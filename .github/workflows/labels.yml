@@ -15,14 +15,18 @@ jobs:
       pull-requests: write
     steps:
       - uses: actions/checkout@v4
-      - name: Load labels yaml
-        id: labels
+      - name: Sync labels
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
         run: |
-          echo "labels<<'EOF'" >> "$GITHUB_OUTPUT"
-          cat .github/labels.yml >> "$GITHUB_OUTPUT"
-          echo "EOF" >> "$GITHUB_OUTPUT"
-      - name: Apply labels from template
-        uses: peter-evans/create-or-update-labels@v4
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          labels: ${{ steps.labels.outputs.labels }}
+          set -euo pipefail
+          jq -c '.[]' .github/labels.yml | while read -r label; do
+            name=$(echo "$label" | jq -r '.name')
+            color=$(echo "$label" | jq -r '.color')
+            description=$(echo "$label" | jq -r '.description')
+            payload=$(jq -n --arg name "$name" --arg color "$color" --arg description "$description" \
+              '{name:$name,color:$color,description:$description}')
+            gh api --method PATCH "/repos/${REPO}/labels/${name}" --input <(echo "$payload") >/dev/null 2>&1 || \
+            gh api --method POST "/repos/${REPO}/labels" --input <(echo "$payload") >/dev/null
+          done
