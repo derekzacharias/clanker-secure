@@ -1,23 +1,30 @@
 from __future__ import annotations
 
+import asyncio
+import base64
 import csv
 import io
 import json
 import logging
-from datetime import datetime
+import os
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, StreamingResponse
+from fastapi.security.http import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from pydantic import BaseModel
 from sqlalchemy import bindparam, text
 from sqlalchemy.orm import selectinload
 from sqlmodel import Session, func, select
 
 from clanker.config import settings
+from clanker.core.enrichment import enrich_from_feed
 from clanker.core.findings import build_findings
 from clanker.core.scanner import (
     DEFAULT_PROFILE_KEY,
@@ -43,6 +50,12 @@ from clanker.db.models import (
     ScanEventRead,
     ScanRead,
     ScanTarget,
+    User,
+    SessionToken,
+    UserRead,
+    LoginAttempt,
+    AuditLog,
+    InviteToken,
 )
 from clanker.db.session import get_session, init_db
 
@@ -252,6 +265,431 @@ def _ensure_asset_status(session: Session, scan_id: int, asset_id: int) -> ScanA
     return status
 
 
+def _b64encode(value: bytes) -> str:
+    return base64.urlsafe_b64encode(value).decode("utf-8").rstrip("=")
+
+
+def _derive_key(password: str, salt: bytes) -> bytes:
+    import hashlib
+
+    return hashlib.scrypt(password.encode("utf-8"), salt=salt, n=16384, r=8, p=1, dklen=32)
+
+
+def _const_eq(a: bytes, b: bytes) -> bool:
+    if len(a) != len(b):
+        return False
+    res = 0
+    for x, y in zip(a, b):
+        res |= x ^ y
+    return res == 0
+
+
+def hash_password(password: str) -> str:
+    salt = os.urandom(16)
+    key = _derive_key(password, salt)
+    return f"scrypt${_b64encode(salt)}${_b64encode(key)}"
+
+
+def verify_password(password: str, hashed: str) -> bool:
+    try:
+        scheme, salt_b64, key_b64 = hashed.split("$", 2)
+        if scheme != "scrypt":
+            return False
+        salt = base64.urlsafe_b64decode(salt_b64 + "==")
+        expected = base64.urlsafe_b64decode(key_b64 + "==")
+        actual = _derive_key(password, salt)
+        return _const_eq(actual, expected)
+    except Exception:
+        return False
+
+
+def _new_token_value() -> str:
+    return _b64encode(os.urandom(32))
+
+
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def create_session_token(session: Session, user_id: int, token_type: str, lifetime: timedelta) -> SessionToken:
+    token = SessionToken(
+        user_id=user_id,
+        token=_new_token_value(),
+        token_type=token_type,
+        expires_at=now_utc() + lifetime,
+    )
+    session.add(token)
+    session.flush()
+    session.refresh(token)
+    return token
+
+
+bearer_scheme = HTTPBearer(auto_error=False)
+
+
+@dataclass
+class CurrentUser:
+    user: User
+    token: SessionToken
+
+
+def get_current_user(
+    creds: Optional[HTTPAuthorizationCredentials] = Depends(bearer_scheme),
+    session: Session = Depends(session_dep),
+) -> CurrentUser:
+    if creds is None or creds.scheme.lower() != "bearer":
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    token_value = creds.credentials
+    token = session.exec(
+        select(SessionToken).where(SessionToken.token == token_value, SessionToken.token_type == "access")
+    ).first()
+
+    def _aware(dt: datetime) -> datetime:
+        return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt
+
+    if not token or token.revoked or _aware(token.expires_at) <= now_utc():
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+    user = session.get(User, token.user_id)
+    if not user or not user.active:
+        raise HTTPException(status_code=403, detail="User disabled")
+    return CurrentUser(user=user, token=token)
+
+
+def require_roles(*roles: str):
+    def dep(current: CurrentUser = Depends(get_current_user)) -> CurrentUser:
+        if current.user.role not in roles:
+            raise HTTPException(status_code=403, detail="Insufficient role")
+        return current
+
+    return dep
+
+
+def _password_complex_enough(pw: str) -> bool:
+    if len(pw) < 10:
+        return False
+    has_lower = any(c.islower() for c in pw)
+    has_upper = any(c.isupper() for c in pw)
+    has_digit = any(c.isdigit() for c in pw)
+    has_symbol = any(not c.isalnum() for c in pw)
+    return has_lower and has_upper and has_digit and has_symbol
+
+
+ACCESS_TTL = timedelta(minutes=30)
+REFRESH_TTL = timedelta(days=7)
+MAX_ATTEMPTS = 5
+MAX_IP_ATTEMPTS = 15
+WINDOW_SECONDS = 600  # 10 minutes
+
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+
+class TokenPair(BaseModel):
+    access_token: str
+    access_expires_at: str
+    refresh_token: str
+    refresh_expires_at: str
+
+
+class RefreshRequest(BaseModel):
+    refresh_token: str
+
+
+class LogoutRequest(BaseModel):
+    revoke_all: Optional[bool] = False
+
+
+class MeUpdate(BaseModel):
+    name: Optional[str] = None
+
+
+class UserCreate(BaseModel):
+    email: str
+    name: Optional[str] = None
+    password: str
+    role: str = "operator"
+    active: bool = True
+
+
+class UserUpdate(BaseModel):
+    name: Optional[str] = None
+    role: Optional[str] = None
+    active: Optional[bool] = None
+    password: Optional[str] = None
+
+
+class ChangePasswordRequest(BaseModel):
+    old_password: str
+    new_password: str
+
+
+class SeedAdminRequest(BaseModel):
+    email: str
+    password: str
+    name: Optional[str] = "Administrator"
+
+
+class AuditLogRead(BaseModel):
+    id: int
+    created_at: str
+    actor_user_id: Optional[int]
+    action: str
+    target: Optional[str]
+    ip: Optional[str]
+    detail: Optional[str]
+
+
+def _client_ip(req: Request) -> str:
+    xff = req.headers.get("x-forwarded-for")
+    if xff:
+        return xff.split(",")[0].strip()
+    return req.client.host if req.client else ""
+
+
+@app.post("/auth/login", response_model=TokenPair)
+def login(payload: LoginRequest, request: Request, session: Session = Depends(session_dep)) -> TokenPair:
+    since = now_utc() - timedelta(seconds=WINDOW_SECONDS)
+    ip = _client_ip(request)
+    fail_count = session.exec(
+        select(func.count()).select_from(LoginAttempt).where(
+            LoginAttempt.email == payload.email, LoginAttempt.success == False, LoginAttempt.created_at >= since  # noqa: E712
+        )
+    ).one()
+    ip_fail_count = session.exec(
+        select(func.count()).select_from(LoginAttempt).where(
+            LoginAttempt.ip == ip, LoginAttempt.success == False, LoginAttempt.created_at >= since  # noqa: E712
+        )
+    ).one()
+    if int(fail_count or 0) >= MAX_ATTEMPTS or int(ip_fail_count or 0) >= MAX_IP_ATTEMPTS:
+        session.add(LoginAttempt(email=payload.email, ip=ip, success=False))
+        session.add(AuditLog(actor_user_id=None, action="login_throttled", target=payload.email, ip=ip, detail=None))
+        session.flush()
+        raise HTTPException(status_code=429, detail="Too many login attempts. Please try again later.")
+
+    user = session.exec(select(User).where(User.email == payload.email)).first()
+    if not user or not verify_password(payload.password, user.hashed_password):
+        session.add(LoginAttempt(email=payload.email, ip=ip, success=False))
+        session.add(AuditLog(actor_user_id=None, action="login_failure", target=payload.email, ip=ip, detail=None))
+        session.flush()
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    if not user.active:
+        raise HTTPException(status_code=403, detail="User disabled")
+
+    session.add(LoginAttempt(email=payload.email, ip=ip, success=True))
+    session.add(AuditLog(actor_user_id=user.id, action="login_success", target=payload.email, ip=ip, detail=None))
+
+    access = create_session_token(session, user_id=user.id, token_type="access", lifetime=ACCESS_TTL)
+    refresh = create_session_token(session, user_id=user.id, token_type="refresh", lifetime=REFRESH_TTL)
+
+    return TokenPair(
+        access_token=access.token,
+        access_expires_at=access.expires_at.isoformat(),
+        refresh_token=refresh.token,
+        refresh_expires_at=refresh.expires_at.isoformat(),
+    )
+
+
+@app.post("/auth/refresh", response_model=TokenPair)
+def refresh(payload: RefreshRequest, session: Session = Depends(session_dep)) -> TokenPair:
+    tok = session.exec(
+        select(SessionToken).where(SessionToken.token == payload.refresh_token, SessionToken.token_type == "refresh")
+    ).first()
+    if tok and tok.expires_at and tok.expires_at.tzinfo is None:
+        tok.expires_at = tok.expires_at.replace(tzinfo=timezone.utc)
+        session.add(tok)
+        session.flush()
+    if not tok or tok.revoked or tok.expires_at <= now_utc():
+        raise HTTPException(status_code=401, detail="Invalid or expired refresh token")
+
+    user = session.get(User, tok.user_id)
+    if not user or not user.active:
+        raise HTTPException(status_code=403, detail="User disabled")
+
+    access = create_session_token(session, user_id=user.id, token_type="access", lifetime=ACCESS_TTL)
+    refresh = create_session_token(session, user_id=user.id, token_type="refresh", lifetime=REFRESH_TTL)
+
+    session.add(AuditLog(actor_user_id=user.id, action="token_refreshed", target=user.email, ip=None, detail=None))
+    return TokenPair(
+        access_token=access.token,
+        access_expires_at=access.expires_at.isoformat(),
+        refresh_token=refresh.token,
+        refresh_expires_at=refresh.expires_at.isoformat(),
+    )
+
+
+@app.get("/auth/me", response_model=UserRead)
+def me(current=Depends(get_current_user)) -> UserRead:  # type: ignore[no-redef]
+    u = current.user
+    return UserRead(id=u.id, email=u.email, name=u.name, role=u.role, active=u.active, created_at=u.created_at)  # type: ignore[arg-type]
+
+
+@app.patch("/auth/me", response_model=UserRead)
+def update_me(payload: MeUpdate, current=Depends(get_current_user), session: Session = Depends(session_dep)) -> UserRead:  # type: ignore[no-redef]
+    user = session.get(User, current.user.id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    if payload.name is not None:
+        user.name = payload.name
+    session.add(user)
+    session.flush()
+    session.refresh(user)
+    return UserRead(id=user.id, email=user.email, name=user.name, role=user.role, active=user.active, created_at=user.created_at)  # type: ignore[arg-type]
+
+
+@app.post("/auth/logout")
+def logout(payload: LogoutRequest, current=Depends(get_current_user), session: Session = Depends(session_dep)) -> dict:  # type: ignore[no-redef]
+    if payload.revoke_all:
+        for t in session.exec(select(SessionToken).where(SessionToken.user_id == current.user.id)).all():
+            t.revoked = True
+            session.add(t)
+    else:
+        current.token.revoked = True
+        session.add(current.token)
+    session.add(AuditLog(actor_user_id=current.user.id, action="logout", target=current.user.email, ip=None, detail=None))
+    return {"status": "ok"}
+
+
+@app.post("/auth/change_password")
+def change_password(payload: ChangePasswordRequest, current=Depends(get_current_user), session: Session = Depends(session_dep)) -> dict:  # type: ignore[no-redef]
+    user = session.get(User, current.user.id)
+    if not user or not verify_password(payload.old_password, user.hashed_password):
+        raise HTTPException(status_code=400, detail="Old password incorrect")
+    if not _password_complex_enough(payload.new_password):
+        raise HTTPException(status_code=400, detail="Password does not meet complexity requirements")
+    user.hashed_password = hash_password(payload.new_password)
+    session.add(user)
+    session.add(AuditLog(actor_user_id=user.id, action="password_changed", target=str(user.id), ip=None, detail=None))
+    return {"status": "ok"}
+
+
+@app.post("/auth/seed_admin")
+def seed_admin(payload: SeedAdminRequest, session: Session = Depends(session_dep)) -> dict:
+    existing = session.exec(select(User)).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="Users already exist")
+    if not _password_complex_enough(payload.password):
+        raise HTTPException(status_code=400, detail="Password does not meet complexity requirements")
+    user = User(email=payload.email, name=payload.name, hashed_password=hash_password(payload.password), role="admin", active=True)
+    session.add(user)
+    session.flush()
+    session.add(AuditLog(actor_user_id=user.id, action="user_created", target=str(user.id), ip=None, detail="seed_admin"))
+    return {"status": "ok"}
+
+
+@app.get("/users", response_model=List[UserRead])
+def list_users(_: object = Depends(require_roles("admin")), session: Session = Depends(session_dep)) -> list[User]:
+    return session.exec(select(User).order_by(User.created_at.desc())).all()
+
+
+@app.post("/users", response_model=UserRead, status_code=201)
+def create_user(payload: UserCreate, _: object = Depends(require_roles("admin")), session: Session = Depends(session_dep)) -> User:
+    existing = session.exec(select(User).where(User.email == payload.email)).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="Email already exists")
+    if not _password_complex_enough(payload.password):
+        raise HTTPException(status_code=400, detail="Password does not meet complexity requirements")
+    user = User(
+        email=payload.email,
+        name=payload.name,
+        hashed_password=hash_password(payload.password),
+        role=payload.role or "operator",
+        active=payload.active,
+    )
+    session.add(user)
+    session.flush()
+    session.refresh(user)
+    session.add(AuditLog(actor_user_id=None, action="user_created", target=str(user.id), ip=None, detail=user.email))
+    return user
+
+
+@app.patch("/users/{user_id}", response_model=UserRead)
+def update_user(user_id: int, payload: UserUpdate, _: object = Depends(require_roles("admin")), session: Session = Depends(session_dep)) -> User:
+    user = session.get(User, user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    if payload.name is not None:
+        user.name = payload.name
+    if payload.role is not None:
+        user.role = payload.role
+    if payload.active is not None:
+        user.active = payload.active
+    if payload.password:
+        if not _password_complex_enough(payload.password):
+            raise HTTPException(status_code=400, detail="Password does not meet complexity requirements")
+        user.hashed_password = hash_password(payload.password)
+    session.add(user)
+    session.flush()
+    session.refresh(user)
+    session.add(AuditLog(actor_user_id=None, action="user_updated", target=str(user.id), ip=None, detail=None))
+    return user
+
+
+@app.get("/audit_logs", response_model=List[AuditLogRead])
+def list_audit_logs(
+    _: object = Depends(require_roles("admin")),
+    user_id: Optional[int] = Query(default=None),
+    action: Optional[str] = Query(default=None),
+    since: Optional[str] = Query(default=None),
+    until: Optional[str] = Query(default=None),
+    session: Session = Depends(session_dep),
+) -> list[AuditLogRead]:
+    q = select(AuditLog)
+    if user_id is not None:
+        q = q.where(AuditLog.actor_user_id == user_id)
+    if action is not None:
+        q = q.where(AuditLog.action == action)
+
+    def _parse(ts: Optional[str]):
+        if not ts:
+            return None
+        try:
+            return datetime.fromisoformat(ts)
+        except Exception:
+            return None
+
+    s_dt = _parse(since)
+    u_dt = _parse(until)
+    if s_dt is not None:
+        q = q.where(AuditLog.created_at >= s_dt)
+    if u_dt is not None:
+        q = q.where(AuditLog.created_at <= u_dt)
+    rows = session.exec(q.order_by(AuditLog.created_at.desc())).all()
+    return [
+        AuditLogRead(
+            id=r.id,
+            created_at=r.created_at.isoformat(),
+            actor_user_id=r.actor_user_id,
+            action=r.action,
+            target=r.target,
+            ip=r.ip,
+            detail=r.detail,
+        )
+        for r in rows
+    ]
+
+
+def _seed_admin_if_configured(session: Session) -> None:
+    email = os.getenv("CLANKER_ADMIN_EMAIL")
+    password = os.getenv("CLANKER_ADMIN_PASSWORD")
+    if not email or not password:
+        return
+    existing = session.exec(select(User).where(User.email == email)).first()
+    if existing:
+        return
+    user = User(email=email, name="Administrator", hashed_password=hash_password(password), role="admin", active=True)
+    session.add(user)
+
+
+@app.on_event("startup")
+def _seed_admin_on_startup() -> None:
+    try:
+        with get_session() as s:
+            _seed_admin_if_configured(s)
+    except Exception:
+        pass
+
 @app.post("/assets", response_model=AssetRead, status_code=201)
 def create_asset(payload: AssetCreate, session: Session = Depends(session_dep)) -> Asset:
     asset = Asset(**payload.model_dump())
@@ -446,6 +884,28 @@ def list_scan_events(scan_id: int, session: Session = Depends(session_dep)) -> L
         select(ScanEvent).where(ScanEvent.scan_id == scan_id).order_by(ScanEvent.created_at.desc())
     ).all()
     return [ScanEventRead(id=event.id, created_at=event.created_at, message=event.message) for event in events]
+
+
+@app.get("/scans/{scan_id}/events/stream")
+def stream_scan_events(scan_id: int):
+    async def event_gen():
+        last_id: Optional[int] = None
+        while True:
+            try:
+                with get_session() as session:
+                    row = session.exec(
+                        select(ScanEvent).where(ScanEvent.scan_id == scan_id).order_by(ScanEvent.created_at.desc()).limit(1)
+                    ).first()
+                    if row and row.id != last_id:
+                        last_id = row.id
+                        payload = {"id": row.id, "created_at": row.created_at.isoformat(), "message": row.message}
+                        yield f"data: {json.dumps(payload)}\n\n"
+            except Exception:
+                # Keep stream alive on transient errors
+                pass
+            await asyncio.sleep(2)
+
+    return StreamingResponse(event_gen(), media_type="text/event-stream")
 
 
 @app.get("/findings", response_model=List[FindingRead])
@@ -778,6 +1238,55 @@ def run_scan_job(scan_id: int) -> None:
         session.add(scan)
         _record_scan_event(session, scan_id, f"Scan finished with status {scan.status}")
         session.commit()
+
+
+@app.post("/enrichment/finding/{finding_id}")
+def enrich_one(finding_id: int, background_tasks: BackgroundTasks) -> dict:
+    def _task(fid: int):
+        with get_session() as s2:
+            row = s2.get(Finding, fid)
+            if row:
+                enrich_from_feed(s2, [row])
+                s2.commit()
+
+    background_tasks.add_task(_task, finding_id)
+    return {"status": "queued"}
+
+
+@app.get("/finding_ext/{finding_id}")
+def get_finding_ext(finding_id: int, session: Session = Depends(session_dep)) -> JSONResponse:
+    finding = session.get(Finding, finding_id)
+    if not finding:
+        raise HTTPException(status_code=404, detail="Finding not found")
+    base = {
+        "id": finding.id,
+        "scan_id": finding.scan_id,
+        "asset_id": finding.asset_id,
+        "host_address": finding.host_address,
+        "host_os_name": finding.host_os_name,
+        "host_os_accuracy": finding.host_os_accuracy,
+        "host_vendor": finding.host_vendor,
+        "traceroute_summary": finding.traceroute_summary,
+        "host_report": finding.host_report,
+        "port": finding.port,
+        "protocol": finding.protocol,
+        "service_name": finding.service_name,
+        "service_version": finding.service_version,
+        "cve_ids": finding.cve_ids,
+        "severity": finding.severity,
+        "status": finding.status,
+        "description": finding.description,
+        "detected_at": finding.detected_at.isoformat() if getattr(finding, "detected_at", None) else None,
+    }
+    ext = session.exec(text("SELECT * FROM finding_enrichment WHERE finding_id = :fid"), {"fid": finding_id}).mappings().first() or {}
+    if ext and isinstance(ext.get("references_json"), str):
+        try:
+            ext["references"] = json.loads(ext["references_json"])
+        except Exception:
+            ext["references"] = []
+    if ext:
+        ext.setdefault("references", [])
+    return JSONResponse({"finding": base, "enrichment": ext})
 
 
 __all__ = ["app"]

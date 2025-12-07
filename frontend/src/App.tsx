@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   AppShell,
   Badge,
@@ -303,24 +303,22 @@ function App() {
   });
   const [scheduleTimesText, setScheduleTimesText] = useState<string>('09:00');
   const [scheduleError, setScheduleError] = useState<string>('');
+  const findingsFetchedOnce = useRef(false);
 
   const refreshAll = async () => {
     setLoading(true);
     try {
-      const [assetRes, scanRes, findingRes] = await Promise.all([
+      const [assetRes, scanRes] = await Promise.all([
         api.get<Asset[]>('/assets', { params: { limit: pageSize, offset: 0 } }),
         api.get<Scan[]>('/scans', { params: { limit: pageSize, offset: 0, status: scanFilter === 'all' ? undefined : scanFilter } }),
-        api.get<Finding[]>('/findings', { params: { limit: pageSize, offset: 0, severity: findingFilter === 'all' ? undefined : findingFilter } }),
       ]);
       setAssets(assetRes.data);
       setScans(scanRes.data);
-      setFindings(findingRes.data);
-      setAssetsTotal(parseInt((assetRes.headers['x-total-count'] as any) ?? `${assetRes.data.length}`, 10) || assetRes.data.length);
-      setScansTotal(parseInt((scanRes.headers['x-total-count'] as any) ?? `${scanRes.data.length}`, 10) || scanRes.data.length);
-      setFindingsTotal(parseInt((findingRes.headers['x-total-count'] as any) ?? `${findingRes.data.length}`, 10) || findingRes.data.length);
+      setAssetsTotal(parseTotalCount(assetRes.headers as Record<string, unknown>, assetRes.data.length));
+      setScansTotal(parseTotalCount(scanRes.headers as Record<string, unknown>, scanRes.data.length));
       setAssetsOffset(assetRes.data.length);
       setScansOffset(scanRes.data.length);
-      setFindingsOffset(findingRes.data.length);
+      await refreshFindings(0, false);
     } catch (error) {
       notifications.show({ color: 'red', title: 'Failed to load data', message: `${error}` });
     } finally {
@@ -373,22 +371,60 @@ function App() {
     loadExt();
   }, [selectedFinding?.id]);
 
-  useEffect(() => {
-    if (!autoRefresh) return undefined;
-    const interval = setInterval(refreshAll, 120000);
-    return () => clearInterval(interval);
-  }, [autoRefresh]);
+useEffect(() => {
+  if (!autoRefresh) return undefined;
+  const interval = setInterval(refreshAll, 120000);
+  return () => clearInterval(interval);
+}, [autoRefresh]);
 
-  const resetAssetForm = () => {
-    setAssetForm({ name: '', target: '', environment: '', owner: '', notes: '' });
-    setEditingAssetId(null);
-  };
+useEffect(() => {
+  if (!findingsFetchedOnce.current) {
+    findingsFetchedOnce.current = true;
+    return;
+  }
+  refreshFindings(0, false);
+}, [findingFilter, findingSearch]);
 
-  const handleLogout = async (): Promise<void> => {
-    try {
-      await api.post('/auth/logout', { revoke_all: true });
-    } catch (_) {
-      // ignore network/auth errors on logout
+const resetAssetForm = () => {
+  setAssetForm({ name: '', target: '', environment: '', owner: '', notes: '' });
+  setEditingAssetId(null);
+};
+
+const parseTotalCount = (headers: Record<string, unknown>, fallback: number): number => {
+  const raw = headers['x-total-count'] as string | undefined;
+  const parsed = raw ? parseInt(raw, 10) : NaN;
+  return Number.isNaN(parsed) ? fallback : parsed;
+};
+
+const buildFindingsParams = (offsetValue: number) => ({
+  limit: pageSize,
+  offset: offsetValue,
+  severity: findingFilter === 'all' ? undefined : findingFilter,
+  q: findingSearch.trim() ? findingSearch.trim() : undefined,
+});
+
+const refreshFindings = async (offsetValue = 0, append = false) => {
+  try {
+    const res = await api.get<Finding[]>('/findings', { params: buildFindingsParams(offsetValue) });
+    const total = parseTotalCount(res.headers as Record<string, unknown>, res.data.length);
+    if (append) {
+      setFindings((prev) => prev.concat(res.data));
+      setFindingsOffset((o) => o + res.data.length);
+    } else {
+      setFindings(res.data);
+      setFindingsOffset(res.data.length);
+    }
+    setFindingsTotal(total);
+  } catch (error) {
+    notifications.show({ color: 'red', title: 'Failed to load findings', message: `${error}` });
+  }
+};
+
+const handleLogout = async (): Promise<void> => {
+  try {
+    await api.post('/auth/logout', { revoke_all: true });
+  } catch (_) {
+    // ignore network/auth errors on logout
     }
     localStorage.removeItem('clanker_access_token');
     localStorage.removeItem('clanker_refresh_token');
@@ -838,6 +874,39 @@ function App() {
     a.download = filename;
     a.click();
     URL.revokeObjectURL(url);
+  };
+
+  const exportFindings = async (format: 'csv' | 'json') => {
+    try {
+      const params = { ...buildFindingsParams(0), format };
+      const res = await api.get(`/reports/findings/export`, {
+        params,
+        responseType: format === 'csv' ? 'blob' : 'json',
+      });
+      if (format === 'csv') {
+        const blob = new Blob([res.data], { type: 'text/csv;charset=utf-8;' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = 'findings.csv';
+        a.click();
+        URL.revokeObjectURL(url);
+      } else {
+        const payload = (res.data as any)?.rows ?? res.data;
+        exportJson(Array.isArray(payload) ? payload : [payload], 'findings.json');
+      }
+      const headerBands = (res.headers as Record<string, unknown>)['x-cvss-bands'];
+      const bandSummary = typeof headerBands === 'string' ? JSON.parse(headerBands) : res.data?.cvss_bands;
+      if (bandSummary) {
+        notifications.show({
+          color: 'teal',
+          title: 'CVSS band summary',
+          message: `Critical ${bandSummary.critical ?? 0} · High ${bandSummary.high ?? 0} · Medium ${bandSummary.medium ?? 0}`,
+        });
+      }
+    } catch (e) {
+      notifications.show({ color: 'red', title: 'Failed to export findings', message: `${e}` });
+    }
   };
 
   const dayOptions = [
@@ -1785,33 +1854,8 @@ function App() {
                       ]}
                     />
                     <TextInput placeholder="Search service, host, text" value={findingSearch} onChange={(e) => setFindingSearch(e.currentTarget.value)} />
-                    <Button
-                      variant="light"
-                      onClick={() =>
-                        exportCsv(
-                          filteredFindings.map((f) => ({
-                            id: f.id,
-                            asset_id: f.asset_id,
-                            scan_id: f.scan_id,
-                            host: f.host_address,
-                            port: f.port,
-                            proto: f.protocol,
-                            service: f.service_name,
-                            severity: f.severity,
-                            status: f.status,
-                            detected_at: f.detected_at,
-                            cve_ids: parseCves(f.cve_ids).join(';'),
-                            cvss_v31_base: f.cvss_v31_base ?? '',
-                            cvss_vector: f.cvss_vector ?? '',
-                            references: (f.references ?? []).join(';'),
-                          })),
-                          'findings.csv',
-                        )
-                      }
-                    >
-                      Export CSV
-                    </Button>
-                    <Button variant="light" onClick={() => exportJson(filteredFindings, 'findings.json')}>Export JSON</Button>
+                    <Button variant="light" onClick={() => exportFindings('csv')}>Export CSV</Button>
+                    <Button variant="light" onClick={() => exportFindings('json')}>Export JSON</Button>
                   </Group>
                 </Group>
                 <Stack gap="md">
@@ -1904,7 +1948,12 @@ function App() {
                 </Stack>
                 {findingsOffset < findingsTotal && (
                   <Group justify="center" mt="md">
-                    <Button variant="light" onClick={async () => { try { const res = await api.get<Finding[]>('/findings', { params: { limit: pageSize, offset: findingsOffset, severity: findingFilter === 'all' ? undefined : findingFilter } }); setFindings((prev) => prev.concat(res.data)); setFindingsOffset((o) => o + res.data.length); setFindingsTotal(parseInt((res.headers['x-total-count'] as any) ?? `${findingsTotal}`, 10) || findingsTotal); } catch (e) { notifications.show({ color: 'red', title: 'Failed to load more findings', message: `${e}` }); } }}>Load more</Button>
+                    <Button
+                      variant="light"
+                      onClick={() => refreshFindings(findingsOffset, true)}
+                    >
+                      Load more
+                    </Button>
                   </Group>
                 )}
               </Card>

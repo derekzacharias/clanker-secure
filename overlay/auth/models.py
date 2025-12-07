@@ -3,9 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Optional
 
-from sqlmodel import Field, Relationship, SQLModel
-from typing import Optional
-from datetime import datetime
+from sqlmodel import Field, SQLModel
 
 
 class User(SQLModel, table=True):
@@ -18,9 +16,8 @@ class User(SQLModel, table=True):
     role: str = Field(default="admin", max_length=32)  # admin | operator | viewer
     active: bool = Field(default=True)
 
-    # Omit reverse tokens relationship for simpler mapping in MVP
-    # (avoids SQLAlchemy generic typing issue under 2.0)
-    # tokens: List["SessionToken"] = Relationship(back_populates="user")
+    class Config:
+        table_args = {"extend_existing": True}
 
 
 class SessionToken(SQLModel, table=True):
@@ -33,7 +30,8 @@ class SessionToken(SQLModel, table=True):
     expires_at: datetime
     revoked: bool = Field(default=False)
 
-    # No relationship field needed for MVP; use user_id directly
+    class Config:
+        table_args = {"extend_existing": True}
 
 
 class UserRead(SQLModel):
@@ -45,19 +43,15 @@ class UserRead(SQLModel):
     created_at: datetime
 
 
-__all__ = [
-    "User",
-    "SessionToken",
-    "UserRead",
-]
-
-
 class LoginAttempt(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     created_at: datetime = Field(default_factory=datetime.utcnow)
     email: str = Field(index=True, max_length=255)
     ip: Optional[str] = Field(default=None, max_length=48)
     success: bool = Field(default=False)
+
+    class Config:
+        table_args = {"extend_existing": True}
 
 
 class AuditLog(SQLModel, table=True):
@@ -69,11 +63,8 @@ class AuditLog(SQLModel, table=True):
     ip: Optional[str] = Field(default=None, max_length=48)
     detail: Optional[str] = Field(default=None)
 
-
-__all__ += [
-    "LoginAttempt",
-    "AuditLog",
-]
+    class Config:
+        table_args = {"extend_existing": True}
 
 
 class InviteToken(SQLModel, table=True):
@@ -87,7 +78,15 @@ class InviteToken(SQLModel, table=True):
     used_at: Optional[datetime] = None
     created_by_user_id: Optional[int] = Field(default=None, foreign_key="user.id")
 
+    class Config:
+        table_args = {"extend_existing": True}
 
-__all__ += [
+
+__all__ = [
+    "User",
+    "SessionToken",
+    "UserRead",
+    "LoginAttempt",
+    "AuditLog",
     "InviteToken",
 ]

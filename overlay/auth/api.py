@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from datetime import timedelta
+from datetime import timedelta, timezone
 from typing import Optional
 
 from fastapi import Depends, HTTPException, Request
@@ -47,6 +47,7 @@ class LogoutRequest(BaseModel):
 
 MAX_ATTEMPTS = 5
 WINDOW_SECONDS = 600  # 10 minutes
+MAX_IP_ATTEMPTS = 15
 
 
 def _client_ip(req: Request) -> str:
@@ -65,10 +66,21 @@ def login(payload: LoginRequest, request: Request, session: Session = Depends(se
             LoginAttempt.email == payload.email, LoginAttempt.success == False, LoginAttempt.created_at >= since  # noqa: E712
         )
     ).one()
+    ip = _client_ip(request)
+    ip_fail_count = session.exec(
+        select(func.count()).select_from(LoginAttempt).where(
+            LoginAttempt.ip == ip, LoginAttempt.success == False, LoginAttempt.created_at >= since  # noqa: E712
+        )
+    ).one()
     if int(fail_count or 0) >= MAX_ATTEMPTS:
         # Record throttled attempt (no password check)
-        session.add(LoginAttempt(email=payload.email, ip=_client_ip(request), success=False))
-        session.add(AuditLog(actor_user_id=None, action="login_throttled", target=payload.email, ip=_client_ip(request), detail=None))
+        session.add(LoginAttempt(email=payload.email, ip=ip, success=False))
+        session.add(AuditLog(actor_user_id=None, action="login_throttled", target=payload.email, ip=ip, detail=None))
+        session.flush()
+        raise HTTPException(status_code=429, detail="Too many login attempts. Please try again later.")
+    if int(ip_fail_count or 0) >= MAX_IP_ATTEMPTS:
+        session.add(LoginAttempt(email=payload.email, ip=ip, success=False))
+        session.add(AuditLog(actor_user_id=None, action="login_throttled_ip", target=payload.email, ip=ip, detail=None))
         session.flush()
         raise HTTPException(status_code=429, detail="Too many login attempts. Please try again later.")
 
@@ -431,3 +443,13 @@ def list_audit_logs(
         )
         for r in rows
     ]
+
+
+from sqlmodel import SQLModel
+from clanker.db.session import engine
+
+
+@app.on_event("startup")
+def _ensure_auth_tables() -> None:
+    # Ensure auth tables exist for rate limiting and audit logging
+    SQLModel.metadata.create_all(engine)

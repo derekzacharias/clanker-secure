@@ -23,6 +23,7 @@ import {
   ThemeIcon,
   Title,
   Tooltip,
+  Drawer,
 } from '@mantine/core';
 import { notifications } from '@mantine/notifications';
 import {
@@ -76,6 +77,10 @@ interface Finding {
   status: string;
   description?: string | null;
   detected_at: string;
+  cve_ids?: string | null;
+  cvss_v31_base?: number | null;
+  cvss_vector?: string | null;
+  references?: string[] | null;
 }
 
 const SCAN_PROFILES = [
@@ -116,6 +121,55 @@ const SEVERITY_COLORS: Record<string, string> = {
 
 const api = axios.create({ baseURL: API_BASE, timeout: 15000 });
 
+const parseCves = (raw?: string | null): string[] => {
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed)) {
+      return parsed.filter((item) => typeof item === 'string');
+    }
+  } catch {
+    // ignore parse errors
+  }
+  if (typeof raw === 'string' && raw.toUpperCase().includes('CVE-')) {
+    return raw.split(/[,;\\s]+/).filter((token) => token.toUpperCase().startsWith('CVE-'));
+  }
+  return [];
+};
+
+const exportCsv = (rows: Record<string, any>[], filename: string) => {
+  if (!rows.length) return;
+  const headers = Object.keys(rows[0]);
+  const csvLines = [headers.join(',')].concat(
+    rows.map((row) =>
+      headers
+        .map((h) => {
+          const value = row[h] ?? '';
+          const escaped = String(value).replace(/\"/g, '\"\"');
+          return `"${escaped}"`;
+        })
+        .join(','),
+    ),
+  );
+  const blob = new Blob([csvLines.join('\\n')], { type: 'text/csv' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
+};
+
+const exportJson = (data: unknown, filename: string) => {
+  const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
+};
+
 const glassStyles = {
   background: 'rgba(13, 21, 37, 0.72)',
   border: '1px solid rgba(255, 255, 255, 0.08)',
@@ -150,6 +204,10 @@ function App() {
   const [loading, setLoading] = useState(false);
   const [autoRefresh, setAutoRefresh] = useState(true);
   const [findingFilter, setFindingFilter] = useState<'all' | 'low' | 'medium' | 'high' | 'critical'>('all');
+  const [selectedScanId, setSelectedScanId] = useState<number | null>(null);
+  const [scanEvents, setScanEvents] = useState<{ id: number; created_at: string; message: string }[]>([]);
+  const [eventsAutoRefresh, setEventsAutoRefresh] = useState(true);
+  const [selectedFinding, setSelectedFinding] = useState<Finding | null>(null);
 
   const [assetForm, setAssetForm] = useState({ name: '', target: '', environment: '', owner: '', notes: '' });
   const [editingAssetId, setEditingAssetId] = useState<number | null>(null);
@@ -183,6 +241,66 @@ function App() {
     const interval = setInterval(refreshAll, 120000);
     return () => clearInterval(interval);
   }, [autoRefresh]);
+
+  useEffect(() => {
+    if (selectedScanId == null) {
+      setScanEvents([]);
+      return;
+    }
+    let cancelled = false;
+    const load = async () => {
+      try {
+        const res = await api.get(`/scans/${selectedScanId}/events`);
+        if (!cancelled) {
+          setScanEvents(res.data);
+        }
+      } catch (error) {
+        if (!cancelled) {
+          notifications.show({ color: 'red', title: 'Failed to load scan events', message: String(error) });
+        }
+      }
+    };
+    load();
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedScanId]);
+
+  useEffect(() => {
+    if (selectedScanId == null || !eventsAutoRefresh) return () => {};
+    let es: EventSource | null = null;
+    const open = () => {
+      try {
+        es = new EventSource(`${API_BASE || ''}/scans/${selectedScanId}/events/stream`);
+        es.onmessage = (ev) => {
+          try {
+            const payload = JSON.parse(ev.data);
+            setScanEvents((prev) => {
+              if (!prev.find((p) => p.id === payload.id)) {
+                return [payload, ...prev].slice(0, 200);
+              }
+              return prev;
+            });
+          } catch {
+            // ignore malformed payloads
+          }
+        };
+        es.onerror = () => {
+          if (es) {
+            es.close();
+            es = null;
+            setTimeout(() => open(), 1500);
+          }
+        };
+      } catch {
+        // ignore EventSource errors
+      }
+    };
+    open();
+    return () => {
+      if (es) es.close();
+    };
+  }, [selectedScanId, eventsAutoRefresh]);
 
   const resetAssetForm = () => {
     setAssetForm({ name: '', target: '', environment: '', owner: '', notes: '' });
@@ -340,6 +458,16 @@ function App() {
     });
     return Array.from(groups.values());
   }, [filteredFindings, assetLookup]);
+
+  const findingGroupIndex = useMemo(() => {
+    const map = new Map<number, { hostLabel: string; hostReport?: string | null }>();
+    findingsByHost.forEach((group) => {
+      group.findings.forEach((finding) => {
+        map.set(finding.id, { hostLabel: group.hostLabel, hostReport: group.hostReport });
+      });
+    });
+    return map;
+  }, [findingsByHost]);
 
   return (
     <AppShell padding="lg" header={{ height: 70 }} styles={{ main: { background: 'transparent' } }}>
@@ -671,17 +799,22 @@ function App() {
                               <Table.Td>
                                 <StatusBadge status={scan.status} />
                               </Table.Td>
-                              <Table.Td>{scan.profile}</Table.Td>
-                              <Table.Td>{new Date(scan.created_at).toLocaleString()}</Table.Td>
-                              <Table.Td>{scan.started_at ? new Date(scan.started_at).toLocaleString() : '-'}</Table.Td>
-                              <Table.Td>{scan.completed_at ? new Date(scan.completed_at).toLocaleString() : '-'}</Table.Td>
-                              <Table.Td>
+                            <Table.Td>{scan.profile}</Table.Td>
+                            <Table.Td>{new Date(scan.created_at).toLocaleString()}</Table.Td>
+                            <Table.Td>{scan.started_at ? new Date(scan.started_at).toLocaleString() : '-'}</Table.Td>
+                            <Table.Td>{scan.completed_at ? new Date(scan.completed_at).toLocaleString() : '-'}</Table.Td>
+                            <Table.Td>
+                              <Group gap="xs">
+                                <Button size="xs" variant="light" onClick={() => setSelectedScanId(scan.id)}>
+                                  View
+                                </Button>
                                 <Button size="xs" color="red" variant="light" onClick={() => handleScanDelete(scan.id)}>
                                   Remove
                                 </Button>
-                              </Table.Td>
-                            </Table.Tr>
-                          ))}
+                              </Group>
+                            </Table.Td>
+                          </Table.Tr>
+                        ))}
                         </Table.Tbody>
                       </Table>
                     </ScrollArea>
@@ -694,17 +827,48 @@ function App() {
               <Card padding="lg" radius="md" style={glassStyles} shadow="xl">
                 <Group justify="space-between" mb="md">
                   <Title order={5}>Findings</Title>
-                  <SegmentedControl
-                    value={findingFilter}
-                    onChange={(value) => setFindingFilter(value as typeof findingFilter)}
-                    data={[
-                      { label: 'All', value: 'all' },
-                      { label: 'Low', value: 'low' },
-                      { label: 'Medium', value: 'medium' },
-                      { label: 'High', value: 'high' },
-                      { label: 'Critical', value: 'critical' },
-                    ]}
-                  />
+                  <Group gap="xs">
+                    <SegmentedControl
+                      value={findingFilter}
+                      onChange={(value) => setFindingFilter(value as typeof findingFilter)}
+                      data={[
+                        { label: 'All', value: 'all' },
+                        { label: 'Low', value: 'low' },
+                        { label: 'Medium', value: 'medium' },
+                        { label: 'High', value: 'high' },
+                        { label: 'Critical', value: 'critical' },
+                      ]}
+                    />
+                    <Button
+                      variant="light"
+                      onClick={() =>
+                        exportCsv(
+                          filteredFindings.map((f) => ({
+                            id: f.id,
+                            asset_id: f.asset_id,
+                            scan_id: f.scan_id,
+                            host: f.host_address,
+                            port: f.port,
+                            protocol: f.protocol,
+                            service: f.service_name,
+                            severity: f.severity,
+                            status: f.status,
+                            detected_at: f.detected_at,
+                            cve_ids: parseCves(f.cve_ids).join(';'),
+                            cvss_v31_base: f.cvss_v31_base ?? '',
+                            cvss_vector: f.cvss_vector ?? '',
+                            references: (f.references ?? []).join(';'),
+                          })),
+                          'findings.csv',
+                        )
+                      }
+                    >
+                      Export CSV
+                    </Button>
+                    <Button variant="light" onClick={() => exportJson(filteredFindings, 'findings.json')}>
+                      Export JSON
+                    </Button>
+                  </Group>
                 </Group>
                 <Stack gap="md">
                   {findingsByHost.length === 0 && <Text c="dimmed">No findings to summarize.</Text>}
@@ -726,6 +890,8 @@ function App() {
                           <Table.Tr>
                             <Table.Th>PORT</Table.Th>
                             <Table.Th>SERVICE</Table.Th>
+                            <Table.Th>CVEs</Table.Th>
+                            <Table.Th>CVSS</Table.Th>
                             <Table.Th>SEVERITY</Table.Th>
                             <Table.Th>STATUS</Table.Th>
                             <Table.Th>DETECTED</Table.Th>
@@ -735,9 +901,46 @@ function App() {
                           {group.findings
                             .sort((a, b) => (a.port ?? 0) - (b.port ?? 0))
                             .map((finding) => (
-                              <Table.Tr key={`${group.hostLabel}-${finding.id}`}>
+                              <Table.Tr key={`${group.hostLabel}-${finding.id}`} onClick={() => setSelectedFinding(finding)} style={{ cursor: 'pointer' }}>
                                 <Table.Td>{finding.port ? `${finding.port}/${finding.protocol || 'tcp'}` : '-'}</Table.Td>
                                 <Table.Td>{finding.service_name || 'unknown'}</Table.Td>
+                                <Table.Td>
+                                  <Group gap={4} wrap="wrap">
+                                    {parseCves(finding.cve_ids).map((cve) => (
+                                      <Badge
+                                        key={cve}
+                                        component="a"
+                                        href={`https://nvd.nist.gov/vuln/detail/${encodeURIComponent(cve)}`}
+                                        target="_blank"
+                                        rel="noreferrer"
+                                        variant="light"
+                                        color="red"
+                                        radius="sm"
+                                      >
+                                        {cve}
+                                      </Badge>
+                                    ))}
+                                    {parseCves(finding.cve_ids).length === 0 && <Text size="xs" c="dimmed">-</Text>}
+                                  </Group>
+                                </Table.Td>
+                                <Table.Td>
+                                  <Badge
+                                    variant="outline"
+                                    color={
+                                      finding.cvss_v31_base != null
+                                        ? finding.cvss_v31_base >= 9
+                                          ? 'red'
+                                          : finding.cvss_v31_base >= 7
+                                            ? 'orange'
+                                            : finding.cvss_v31_base >= 4
+                                              ? 'yellow'
+                                              : 'teal'
+                                        : 'gray'
+                                    }
+                                  >
+                                    {finding.cvss_v31_base ?? '—'}
+                                  </Badge>
+                                </Table.Td>
                                 <Table.Td>
                                   <SeverityBadge severity={finding.severity} />
                                 </Table.Td>
@@ -789,6 +992,163 @@ function App() {
             </Tabs.Panel>
           </Tabs>
         </Stack>
+        <Drawer
+          opened={selectedFinding != null}
+          onClose={() => setSelectedFinding(null)}
+          title={selectedFinding ? `Finding #${selectedFinding.id}` : ''}
+          position="right"
+          size="lg"
+        >
+          {selectedFinding && (
+            <Stack gap="sm">
+              <Group justify="space-between">
+                <Group gap="xs">
+                  <StatusBadge status={selectedFinding.status} />
+                  <SeverityBadge severity={selectedFinding.severity} />
+                </Group>
+                <Text size="sm" c="dimmed">
+                  {new Date(selectedFinding.detected_at).toLocaleString()}
+                </Text>
+              </Group>
+              <Text fw={600}>{selectedFinding.service_name || 'unknown service'}</Text>
+              <Text size="sm" c="dimmed">
+                Host: {findingGroupIndex.get(selectedFinding.id)?.hostLabel || selectedFinding.host_address || 'unknown'}
+              </Text>
+              <Text size="sm">Port: {selectedFinding.port ? `${selectedFinding.port}/${selectedFinding.protocol || 'tcp'}` : '-'}</Text>
+              {parseCves(selectedFinding.cve_ids).length > 0 && (
+                <Group gap="xs" wrap="wrap">
+                  <Text size="sm" c="dimmed">
+                    CVEs:
+                  </Text>
+                  {parseCves(selectedFinding.cve_ids).map((cve) => (
+                    <Badge
+                      key={cve}
+                      component="a"
+                      href={`https://nvd.nist.gov/vuln/detail/${encodeURIComponent(cve)}`}
+                      target="_blank"
+                      rel="noreferrer"
+                      variant="light"
+                      color="red"
+                      radius="sm"
+                    >
+                      {cve}
+                    </Badge>
+                  ))}
+                </Group>
+              )}
+              <Group gap="xs">
+                <Text size="sm" c="dimmed">
+                  CVSS v3.1:
+                </Text>
+                <Badge
+                  color={
+                    selectedFinding.cvss_v31_base != null
+                      ? selectedFinding.cvss_v31_base >= 9
+                        ? 'red'
+                        : selectedFinding.cvss_v31_base >= 7
+                          ? 'orange'
+                          : selectedFinding.cvss_v31_base >= 4
+                            ? 'yellow'
+                            : 'teal'
+                      : 'gray'
+                  }
+                  variant="light"
+                >
+                  {selectedFinding.cvss_v31_base ?? 'Not enriched'}
+                </Badge>
+                {selectedFinding.cvss_vector && (
+                  <Text size="sm" c="dimmed">
+                    {selectedFinding.cvss_vector}
+                  </Text>
+                )}
+              </Group>
+              {selectedFinding.references && selectedFinding.references.length > 0 && (
+                <Stack gap={4}>
+                  <Text size="sm" c="dimmed">
+                    References
+                  </Text>
+                  {selectedFinding.references.map((ref, idx) => (
+                    <Text key={idx} size="sm" component="a" href={ref} target="_blank" rel="noreferrer" style={{ overflowWrap: 'anywhere' }}>
+                      {ref}
+                    </Text>
+                  ))}
+                </Stack>
+              )}
+              {findingGroupIndex.get(selectedFinding.id)?.hostReport && (
+                <Paper p="sm" withBorder>
+                  <Text fw={600} size="sm" mb={4}>
+                    Raw nmap output (excerpt)
+                  </Text>
+                  <ScrollArea h={200} offsetScrollbars>
+                    <Text
+                      component="pre"
+                      style={{ whiteSpace: 'pre-wrap', fontFamily: 'SFMono-Regular, Menlo, Monaco, Consolas, monospace', fontSize: '0.85rem' }}
+                    >
+                      {findingGroupIndex.get(selectedFinding.id)?.hostReport}
+                    </Text>
+                  </ScrollArea>
+                </Paper>
+              )}
+            </Stack>
+          )}
+        </Drawer>
+        <Drawer
+          opened={selectedScanId != null}
+          onClose={() => setSelectedScanId(null)}
+          title={selectedScanId ? `Scan #${selectedScanId} progress` : ''}
+          position="right"
+          size="md"
+        >
+          <Group justify="space-between" mb="sm">
+            <Badge variant="light">{scanEvents.length} events</Badge>
+            <Group gap="xs">
+              <Badge
+                variant="light"
+                color={eventsAutoRefresh ? 'green' : 'gray'}
+                style={{ cursor: 'pointer' }}
+                onClick={() => setEventsAutoRefresh((v) => !v)}
+              >
+                Auto-refresh: {eventsAutoRefresh ? 'ON' : 'OFF'}
+              </Badge>
+              <Button
+                size="xs"
+                variant="light"
+                onClick={() => selectedScanId && api.get(`/scans/${selectedScanId}/events`).then((r) => setScanEvents(r.data))}
+              >
+                Refresh
+              </Button>
+            </Group>
+          </Group>
+          <Stack gap={6} mb="sm">
+            <Text fw={600} size="sm">
+              Latest events
+            </Text>
+            {scanEvents.length === 0 && <Text size="sm" c="dimmed">No events yet.</Text>}
+            {scanEvents.slice(0, 3).map((e) => (
+              <Group key={`latest-${e.id}`} gap="sm">
+                <Text size="xs" c="dimmed" w={160}>
+                  {new Date(e.created_at).toLocaleString()}
+                </Text>
+                <Text size="sm">{e.message}</Text>
+              </Group>
+            ))}
+          </Stack>
+          <Text fw={600} size="sm" mb="xs">
+            Event log
+          </Text>
+          <ScrollArea h={420} offsetScrollbars>
+            <Stack gap={4}>
+              {scanEvents.map((e) => (
+                <Group key={e.id} gap="sm">
+                  <Text size="xs" c="dimmed" w={160}>
+                    {new Date(e.created_at).toLocaleString()}
+                  </Text>
+                  <Text size="sm">{e.message}</Text>
+                </Group>
+              ))}
+            </Stack>
+          </ScrollArea>
+        </Drawer>
       </AppShell.Main>
     </AppShell>
   );
