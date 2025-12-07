@@ -11,5 +11,7 @@
   {"name": "api-change", "color": "f9d0c4", "description": "API contract change; coordinate consumers"},
   {"name": "auth", "color": "c5def5", "description": "Authentication or RBAC changes"},
   {"name": "nmap-profile", "color": "0052cc", "description": "Scan profiles or nmap flags"},
-  {"name": "ui", "color": "5319e7", "description": "UI/UX adjustments"}
+  {"name": "ui", "color": "5319e7", "description": "UI/UX adjustments"},
+  {"name": "roadmap-monthly", "color": "1d76db", "description": "Committed for current month"},
+  {"name": "roadmap-quarterly", "color": "5319e7", "description": "Committed for current quarter"}
 ]
