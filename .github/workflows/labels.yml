@@ -15,8 +15,14 @@ jobs:
       pull-requests: write
     steps:
       - uses: actions/checkout@v4
+      - name: Load labels yaml
+        id: labels
+        run: |
+          echo "labels<<'EOF'" >> "$GITHUB_OUTPUT"
+          cat .github/labels.yml >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
       - name: Apply labels from template
         uses: peter-evans/create-or-update-labels@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          labels: ${{ toJson(fromYaml(file('.github/labels.yml'))) }}
+          labels: ${{ steps.labels.outputs.labels }}
