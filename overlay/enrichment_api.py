@@ -93,4 +93,6 @@ def get_finding_ext(finding_id: int, session: Session = Depends(session_dep)) ->
             ext["references"] = json.loads(ext["references_json"])  # type: ignore[name-defined]
         except Exception:
             ext["references"] = []
+    if ext:
+        ext.setdefault("references", [])
     return JSONResponse({"finding": base, "enrichment": ext})

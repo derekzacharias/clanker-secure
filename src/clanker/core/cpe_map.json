@@ -1,0 +1,19 @@
+{
+  "nginx": "cpe:2.3:a:nginx:nginx:{version}:*:*:*:*:*:*:*",
+  "httpd": "cpe:2.3:a:apache:http_server:{version}:*:*:*:*:*:*:*",
+  "apache": "cpe:2.3:a:apache:http_server:{version}:*:*:*:*:*:*:*",
+  "openssh": "cpe:2.3:a:openbsd:openssh:{version}:*:*:*:*:*:*:*",
+  "mysql": "cpe:2.3:a:mysql:mysql:{version}:*:*:*:*:*:*:*",
+  "mariadb": "cpe:2.3:a:mariadb:mariadb:{version}:*:*:*:*:*:*:*",
+  "postgresql": "cpe:2.3:a:postgresql:postgresql:{version}:*:*:*:*:*:*:*",
+  "redis": "cpe:2.3:a:redislabs:redis:{version}:*:*:*:*:*:*:*",
+  "mongodb": "cpe:2.3:a:mongodb:mongodb:{version}:*:*:*:*:*:*:*",
+  "vsftpd": "cpe:2.3:a:vsftpd_project:vsftpd:{version}:*:*:*:*:*:*:*",
+  "proftpd": "cpe:2.3:a:proftpd:proftpd:{version}:*:*:*:*:*:*:*",
+  "opensmtpd": "cpe:2.3:a:openbsd:opensmtpd:{version}:*:*:*:*:*:*:*",
+  "exim": "cpe:2.3:a:exim:exim:{version}:*:*:*:*:*:*:*",
+  "postfix": "cpe:2.3:a:postfix:postfix:{version}:*:*:*:*:*:*:*",
+  "dovecot": "cpe:2.3:a:dovecot:dovecot:{version}:*:*:*:*:*:*:*",
+  "cisco": "cpe:2.3:o:cisco:{product}:{version}:*:*:*:*:*:*:*",
+  "juniper": "cpe:2.3:o:juniper:{product}:{version}:*:*:*:*:*:*:*"
+}

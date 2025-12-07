@@ -2,13 +2,17 @@ from __future__ import annotations
 
 import asyncio
 import json
-from typing import List, Optional
+import os
+from typing import Any, Dict, List, Optional
 import threading
 import time
 from datetime import datetime
 
-from fastapi import Depends, Query, Response
+from fastapi import Depends, HTTPException, Query, Response
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from pydantic import ConfigDict
+from sqlalchemy import bindparam, text
 from sqlmodel import Session, select, func
 
 from clanker.main import app as app  # reuse existing app
@@ -19,6 +23,7 @@ from clanker.db.models import (
     Finding,
     FindingRead,
     Scan,
+    ScanCreate,
     ScanEvent,
     ScanRead,
     ScanAssetStatusRead,
@@ -37,6 +42,12 @@ try:
 except Exception:
     pass
 
+# Register security headers middleware (CSP, etc.) if available
+try:
+    from overlay import security_headers as _security_headers  # noqa: F401
+except Exception:
+    pass
+
 # Register enrichment migrations and API
 try:
     from overlay import startup_enrichment as _enrich_startup  # noqa: F401
@@ -45,6 +56,57 @@ try:
     from overlay import rbac_override as _rbac  # noqa: F401
 except Exception:
     pass
+
+
+def _parse_csv_env(name: str, default: list[str]) -> list[str]:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return [part.strip() for part in raw.split(",") if part.strip()]
+
+
+def _configure_cors_from_env() -> None:
+    """Replace permissive default CORS settings with env-driven values."""
+    origins = _parse_csv_env("CLANKER_CORS_ORIGINS", [])
+    origin_regex = os.getenv("CLANKER_CORS_ORIGIN_REGEX")
+    methods = _parse_csv_env("CLANKER_CORS_METHODS", ["GET", "POST", "PATCH", "DELETE", "OPTIONS"])
+    headers = _parse_csv_env("CLANKER_CORS_HEADERS", ["Authorization", "Content-Type"])
+    allow_credentials = os.getenv("CLANKER_CORS_ALLOW_CREDENTIALS", "false").lower() in {"1", "true", "yes", "y"}
+
+    app.user_middleware = [m for m in app.user_middleware if getattr(m, "cls", None) is not CORSMiddleware]
+    app.middleware_stack = None  # reset so we can safely add middleware before startup
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=origins,
+        allow_origin_regex=origin_regex or None,
+        allow_methods=methods or ["GET"],
+        allow_headers=headers or ["Authorization", "Content-Type"],
+        allow_credentials=allow_credentials,
+    )
+    app.middleware_stack = app.build_middleware_stack()
+
+
+_configure_cors_from_env()
+
+
+def _parse_references(raw: Optional[str]) -> List[str]:
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+        if isinstance(data, list):
+            return [s for s in data if isinstance(s, str)]
+    except Exception:
+        pass
+    return []
+
+
+class FindingWithEnrichment(FindingRead):
+    cvss_v31_base: Optional[float] = None
+    cvss_vector: Optional[str] = None
+    references: Optional[List[str]] = None
+
+    model_config = ConfigDict(from_attributes=True)
 
 
 def _remove_route(path: str, method: str = "GET") -> None:
@@ -109,8 +171,41 @@ def list_scans(
     return rows
 
 
+# Override scan creation to enqueue instead of immediate execution
+_remove_route("/scans", "POST")
+@app.post("/scans", response_model=ScanRead, status_code=201)
+def create_scan(
+    payload: ScanCreate,
+    _: object = Depends(require_roles("admin", "operator")),
+    session: Session = Depends(session_dep),
+) -> Scan:
+    if not payload.asset_ids:
+        raise HTTPException(status_code=400, detail="asset_ids must not be empty")
+
+    asset_ids = sorted(set(payload.asset_ids))
+    assets = session.exec(select(Asset).where(Asset.id.in_(asset_ids))).all()
+    if len(assets) != len(asset_ids):
+        raise HTTPException(status_code=404, detail="One or more assets not found")
+
+    profile_key = payload.profile or cm.DEFAULT_PROFILE_KEY  # type: ignore[attr-defined]
+    if profile_key not in cm.SCAN_PROFILE_KEYS:  # type: ignore[attr-defined]
+        raise HTTPException(status_code=400, detail="Unknown scan profile")
+
+    scan = Scan(profile=profile_key, status="queued")
+    session.add(scan)
+    session.flush()
+
+    for asset in assets:
+        session.add(ScanTarget(scan_id=scan.id, asset_id=asset.id))
+        cm._ensure_asset_status(session, scan.id, asset.id)  # type: ignore[attr-defined]
+
+    session.commit()
+    cm._record_scan_event(session, scan.id, "Scan enqueued")  # type: ignore[attr-defined]
+    return scan
+
+
 _remove_route("/findings", "GET")
-@app.get("/findings", response_model=List[FindingRead])
+@app.get("/findings", response_model=List[FindingWithEnrichment])
 def list_findings(
     _: object = Depends(require_roles("admin", "operator", "viewer")),
     scan_id: Optional[int] = Query(default=None),
@@ -130,9 +225,40 @@ def list_findings(
         query = query.where(Finding.status == status_filter)
     total = session.exec(select(func.count()).select_from(query.subquery())).one()
     rows = session.exec(query.order_by(Finding.detected_at.desc()).limit(limit).offset(offset)).all()
+    enrichment_by_finding: Dict[int, Dict[str, Any]] = {}
+    ids = [f.id for f in rows if f.id is not None]
+    if ids:
+        try:
+            stmt = (
+                text(
+                    "SELECT finding_id, cvss_v31_base, cvss_vector, references_json "
+                    "FROM finding_enrichment WHERE finding_id IN :ids"
+                ).bindparams(bindparam("ids", expanding=True))
+            )
+            for row in session.exec(stmt, {"ids": ids}).all():
+                data = dict(row._mapping) if hasattr(row, "_mapping") else dict(row)
+                fid = int(data.get("finding_id"))
+                enrichment_by_finding[fid] = {
+                    "cvss_v31_base": data.get("cvss_v31_base"),
+                    "cvss_vector": data.get("cvss_vector"),
+                    "references": _parse_references(data.get("references_json")),
+                }
+        except Exception:
+            enrichment_by_finding = {}
     if response is not None:
         response.headers["X-Total-Count"] = str(int(total or 0))
-    return rows
+    enriched: List[FindingWithEnrichment] = []
+    for finding in rows:
+        base = finding.model_dump()
+        extra = enrichment_by_finding.get(finding.id or -1, {})
+        payload = {
+            **base,
+            "cvss_v31_base": extra.get("cvss_v31_base"),
+            "cvss_vector": extra.get("cvss_vector"),
+            "references": extra.get("references") or None,
+        }
+        enriched.append(FindingWithEnrichment.model_validate(payload))
+    return enriched
 
 
 @app.get("/scans/{scan_id}/events/stream")
@@ -320,46 +446,77 @@ cm.run_scan_job = run_scan_job
 
 
 # -----------------------------
-# Minimal scheduler (cron-like)
+# Minimal scheduler (weekday/time)
 # -----------------------------
 
-def _parse_minute_field(field: str, minute: int) -> bool:
-    f = field.strip()
-    if f == "*":
-        return True
-    if f.startswith("*/"):
-        try:
-            n = int(f[2:])
-            return n > 0 and (minute % n == 0)
-        except ValueError:
-            return False
+def _valid_time(value: str) -> bool:
+    if not value or ":" not in value:
+        return False
     try:
-        return int(f) == minute
-    except ValueError:
+        h_str, m_str = value.split(":", 1)
+        h = int(h_str)
+        m = int(m_str)
+        return 0 <= h <= 23 and 0 <= m <= 59
+    except Exception:
         return False
 
 
-def _cron_due(cron: str, now: datetime, last_run: Optional[datetime]) -> bool:
-    parts = (cron or "*").split()
-    if len(parts) < 5:
-        parts = parts + ["*"] * (5 - len(parts))
-    minute_field = parts[0]
+def _parse_times(raw: Optional[str]) -> List[str]:
+    try:
+        data = json.loads(raw) if raw else []
+        if isinstance(data, list):
+            times = []
+            for t in data:
+                s = str(t).strip()
+                if _valid_time(s):
+                    times.append(s)
+            return times
+    except Exception:
+        pass
+    return []
+
+
+def _parse_days(raw: Optional[str]) -> List[int]:
+    try:
+        data = json.loads(raw) if raw else []
+        if isinstance(data, list):
+            days: List[int] = []
+            for d in data:
+                try:
+                    n = int(d)
+                    if 0 <= n <= 6:
+                        days.append(n)
+                except Exception:
+                    continue
+            return days
+    except Exception:
+        pass
+    return []
+
+
+def _should_run(job: ScheduleJob, now: datetime, last_run: Optional[datetime]) -> bool:
+    days = _parse_days(job.days_of_week) or list(range(7))
+    times = _parse_times(job.times) or ["00:00"]
+    if now.weekday() not in days:
+        return False
     if last_run and last_run.year == now.year and last_run.month == now.month and last_run.day == now.day:
         if last_run.hour == now.hour and last_run.minute == now.minute:
             return False
-    return _parse_minute_field(minute_field, now.minute)
+    now_hm = f"{now.hour:02d}:{now.minute:02d}"
+    return now_hm in times
 
 
 def _scheduler_ticker() -> None:
     from clanker.db.session import get_session as session_factory
 
+    _ensure_scheduler_tables()
     while True:
         try:
             with session_factory() as session:
                 now = datetime.utcnow()
                 jobs = session.exec(select(ScheduleJob).where(ScheduleJob.enabled == True)).all()  # noqa: E712
                 for job in jobs:
-                    if not _cron_due(job.cron, now, job.last_run_at):
+                    if not _should_run(job, now, job.last_run_at):
                         continue
                     asset_ids = [row.asset_id for row in session.exec(
                         select(AssetGroupMember).where(AssetGroupMember.asset_group_id == job.asset_group_id)
@@ -411,8 +568,87 @@ def _start_scheduler() -> None:
 
 
 # -----------------------------
+# Scan queue worker
+# -----------------------------
+
+def _scan_queue_worker() -> None:
+    from clanker.db.session import get_session as session_factory
+
+    while True:
+        try:
+            with session_factory() as session:
+                scan = session.exec(
+                    select(Scan).where(Scan.status == "queued").order_by(Scan.created_at).limit(1)
+                ).first()
+                if not scan:
+                    time.sleep(5)
+                    continue
+                cm._record_scan_event(session, scan.id, "Dispatching scan from queue")  # type: ignore[attr-defined]
+                session.commit()
+                cm.run_scan_job(scan.id)  # type: ignore[attr-defined]
+        except Exception:
+            cm.logger.exception("Scan queue worker error")
+            time.sleep(5)
+
+
+@app.on_event("startup")
+def _start_scan_queue() -> None:
+    t = threading.Thread(target=_scan_queue_worker, name="scan-queue-worker", daemon=True)
+    t.start()
+
+
+# -----------------------------
 # Minimal CRUD for scheduling
 # -----------------------------
+
+
+def _ensure_scheduler_tables() -> None:
+    """Create scheduler tables if missing (idempotent)."""
+    from clanker.db.session import engine
+
+    ddl = [
+        """
+        CREATE TABLE IF NOT EXISTS assetgroup (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          name TEXT NOT NULL,
+          description TEXT,
+          created_at TEXT DEFAULT (datetime('now'))
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS assetgroupmember (
+          asset_group_id INTEGER NOT NULL,
+          asset_id INTEGER NOT NULL,
+          PRIMARY KEY (asset_group_id, asset_id)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS schedulejob (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          name TEXT NOT NULL,
+          cron TEXT NOT NULL,
+          profile TEXT NOT NULL,
+          asset_group_id INTEGER NOT NULL,
+          enabled BOOLEAN DEFAULT 1,
+          last_run_at TEXT,
+          days_of_week TEXT,
+          times TEXT
+        )
+        """
+    ]
+    with engine.connect() as conn:
+        for stmt in ddl:
+            conn.execute(text(stmt))
+        for ddl_stmt in [
+            "ALTER TABLE schedulejob ADD COLUMN days_of_week TEXT",
+            "ALTER TABLE schedulejob ADD COLUMN times TEXT",
+        ]:
+            try:
+                conn.execute(text(ddl_stmt))
+            except Exception:
+                pass
+        conn.commit()
+
 
 @app.post("/asset_groups", response_model=dict)
 def create_asset_group(payload: dict, _: object = Depends(require_roles("admin")), session: Session = Depends(session_dep)) -> dict:
@@ -447,17 +683,66 @@ def list_asset_groups(_: object = Depends(require_roles("admin", "operator", "vi
 @app.post("/schedules", response_model=dict)
 def create_schedule(payload: dict, _: object = Depends(require_roles("admin")), session: Session = Depends(session_dep)) -> dict:
     name = payload.get("name")
-    cron = payload.get("cron") or "* * * * *"
     profile = payload.get("profile") or "intense"
     asset_group_id = payload.get("asset_group_id")
-    if not name or not asset_group_id:
+    asset_ids = list({int(a) for a in (payload.get("asset_ids") or []) if isinstance(a, (int, str)) and str(a).isdigit()})
+    days = payload.get("days_of_week") or payload.get("days")
+    times = payload.get("times")
+    days_list: List[int] = []
+    times_list: List[str] = []
+    if days and isinstance(days, list):
+        for d in days:
+            try:
+                n = int(d)
+                if 0 <= n <= 6:
+                    days_list.append(n)
+            except Exception:
+                continue
+    if times and isinstance(times, list):
+        for t in times:
+            s = str(t).strip()
+            if _valid_time(s):
+                times_list.append(s)
+    if not name:
         from fastapi import HTTPException
 
-        raise HTTPException(status_code=400, detail="name and asset_group_id are required")
-    job = ScheduleJob(name=name, cron=cron, profile=profile, asset_group_id=int(asset_group_id), enabled=bool(payload.get("enabled", True)))
+        raise HTTPException(status_code=400, detail="name is required")
+    if not asset_group_id and not asset_ids:
+        from fastapi import HTTPException
+
+        raise HTTPException(status_code=400, detail="asset_group_id or asset_ids is required")
+    if not asset_group_id and asset_ids:
+        group = AssetGroup(name=f"Schedule {name}", description=f"Auto group for schedule {name}")
+        session.add(group)
+        session.flush()
+        for aid in asset_ids:
+            session.add(AssetGroupMember(asset_group_id=group.id, asset_id=aid))
+        asset_group_id = group.id
+    if not times_list:
+        times_list = ["00:00"]
+    if not days_list:
+        days_list = list(range(7))
+    job = ScheduleJob(
+        name=name,
+        cron="* * * * *",
+        profile=profile,
+        asset_group_id=int(asset_group_id),
+        enabled=bool(payload.get("enabled", True)),
+        days_of_week=json.dumps(days_list),
+        times=json.dumps(times_list),
+    )
     session.add(job)
     session.commit()
-    return {"id": job.id, "name": job.name, "cron": job.cron, "profile": job.profile, "asset_group_id": job.asset_group_id, "enabled": job.enabled}
+    return {
+        "id": job.id,
+        "name": job.name,
+        "profile": job.profile,
+        "asset_group_id": job.asset_group_id,
+        "asset_ids": asset_ids,
+        "days_of_week": days_list,
+        "times": times_list,
+        "enabled": job.enabled,
+    }
 
 
 @app.get("/schedules", response_model=List[dict])
@@ -467,14 +752,134 @@ def list_schedules(_: object = Depends(require_roles("admin", "operator", "viewe
         {
             "id": j.id,
             "name": j.name,
-            "cron": j.cron,
             "profile": j.profile,
             "asset_group_id": j.asset_group_id,
+            "asset_ids": list(
+                session.exec(
+                    select(AssetGroupMember.asset_id).where(AssetGroupMember.asset_group_id == j.asset_group_id)
+                ).all()
+            ),
+            "days_of_week": _parse_days(j.days_of_week),
+            "times": _parse_times(j.times),
             "enabled": j.enabled,
             "last_run_at": j.last_run_at,
         }
         for j in jobs
     ]
+
+
+@app.patch("/schedules/{schedule_id}", response_model=dict)
+def update_schedule(
+    schedule_id: int, payload: dict, _: object = Depends(require_roles("admin")), session: Session = Depends(session_dep)
+) -> dict:
+    job = session.get(ScheduleJob, schedule_id)
+    if not job:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="Schedule not found")
+
+    if "name" in payload:
+        job.name = payload.get("name") or job.name
+    if "profile" in payload and payload.get("profile"):
+        job.profile = payload["profile"]
+    if "enabled" in payload:
+        job.enabled = bool(payload.get("enabled", True))
+
+    if "days_of_week" in payload:
+        days_list: List[int] = []
+        for d in payload.get("days_of_week") or []:
+            try:
+                n = int(d)
+                if 0 <= n <= 6:
+                    days_list.append(n)
+            except Exception:
+                continue
+        if days_list:
+            job.days_of_week = json.dumps(days_list)
+    if "times" in payload:
+        times_list: List[str] = []
+        for t in payload.get("times") or []:
+            s = str(t).strip()
+            if _valid_time(s):
+                times_list.append(s)
+        if times_list:
+            job.times = json.dumps(times_list)
+
+    if "asset_ids" in payload and isinstance(payload.get("asset_ids"), list):
+        asset_ids = list({int(a) for a in payload.get("asset_ids") if isinstance(a, (int, str)) and str(a).isdigit()})
+        if asset_ids:
+            # Ensure group exists
+            if not job.asset_group_id:
+                group = AssetGroup(name=f"Schedule {job.name}", description=f"Auto group for schedule {job.name}")
+                session.add(group)
+                session.flush()
+                job.asset_group_id = group.id
+            # Replace members
+            session.exec(
+                text("DELETE FROM assetgroupmember WHERE asset_group_id = :gid"),
+                {"gid": job.asset_group_id},
+            )
+            for aid in asset_ids:
+                session.add(AssetGroupMember(asset_group_id=job.asset_group_id, asset_id=aid))
+
+    session.add(job)
+    session.commit()
+    return {
+        "id": job.id,
+        "name": job.name,
+        "profile": job.profile,
+        "asset_group_id": job.asset_group_id,
+        "asset_ids": [
+            row.asset_id
+            for row in session.exec(
+                select(AssetGroupMember.asset_id).where(AssetGroupMember.asset_group_id == job.asset_group_id)
+            ).all()
+        ],
+        "days_of_week": _parse_days(job.days_of_week),
+        "times": _parse_times(job.times),
+        "enabled": job.enabled,
+        "last_run_at": job.last_run_at,
+    }
+
+
+@app.delete("/schedules/{schedule_id}", status_code=204, response_class=Response)
+def delete_schedule(schedule_id: int, _: object = Depends(require_roles("admin")), session: Session = Depends(session_dep)) -> Response:
+    job = session.get(ScheduleJob, schedule_id)
+    if not job:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="Schedule not found")
+    session.delete(job)
+    session.commit()
+    return Response(status_code=204)
+
+
+@app.post("/schedules/{schedule_id}/run-now", response_model=dict)
+def run_schedule_now(
+    schedule_id: int, _: object = Depends(require_roles("admin", "operator")), session: Session = Depends(session_dep)
+) -> dict:
+    job = session.get(ScheduleJob, schedule_id)
+    if not job:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="Schedule not found")
+    asset_ids = [
+        row.asset_id
+        for row in session.exec(
+            select(AssetGroupMember.asset_id).where(AssetGroupMember.asset_group_id == job.asset_group_id)
+        ).all()
+    ]
+    asset_ids = [int(a) for a in asset_ids if a is not None]
+    if not asset_ids:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=400, detail="No assets linked to this schedule")
+    scan = Scan(profile=job.profile, status="queued")
+    session.add(scan)
+    session.flush()
+    for aid in asset_ids:
+        session.add(ScanTarget(scan_id=scan.id, asset_id=aid))
+        cm._ensure_asset_status(session, scan.id, aid)  # type: ignore[attr-defined]
+    session.commit()
+    cm._record_scan_event(session, scan.id, f"Manual run for schedule '{job.name}' created")  # type: ignore[attr-defined]
+    threading.Thread(target=cm.run_scan_job, args=(scan.id,), daemon=True).start()
+    return {"status": "queued", "scan_id": scan.id}
 
 # Gate additional read endpoints defined in core
 from clanker.main import (

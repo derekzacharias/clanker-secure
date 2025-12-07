@@ -7,6 +7,7 @@ import {
   Grid,
   Group,
   MultiSelect,
+  Switch,
   Paper,
   Progress,
   RingProgress,
@@ -95,6 +96,9 @@ interface Finding {
   status: string;
   description?: string | null;
   detected_at: string;
+  cvss_v31_base?: number | null;
+  cvss_vector?: string | null;
+  references?: string[] | null;
 }
 
 interface FindingEnrichment {
@@ -132,6 +136,7 @@ const STATUS_COLORS: Record<string, string> = {
   completed: 'teal',
   completed_with_errors: 'orange',
   failed: 'red',
+  cancelled: 'gray',
 };
 
 const SEVERITY_COLORS: Record<string, string> = {
@@ -178,6 +183,20 @@ api.interceptors.response.use(
     throw error;
   },
 );
+
+const parseApiError = (error: unknown): { message: string; status?: number } => {
+  if (axios.isAxiosError(error)) {
+    const status = error.response?.status;
+    const data = error.response?.data as any;
+    const detail = typeof data?.detail === 'string' ? data.detail : undefined;
+    const message = detail || (typeof data?.message === 'string' ? data.message : error.message);
+    return { message: message || 'Unexpected error', status };
+  }
+  if (error instanceof Error) {
+    return { message: error.message };
+  }
+  return { message: 'Unexpected error' };
+};
 
 const glassStyles = {
   background: 'rgba(10, 15, 28, 0.72)',
@@ -244,7 +263,7 @@ function App() {
   const [assetsOffset, setAssetsOffset] = useState(0);
   const [scansOffset, setScansOffset] = useState(0);
   const [findingsOffset, setFindingsOffset] = useState(0);
-  const [activeTab, setActiveTab] = useState<'assets' | 'scans' | 'findings'>('assets');
+  const [activeTab, setActiveTab] = useState<'assets' | 'scans' | 'findings' | 'schedules'>('assets');
   const [loginOpen, setLoginOpen] = useState<boolean>(false);
   const [loginEmail, setLoginEmail] = useState<string>('');
   const [loginPassword, setLoginPassword] = useState<string>('');
@@ -259,6 +278,31 @@ function App() {
   const [auditOpen, setAuditOpen] = useState<boolean>(false);
   const [auditRows, setAuditRows] = useState<Array<{ id: number; created_at: string; actor_user_id?: number | null; action: string; target?: string | null; ip?: string | null; detail?: string | null }>>([]);
   const [auditFilter, setAuditFilter] = useState<{ user_id?: string; action?: string; since?: string; until?: string }>({});
+  const selectedScan = useMemo(() => scans.find((s) => s.id === selectedScanId) ?? null, [selectedScanId, scans]);
+  type Schedule = {
+    id: number;
+    name: string;
+    profile: string;
+    active: boolean;
+    assetIds: number[];
+    daysOfWeek: number[];
+    times: string[];
+    last_run_at?: string | null;
+    next_run_at?: string | null;
+  };
+  const [schedules, setSchedules] = useState<Schedule[]>([]);
+  const [scheduleModalOpen, setScheduleModalOpen] = useState<boolean>(false);
+  const [editingScheduleId, setEditingScheduleId] = useState<number | null>(null);
+  const [scheduleForm, setScheduleForm] = useState<{ name: string; profile: string; assetIds: string[]; active: boolean; daysOfWeek: string[]; times: string[] }>({
+    name: '',
+    profile: 'intense',
+    assetIds: [],
+    active: true,
+    daysOfWeek: ['0', '1', '2', '3', '4'], // weekdays by default
+    times: ['09:00'],
+  });
+  const [scheduleTimesText, setScheduleTimesText] = useState<string>('09:00');
+  const [scheduleError, setScheduleError] = useState<string>('');
 
   const refreshAll = async () => {
     setLoading(true);
@@ -309,13 +353,21 @@ function App() {
   }, []);
 
   useEffect(() => {
+    if (activeTab === 'schedules' && currentUser && currentUser.role !== 'admin') {
+      setActiveTab('assets');
+    }
+  }, [activeTab, currentUser?.role]);
+
+  useEffect(() => {
     const loadExt = async () => {
       if (!selectedFinding) { setSelectedFindingEnrichment(null); return; }
+      const fallback = deriveEnrichmentFromFinding(selectedFinding);
       try {
         const res = await api.get(`/finding_ext/${selectedFinding.id}`);
-        setSelectedFindingEnrichment(res.data?.enrichment ?? null);
+        const enriched = normalizeEnrichment(res.data?.enrichment);
+        setSelectedFindingEnrichment(enriched ?? fallback);
       } catch (e) {
-        setSelectedFindingEnrichment(null);
+        setSelectedFindingEnrichment(fallback);
       }
     };
     loadExt();
@@ -356,7 +408,9 @@ function App() {
       setLoginOpen(false);
       setMenuOpen(false);
     } catch (e) {
-      notifications.show({ color: 'red', title: 'Login failed', message: `${e}` });
+      const { message, status } = parseApiError(e);
+      const title = status === 429 ? 'Too many attempts' : 'Login failed';
+      notifications.show({ color: 'red', title, message });
     }
   };
 
@@ -404,6 +458,34 @@ function App() {
     if (eventsAutoRefresh) open();
     return () => { if (es) es.close(); };
   }, [selectedScanId, eventsAutoRefresh]);
+
+  useEffect(() => {
+    if (selectedScanId == null) {
+      setScanEvents([]);
+      setAssetStatuses([]);
+      return;
+    }
+    let cancelled = false;
+    const loadScanDetails = async () => {
+      try {
+        const [eventsRes, assetsRes] = await Promise.all([
+          api.get(`/scans/${selectedScanId}/events`),
+          api.get(`/scans/${selectedScanId}/assets`),
+        ]);
+        if (cancelled) return;
+        setScanEvents(eventsRes.data);
+        setAssetStatuses(assetsRes.data);
+      } catch (error) {
+        if (!cancelled) {
+          notifications.show({ color: 'red', title: 'Failed to load scan details', message: `${error}` });
+        }
+      }
+    };
+    loadScanDetails();
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedScanId]);
 
   // Note: Do not early-return before declaring hooks. Auth/login views are
   // returned later to preserve consistent hook order across renders.
@@ -478,6 +560,35 @@ function App() {
       } else {
         notifications.show({ color: 'red', title: 'Failed to queue scan', message: `${error}` });
       }
+    }
+  };
+
+  const handleScanCancel = async (scanId: number) => {
+    try {
+      const res = await api.post<Scan>(`/scans/${scanId}/cancel`);
+      const updated = res.data;
+      setScans((prev) => {
+        let found = false;
+        const mapped = prev.map((scan) => {
+          if (scan.id === scanId) {
+            found = true;
+            return { ...scan, ...updated };
+          }
+          return scan;
+        });
+        return found ? mapped : mapped.concat(updated);
+      });
+      if (selectedScanId === scanId) {
+        const [eventsRes, assetsRes] = await Promise.allSettled([
+          api.get(`/scans/${scanId}/events`),
+          api.get(`/scans/${scanId}/assets`),
+        ]);
+        if (eventsRes.status === 'fulfilled') setScanEvents(eventsRes.value.data);
+        if (assetsRes.status === 'fulfilled') setAssetStatuses(assetsRes.value.data);
+      }
+      notifications.show({ color: 'yellow', title: 'Scan cancelled', message: `Scan #${scanId}` });
+    } catch (error) {
+      notifications.show({ color: 'red', title: 'Failed to cancel', message: `${error}` });
     }
   };
 
@@ -649,6 +760,50 @@ function App() {
     }
   };
 
+  const normalizeEnrichment = (value: any): FindingEnrichment | null => {
+    if (!value) return null;
+    let references: string[] = [];
+    if (Array.isArray(value.references)) {
+      references = value.references.filter((r: unknown) => typeof r === 'string');
+    } else if (typeof value.references_json === 'string') {
+      try {
+        const parsed = JSON.parse(value.references_json);
+        if (Array.isArray(parsed)) references = parsed.filter((r: unknown) => typeof r === 'string');
+      } catch {
+        // ignore parsing errors
+      }
+    }
+    const normalized: FindingEnrichment = {
+      cpe: value.cpe ?? null,
+      cvss_v31_base: value.cvss_v31_base ?? null,
+      cvss_vector: value.cvss_vector ?? null,
+      references,
+      last_enriched_at: value.last_enriched_at ?? null,
+      source: value.source ?? null,
+    };
+    const hasData = normalized.cvss_v31_base != null || !!normalized.cvss_vector || !!normalized.cpe || (references && references.length > 0);
+    return hasData ? normalized : null;
+  };
+
+  const deriveEnrichmentFromFinding = (finding?: Finding | null): FindingEnrichment | null => {
+    if (!finding) return null;
+    return normalizeEnrichment({
+      cvss_v31_base: finding.cvss_v31_base,
+      cvss_vector: finding.cvss_vector,
+      references: finding.references,
+    });
+  };
+
+  const displayedEnrichment = useMemo(
+    () => selectedFindingEnrichment ?? deriveEnrichmentFromFinding(selectedFinding),
+    [selectedFindingEnrichment, selectedFinding],
+  );
+
+  const canCancelScan = (status?: string | null) => {
+    if (!status) return false;
+    return !['completed', 'failed', 'completed_with_errors', 'cancelled'].includes(status);
+  };
+
   const filteredScans = useMemo(() => {
     return scanFilter === 'all' ? scans : scans.filter((s) => s.status === scanFilter);
   }, [scans, scanFilter]);
@@ -684,6 +839,172 @@ function App() {
     a.click();
     URL.revokeObjectURL(url);
   };
+
+  const dayOptions = [
+    { label: 'Mon', value: '0' },
+    { label: 'Tue', value: '1' },
+    { label: 'Wed', value: '2' },
+    { label: 'Thu', value: '3' },
+    { label: 'Fri', value: '4' },
+    { label: 'Sat', value: '5' },
+    { label: 'Sun', value: '6' },
+  ];
+
+  const parseTimesInput = (raw: string): string[] => {
+    return raw
+      .split(/[,\s]+/)
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0);
+  };
+
+  const isValidTime = (t: string): boolean => {
+    if (!t.includes(':')) return false;
+    const [hStr, mStr] = t.split(':');
+    const h = Number(hStr);
+    const m = Number(mStr);
+    return Number.isInteger(h) && Number.isInteger(m) && h >= 0 && h <= 23 && m >= 0 && m <= 59;
+  };
+
+  const resetScheduleForm = () => {
+    setEditingScheduleId(null);
+    setScheduleForm({ name: '', profile: 'intense', assetIds: [], active: true, daysOfWeek: ['0', '1', '2', '3', '4'], times: ['09:00'] });
+    setScheduleTimesText('09:00');
+    setScheduleError('');
+  };
+
+  const handleSaveSchedule = async () => {
+    setScheduleError('');
+    if (!scheduleForm.name.trim()) {
+      setScheduleError('Name is required');
+      return;
+    }
+    if (scheduleForm.daysOfWeek.length === 0) {
+      setScheduleError('Select at least one day');
+      return;
+    }
+    const times = scheduleForm.times.filter((t) => t.trim().length > 0);
+    if (times.length === 0) {
+      setScheduleError('Add at least one time');
+      return;
+    }
+    const invalidTimes = times.filter((t) => !isValidTime(t));
+    if (invalidTimes.length > 0) {
+      setScheduleError(`Invalid time(s): ${invalidTimes.join(', ')}`);
+      return;
+    }
+    const assetIds = scheduleForm.assetIds.map((v) => parseInt(v, 10)).filter((v) => !Number.isNaN(v));
+    if (assetIds.length === 0) {
+      setScheduleError('Select at least one asset');
+      return;
+    }
+    const payload = {
+      name: scheduleForm.name,
+      profile: scheduleForm.profile,
+      asset_ids: assetIds,
+      days_of_week: scheduleForm.daysOfWeek.map((d) => parseInt(d, 10)),
+      times: times,
+      active: scheduleForm.active,
+    };
+    try {
+      if (editingScheduleId) {
+        await api.patch(`/schedules/${editingScheduleId}`, payload);
+        notifications.show({ color: 'green', title: 'Schedule updated', message: scheduleForm.name });
+      } else {
+        await api.post('/schedules', payload);
+        notifications.show({ color: 'green', title: 'Schedule created', message: scheduleForm.name });
+      }
+      setScheduleModalOpen(false);
+      resetScheduleForm();
+      loadSchedules();
+    } catch (e) {
+      notifications.show({ color: 'red', title: 'Failed to save schedule', message: `${e}` });
+    }
+  };
+
+  const handleEditSchedule = (sch: Schedule) => {
+    setEditingScheduleId(sch.id);
+    setScheduleForm({
+      name: sch.name,
+      profile: sch.profile,
+      assetIds: sch.assetIds.map((id) => String(id)),
+      active: sch.active,
+      daysOfWeek: sch.daysOfWeek.map((d) => String(d)),
+      times: sch.times,
+    });
+    setScheduleTimesText(sch.times.join(', '));
+    setScheduleModalOpen(true);
+  };
+
+  const handleToggleSchedule = async (sch: Schedule) => {
+    try {
+      await api.patch(`/schedules/${sch.id}`, { active: !sch.active });
+      notifications.show({ color: 'green', title: sch.active ? 'Schedule paused' : 'Schedule resumed', message: sch.name });
+      loadSchedules();
+    } catch (e) {
+      notifications.show({ color: 'red', title: 'Failed to toggle schedule', message: `${e}` });
+    }
+  };
+
+  const handleRunNow = async (sch: Schedule) => {
+    try {
+      await api.post(`/schedules/${sch.id}/run-now`);
+      notifications.show({ color: 'green', title: 'Run queued', message: sch.name });
+      loadSchedules();
+    } catch (e) {
+      notifications.show({ color: 'red', title: 'Failed to run schedule', message: `${e}` });
+    }
+  };
+
+  const handleDeleteSchedule = async (sch: Schedule) => {
+    if (!window.confirm(`Delete schedule "${sch.name}"?`)) return;
+    try {
+      await api.delete(`/schedules/${sch.id}`);
+      notifications.show({ color: 'green', title: 'Schedule deleted', message: sch.name });
+      loadSchedules();
+    } catch (e) {
+      notifications.show({ color: 'red', title: 'Failed to delete schedule', message: `${e}` });
+    }
+  };
+
+  const parseAssetIds = (raw: unknown): number[] => {
+    if (Array.isArray(raw)) {
+      return raw.map((v) => parseInt(String(v), 10)).filter((v) => !Number.isNaN(v));
+    }
+    if (typeof raw === 'string') {
+      try {
+        const arr = JSON.parse(raw);
+        if (Array.isArray(arr)) {
+          return arr.map((v) => parseInt(String(v), 10)).filter((v) => !Number.isNaN(v));
+        }
+      } catch {}
+    }
+    return [];
+  };
+
+  const loadSchedules = async () => {
+    if (!currentUser || currentUser.role !== 'admin') return;
+    try {
+      const res = await api.get('/schedules');
+      const mapped = res.data.map((s: any) => ({
+        id: s.id,
+        name: s.name,
+        profile: s.profile,
+        active: s.active,
+        assetIds: parseAssetIds(s.asset_ids ?? s.asset_ids_json ?? []),
+        daysOfWeek: Array.isArray(s.days_of_week) ? s.days_of_week.map((d: any) => parseInt(String(d), 10)).filter((n: number) => !Number.isNaN(n)) : [],
+        times: Array.isArray(s.times) ? s.times.map((t: any) => String(t)) : [],
+        last_run_at: s.last_run_at ?? null,
+        next_run_at: s.next_run_at ?? null,
+      }));
+      setSchedules(mapped);
+    } catch (e) {
+      notifications.show({ color: 'red', title: 'Failed to load schedules', message: `${e}` });
+    }
+  };
+
+  useEffect(() => {
+    if (activeTab === 'schedules') loadSchedules();
+  }, [activeTab, currentUser?.role]);
 
   
 
@@ -975,7 +1296,7 @@ function App() {
           <PasswordInput label="Current password" value={oldPw} onChange={(e) => setOldPw(e.currentTarget.value)} />
           <PasswordInput label="New password" value={newPw} onChange={(e) => setNewPw(e.currentTarget.value)} description="Min 10 chars with upper, lower, number, and symbol" />
           <Group justify="flex-end">
-            <Button onClick={async () => { try { await api.post('/auth/change_password', { old_password: oldPw, new_password: newPw }); setOldPw(''); setNewPw(''); notifications.show({ color: 'green', title: 'Password changed', message: '' }); setChangePwOpen(false); } catch (e) { notifications.show({ color: 'red', title: 'Failed to change password', message: `${e}` }); } }} disabled={!oldPw || !newPw}>Update</Button>
+            <Button onClick={async () => { try { await api.post('/auth/change_password', { old_password: oldPw, new_password: newPw }); setOldPw(''); setNewPw(''); notifications.show({ color: 'green', title: 'Password changed', message: '' }); setChangePwOpen(false); } catch (e) { const { message, status } = parseApiError(e); const title = status === 429 ? 'Too many attempts' : 'Failed to change password'; notifications.show({ color: 'red', title, message }); } }} disabled={!oldPw || !newPw}>Update</Button>
           </Group>
         </Stack>
       </Modal>
@@ -1020,6 +1341,51 @@ function App() {
               </Table.Tbody>
             </Table>
           </ScrollArea>
+        </Stack>
+      </Modal>
+      <Modal opened={scheduleModalOpen} onClose={() => { setScheduleModalOpen(false); resetScheduleForm(); }} title={editingScheduleId ? 'Edit schedule' : 'New schedule'} size="lg" centered>
+        <Stack>
+          <TextInput label="Name" value={scheduleForm.name} onChange={(e) => setScheduleForm((p) => ({ ...p, name: e.currentTarget.value }))} />
+          <Group grow>
+            <MultiSelect
+              label="Days"
+              data={dayOptions}
+              value={scheduleForm.daysOfWeek}
+              onChange={(vals) => setScheduleForm((p) => ({ ...p, daysOfWeek: vals }))}
+              clearable
+            />
+            <TextInput
+              label="Times (HH:MM, comma separated)"
+              placeholder="09:00, 17:00"
+              value={scheduleTimesText}
+              onChange={(e) => {
+                const raw = e.currentTarget.value;
+                setScheduleTimesText(raw);
+                setScheduleForm((p) => ({ ...p, times: parseTimesInput(raw) }));
+              }}
+            />
+          </Group>
+          <Select
+            label="Profile"
+            data={SCAN_PROFILES.map((profile) => ({ value: profile.key, label: profile.label }))}
+            value={scheduleForm.profile}
+            onChange={(value) => value && setScheduleForm((prev) => ({ ...prev, profile: value }))}
+          />
+          <MultiSelect
+            label="Assets"
+            placeholder={assets.length ? 'Select assets' : 'Add assets first'}
+            data={assets.map((asset) => ({ value: String(asset.id), label: `${asset.name ? `${asset.name} · ` : ''}${asset.target} (#${asset.id})` }))}
+            value={scheduleForm.assetIds}
+            onChange={(vals) => setScheduleForm((p) => ({ ...p, assetIds: vals }))}
+            searchable
+            nothingFoundMessage="No assets"
+          />
+          <Switch label="Active" checked={scheduleForm.active} onChange={(e) => setScheduleForm((p) => ({ ...p, active: e.currentTarget.checked }))} />
+          {scheduleError && <Text c="red">{scheduleError}</Text>}
+          <Group justify="flex-end">
+            <Button variant="light" onClick={() => { resetScheduleForm(); setScheduleModalOpen(false); }}>Cancel</Button>
+            <Button onClick={handleSaveSchedule}>{editingScheduleId ? 'Update' : 'Create'}</Button>
+          </Group>
         </Stack>
       </Modal>
       <AppShell.Main>
@@ -1197,6 +1563,7 @@ function App() {
               <Tabs.Tab value="assets">Assets</Tabs.Tab>
               <Tabs.Tab value="scans">Scans</Tabs.Tab>
               <Tabs.Tab value="findings">Findings</Tabs.Tab>
+              {currentUser?.role === 'admin' && <Tabs.Tab value="schedules">Schedules</Tabs.Tab>}
             </Tabs.List>
 
             <Tabs.Panel value="assets" pt="md">
@@ -1369,7 +1736,9 @@ function App() {
                                   <Button size="xs" variant="light" onClick={() => setSelectedScanId(scan.id)}>
                                     View
                                   </Button>
-                                  <Button size="xs" variant="light" color="orange" onClick={async () => { try { await api.post(`/scans/${scan.id}/cancel`); notifications.show({ color: 'yellow', title: 'Scan cancelled', message: `Scan #${scan.id}` }); refreshAll(); } catch (e) { notifications.show({ color: 'red', title: 'Failed to cancel', message: `${e}` }); } }}>Cancel</Button>
+                                  <Button size="xs" variant="light" color="orange" onClick={() => handleScanCancel(scan.id)} disabled={!canWrite || !canCancelScan(scan.status)}>
+                                    Cancel
+                                  </Button>
                                   <Button size="xs" color="red" variant="light" onClick={() => handleScanDelete(scan.id)}>
                                     Remove
                                   </Button>
@@ -1432,6 +1801,9 @@ function App() {
                             status: f.status,
                             detected_at: f.detected_at,
                             cve_ids: parseCves(f.cve_ids).join(';'),
+                            cvss_v31_base: f.cvss_v31_base ?? '',
+                            cvss_vector: f.cvss_vector ?? '',
+                            references: (f.references ?? []).join(';'),
                           })),
                           'findings.csv',
                         )
@@ -1537,6 +1909,82 @@ function App() {
                 )}
               </Card>
             </Tabs.Panel>
+
+            {currentUser?.role === 'admin' && (
+              <Tabs.Panel value="schedules" pt="md">
+                <Card padding="lg" radius="md" style={colorScheme === 'light' ? (surfaces.tile as React.CSSProperties) : glassStyles} shadow="xl">
+                  <Group justify="space-between" mb="md">
+                    <div>
+                      <Title order={4} c={colorScheme === 'light' ? '#0b1220' : undefined}>Schedules</Title>
+                      <Text size="sm" c={colorScheme === 'light' ? '#334155' : 'dimmed'}>Create recurring scans</Text>
+                    </div>
+                    <Group gap="xs">
+                      <Button variant="light" onClick={() => loadSchedules()}>Refresh</Button>
+                      <Button onClick={() => { resetScheduleForm(); setScheduleModalOpen(true); }}>New schedule</Button>
+                    </Group>
+                  </Group>
+                  <ScrollArea h={360} offsetScrollbars>
+                    <Table striped highlightOnHover>
+                      <Table.Thead>
+                        <Table.Tr>
+                          <Table.Th>Name</Table.Th>
+                          <Table.Th>Days</Table.Th>
+                          <Table.Th>Times</Table.Th>
+                          <Table.Th>Profile</Table.Th>
+                          <Table.Th>Assets</Table.Th>
+                          <Table.Th>Active</Table.Th>
+                          <Table.Th>Last run</Table.Th>
+                          <Table.Th>Actions</Table.Th>
+                        </Table.Tr>
+                      </Table.Thead>
+                      <Table.Tbody>
+                        {schedules.map((sch) => (
+                          <Table.Tr key={sch.id}>
+                            <Table.Td>{sch.name}</Table.Td>
+                            <Table.Td>
+                              <Group gap={6}>
+                                {(sch.daysOfWeek.length ? sch.daysOfWeek : [0, 1, 2, 3, 4, 5, 6]).map((d) => (
+                                  <Badge key={d} variant="light">{['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'][d] ?? d}</Badge>
+                                ))}
+                              </Group>
+                            </Table.Td>
+                            <Table.Td>
+                              <Group gap={6}>
+                                {(sch.times.length ? sch.times : ['00:00']).map((t) => (
+                                  <Badge key={t} color="blue" variant="outline">{t}</Badge>
+                                ))}
+                              </Group>
+                            </Table.Td>
+                            <Table.Td>{sch.profile}</Table.Td>
+                            <Table.Td>{sch.assetIds.length}</Table.Td>
+                            <Table.Td>
+                              <Badge color={sch.active ? 'teal' : 'gray'}>{sch.active ? 'yes' : 'no'}</Badge>
+                            </Table.Td>
+                            <Table.Td>
+                              <Stack gap={2}>
+                                <Text size="sm">{sch.last_run_at ? new Date(sch.last_run_at).toLocaleString() : '-'}</Text>
+                                <Text size="xs" c="dimmed">Next: {sch.next_run_at ? new Date(sch.next_run_at).toLocaleString() : '-'}</Text>
+                              </Stack>
+                            </Table.Td>
+                            <Table.Td>
+                            <Group gap="xs">
+                              <Button size="xs" variant="light" onClick={() => handleEditSchedule(sch)}>Edit</Button>
+                              <Button size="xs" variant="light" color={sch.active ? 'yellow' : 'teal'} onClick={() => handleToggleSchedule(sch)}>
+                                {sch.active ? 'Pause' : 'Resume'}
+                              </Button>
+                              <Button size="xs" variant="light" color="green" onClick={() => handleRunNow(sch)}>Run now</Button>
+                              <Button size="xs" variant="light" color="red" onClick={() => handleDeleteSchedule(sch)}>Delete</Button>
+                            </Group>
+                          </Table.Td>
+                          </Table.Tr>
+                        ))}
+                      </Table.Tbody>
+                    </Table>
+                  </ScrollArea>
+                  {schedules.length === 0 && <Text c="dimmed" mt="sm">No schedules yet.</Text>}
+                </Card>
+              </Tabs.Panel>
+            )}
           </Tabs>
         </Stack>
       </AppShell.Main>
@@ -1587,7 +2035,7 @@ function App() {
             )}
             <Group justify="space-between">
               <Text fw={600}>Vulnerability details</Text>
-              {!selectedFindingEnrichment && (
+              {!displayedEnrichment && (
                 <Button size="xs" variant="light" onClick={async () => {
                   try {
                     await api.post(`/enrichment/finding/${selectedFinding.id}`);
@@ -1597,9 +2045,9 @@ function App() {
                     const poll = async () => {
                       try {
                         const res = await api.get(`/finding_ext/${selectedFinding.id}`);
-                        const ext = res.data?.enrichment ?? null;
-                        if (ext && (ext.cvss_v31_base != null || (Array.isArray(ext.references) && ext.references.length > 0))) {
-                          setSelectedFindingEnrichment(ext);
+                        const normalized = normalizeEnrichment(res.data?.enrichment);
+                        if (normalized) {
+                          setSelectedFindingEnrichment(normalized);
                           notifications.show({ color: 'green', title: 'Enrichment complete', message: 'CVSS and references loaded.' });
                           return;
                         }
@@ -1617,25 +2065,25 @@ function App() {
                 }}>Enrich now</Button>
               )}
             </Group>
-            {selectedFindingEnrichment && (
+            {displayedEnrichment && (
               <Paper p="sm" withBorder>
                 <Stack gap={6}>
                   <Group gap="xs">
                     <Text size="sm" c="dimmed">CVSS v3.1:</Text>
-                    <Badge color={selectedFindingEnrichment.cvss_v31_base && selectedFindingEnrichment.cvss_v31_base >= 9 ? 'red' : selectedFindingEnrichment.cvss_v31_base && selectedFindingEnrichment.cvss_v31_base >= 7 ? 'orange' : selectedFindingEnrichment.cvss_v31_base && selectedFindingEnrichment.cvss_v31_base >= 4 ? 'yellow' : 'teal'}>
-                      {selectedFindingEnrichment.cvss_v31_base ?? '-'}
+                    <Badge color={displayedEnrichment.cvss_v31_base && displayedEnrichment.cvss_v31_base >= 9 ? 'red' : displayedEnrichment.cvss_v31_base && displayedEnrichment.cvss_v31_base >= 7 ? 'orange' : displayedEnrichment.cvss_v31_base && displayedEnrichment.cvss_v31_base >= 4 ? 'yellow' : 'teal'}>
+                      {displayedEnrichment.cvss_v31_base ?? '-'}
                     </Badge>
-                    {selectedFindingEnrichment.cvss_vector && (
-                      <Text size="sm" c="dimmed">{selectedFindingEnrichment.cvss_vector}</Text>
+                    {displayedEnrichment.cvss_vector && (
+                      <Text size="sm" c="dimmed">{displayedEnrichment.cvss_vector}</Text>
                     )}
                   </Group>
-                  {selectedFindingEnrichment.cpe && (
-                    <Text size="sm"><Text span c="dimmed">CPE:</Text> {selectedFindingEnrichment.cpe}</Text>
+                  {displayedEnrichment.cpe && (
+                    <Text size="sm"><Text span c="dimmed">CPE:</Text> {displayedEnrichment.cpe}</Text>
                   )}
-                  {selectedFindingEnrichment.references && selectedFindingEnrichment.references.length > 0 && (
+                  {displayedEnrichment.references && displayedEnrichment.references.length > 0 && (
                     <Stack gap={4}>
                       <Text size="sm" c="dimmed">References</Text>
-                      {selectedFindingEnrichment.references.map((r, idx) => (
+                      {displayedEnrichment.references.map((r, idx) => (
                         <Text key={idx} size="sm" component="a" href={r} target="_blank" rel="noreferrer" style={{ overflowWrap: 'anywhere' }}>{r}</Text>
                       ))}
                     </Stack>
@@ -1663,6 +2111,19 @@ function App() {
         position="right"
         size="md"
       >
+        {selectedScan && (
+          <Group justify="space-between" mb="sm">
+            <Group gap="xs">
+              <StatusBadge status={selectedScan.status} />
+              <Badge variant="light">{selectedScan.profile}</Badge>
+            </Group>
+            {canWrite && canCancelScan(selectedScan.status) && (
+              <Button size="xs" variant="light" color="orange" onClick={() => handleScanCancel(selectedScan.id)}>
+                Cancel
+              </Button>
+            )}
+          </Group>
+        )}
         <Group justify="space-between" mb="sm">
           <Group gap="xs">
             <Badge variant="light">{scanEvents.length} events</Badge>
@@ -1675,6 +2136,18 @@ function App() {
             <Button size="xs" variant="light" onClick={() => selectedScanId && api.get(`/scans/${selectedScanId}/assets`).then((r) => setAssetStatuses(r.data))}>Assets</Button>
           </Group>
         </Group>
+        <Stack gap={6} mb="sm">
+          <Text fw={600} size="sm">Latest events</Text>
+          {scanEvents.length === 0 && <Text size="sm" c="dimmed">No events yet.</Text>}
+          {scanEvents.slice(0, 3).map((e) => (
+            <Group key={`latest-${e.id}`} gap="sm">
+              <Text size="xs" c="dimmed" w={160}>
+                {new Date(e.created_at).toLocaleString()}
+              </Text>
+              <Text size="sm">{e.message}</Text>
+            </Group>
+          ))}
+        </Stack>
         {assetStatuses.length > 0 && (
           <Stack gap="xs" mb="sm">
             <Text fw={600} size="sm">Assets in this scan</Text>
@@ -1700,6 +2173,7 @@ function App() {
             </ScrollArea>
           </Stack>
         )}
+        <Text fw={600} size="sm" mb="xs">Event log</Text>
         <ScrollArea h={520} offsetScrollbars>
           <Stack gap={4}>
             {scanEvents.map((e) => (

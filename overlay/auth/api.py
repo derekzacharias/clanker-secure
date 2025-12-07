@@ -100,6 +100,10 @@ def refresh(payload: RefreshRequest, session: Session = Depends(session_dep)) ->
     tok = session.exec(
         select(SessionToken).where(SessionToken.token == payload.refresh_token, SessionToken.token_type == "refresh")
     ).first()
+    if tok and tok.expires_at and tok.expires_at.tzinfo is None:
+        tok.expires_at = tok.expires_at.replace(tzinfo=timezone.utc)
+        session.add(tok)
+        session.flush()
     if not tok or tok.revoked or tok.expires_at <= now_utc():
         raise HTTPException(status_code=401, detail="Invalid or expired refresh token")
 

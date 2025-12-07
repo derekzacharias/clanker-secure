@@ -1,15 +1,19 @@
 from __future__ import annotations
 
+import csv
+import io
+import json
 import logging
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from sqlalchemy import bindparam, text
 from sqlalchemy.orm import selectinload
 from sqlmodel import Session, func, select
 
@@ -78,6 +82,158 @@ def session_dep() -> Session:
         yield session
 
 
+def _paginate_query(session: Session, query, limit: int, offset: int) -> tuple[list[Any], int]:
+    total = session.exec(select(func.count()).select_from(query.subquery())).one()
+    rows = session.exec(query.limit(limit).offset(offset)).all()
+    return rows, int(total or 0)
+
+
+def _build_finding_filters(
+    scan_id: Optional[int],
+    severity: Optional[str],
+    status_filter: Optional[str],
+    asset_id: Optional[int],
+    search: Optional[str],
+):
+    query = select(Finding)
+    clauses = []
+    params: Dict[str, Any] = {}
+
+    if scan_id is not None:
+        query = query.where(Finding.scan_id == scan_id)
+        clauses.append("f.scan_id = :scan_id")
+        params["scan_id"] = scan_id
+    if severity is not None:
+        query = query.where(Finding.severity == severity)
+        clauses.append("f.severity = :severity")
+        params["severity"] = severity
+    if status_filter is not None:
+        query = query.where(Finding.status == status_filter)
+        clauses.append("f.status = :status_filter")
+        params["status_filter"] = status_filter
+    if asset_id is not None:
+        query = query.where(Finding.asset_id == asset_id)
+        clauses.append("f.asset_id = :asset_id")
+        params["asset_id"] = asset_id
+    if search:
+        pattern = f"%{search.lower()}%"
+        query = query.where(
+            func.lower(Finding.service_name).like(pattern)
+            | func.lower(Finding.host_address).like(pattern)
+            | func.lower(Finding.description).like(pattern)
+        )
+        clauses.append(
+            "(lower(f.service_name) LIKE :q OR lower(f.host_address) LIKE :q OR lower(f.description) LIKE :q)"
+        )
+        params["q"] = pattern
+
+    where_sql = " AND ".join(clauses) if clauses else "1=1"
+    return query, where_sql, params
+
+
+def _load_enrichment(session: Session, finding_ids: List[int]) -> Dict[int, Dict[str, Any]]:
+    if not finding_ids:
+        return {}
+    stmt = (
+        text(
+            "SELECT finding_id, cvss_v31_base, cvss_vector, references_json "
+            "FROM finding_enrichment WHERE finding_id IN :ids"
+        ).bindparams(bindparam("ids", expanding=True))
+    )
+    enrichment: Dict[int, Dict[str, Any]] = {}
+    try:
+        for row in session.exec(stmt, {"ids": finding_ids}).all():
+            data = dict(row._mapping) if hasattr(row, "_mapping") else dict(row)
+            fid = int(data.get("finding_id"))
+            enrichment[fid] = {
+                "cvss_v31_base": data.get("cvss_v31_base"),
+                "cvss_vector": data.get("cvss_vector"),
+                "references_json": data.get("references_json"),
+            }
+    except Exception:
+        return {}
+    return enrichment
+
+
+def _parse_cve_ids(raw: Optional[str]) -> List[str]:
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+        if isinstance(data, list):
+            return [s for s in data if isinstance(s, str)]
+    except Exception:
+        if isinstance(raw, str) and "CVE-" in raw.upper():
+            return [raw]
+    return []
+
+
+def _cvss_band(score: Optional[float]) -> str:
+    if score is None:
+        return "unscored"
+    if score >= 9.0:
+        return "critical"
+    if score >= 7.0:
+        return "high"
+    if score >= 4.0:
+        return "medium"
+    if score > 0:
+        return "low"
+    return "none"
+
+
+def _serialize_finding_export(finding: Finding, enrichment: Dict[str, Any]) -> Dict[str, Any]:
+    score = enrichment.get("cvss_v31_base")
+    cves = _parse_cve_ids(finding.cve_ids)
+    return {
+        "id": finding.id,
+        "scan_id": finding.scan_id,
+        "asset_id": finding.asset_id,
+        "detected_at": finding.detected_at.isoformat() if finding.detected_at else None,
+        "severity": finding.severity,
+        "status": finding.status,
+        "service_name": finding.service_name,
+        "service_version": finding.service_version,
+        "host_address": finding.host_address,
+        "port": finding.port,
+        "protocol": finding.protocol,
+        "description": finding.description,
+        "cve_ids": cves,
+        "cvss_v31_base": score,
+        "cvss_vector": enrichment.get("cvss_vector"),
+        "cvss_band": _cvss_band(score if isinstance(score, (float, int)) else None),
+    }
+
+
+def _aggregate_cvss_bands(session: Session, where_sql: str, params: Dict[str, Any]) -> Dict[str, int]:
+    summary = {"critical": 0, "high": 0, "medium": 0, "low": 0, "none": 0, "unscored": 0}
+    stmt = text(
+        "SELECT "
+        "CASE "
+        "WHEN fe.cvss_v31_base >= 9 THEN 'critical' "
+        "WHEN fe.cvss_v31_base >= 7 THEN 'high' "
+        "WHEN fe.cvss_v31_base >= 4 THEN 'medium' "
+        "WHEN fe.cvss_v31_base > 0 THEN 'low' "
+        "WHEN fe.cvss_v31_base = 0 THEN 'none' "
+        "ELSE 'unscored' END AS band, "
+        "COUNT(*) AS count "
+        "FROM finding f "
+        "LEFT JOIN finding_enrichment fe ON fe.finding_id = f.id "
+        f"WHERE {where_sql} "
+        "GROUP BY band"
+    )
+    try:
+        for row in session.exec(stmt, params).all():
+            data = dict(row._mapping) if hasattr(row, "_mapping") else dict(row)
+            band = data.get("band")
+            count = data.get("count")
+            if band in summary:
+                summary[band] = int(count or 0)
+    except Exception:
+        return summary
+    return summary
+
+
 def _record_scan_event(session: Session, scan_id: int, message: str) -> None:
     session.add(ScanEvent(scan_id=scan_id, message=message))
     session.commit()
@@ -106,8 +262,27 @@ def create_asset(payload: AssetCreate, session: Session = Depends(session_dep)) 
 
 
 @app.get("/assets", response_model=List[AssetRead])
-def list_assets(session: Session = Depends(session_dep)) -> List[Asset]:
-    return session.exec(select(Asset).order_by(Asset.created_at.desc())).all()
+def list_assets(
+    response: Response,
+    q: Optional[str] = Query(default=None, description="Filter by partial target or name"),
+    environment: Optional[str] = Query(default=None),
+    owner: Optional[str] = Query(default=None),
+    limit: int = Query(default=100, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0),
+    session: Session = Depends(session_dep),
+) -> List[Asset]:
+    query = select(Asset)
+    if q:
+        pattern = f"%{q.lower()}%"
+        query = query.where(func.lower(Asset.target).like(pattern) | func.lower(Asset.name).like(pattern))
+    if environment:
+        query = query.where(Asset.environment == environment)
+    if owner:
+        query = query.where(Asset.owner == owner)
+
+    rows, total = _paginate_query(session, query.order_by(Asset.created_at.desc()), limit, offset)
+    response.headers["X-Total-Count"] = str(total)
+    return rows
 
 
 @app.get("/assets/{asset_id}", response_model=AssetRead)
@@ -174,8 +349,19 @@ def create_scan(
 
 
 @app.get("/scans", response_model=List[ScanRead])
-def list_scans(session: Session = Depends(session_dep)) -> List[Scan]:
-    return session.exec(select(Scan).order_by(Scan.created_at.desc())).all()
+def list_scans(
+    response: Response,
+    status: Optional[str] = Query(default=None),
+    limit: int = Query(default=100, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0),
+    session: Session = Depends(session_dep),
+) -> List[Scan]:
+    query = select(Scan)
+    if status:
+        query = query.where(Scan.status == status)
+    rows, total = _paginate_query(session, query.order_by(Scan.created_at.desc()), limit, offset)
+    response.headers["X-Total-Count"] = str(total)
+    return rows
 
 
 @app.delete("/scans/{scan_id}", status_code=204)
@@ -264,19 +450,106 @@ def list_scan_events(scan_id: int, session: Session = Depends(session_dep)) -> L
 
 @app.get("/findings", response_model=List[FindingRead])
 def list_findings(
+    response: Response,
     scan_id: Optional[int] = Query(default=None),
     severity: Optional[str] = Query(default=None),
     status_filter: Optional[str] = Query(default=None, alias="status"),
+    asset_id: Optional[int] = Query(default=None),
+    search: Optional[str] = Query(default=None, alias="q"),
+    limit: int = Query(default=100, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0),
     session: Session = Depends(session_dep),
 ) -> List[Finding]:
-    query = select(Finding)
-    if scan_id is not None:
-        query = query.where(Finding.scan_id == scan_id)
-    if severity is not None:
-        query = query.where(Finding.severity == severity)
-    if status_filter is not None:
-        query = query.where(Finding.status == status_filter)
-    return session.exec(query.order_by(Finding.detected_at.desc())).all()
+    query, _, _ = _build_finding_filters(scan_id, severity, status_filter, asset_id, search)
+    rows, total = _paginate_query(session, query.order_by(Finding.detected_at.desc()), limit, offset)
+    response.headers["X-Total-Count"] = str(total)
+    return rows
+
+
+@app.get("/reports/findings/export")
+def export_findings_report(
+    response: Response,
+    format: str = Query(default="json", pattern="^(json|csv)$"),
+    scan_id: Optional[int] = Query(default=None),
+    severity: Optional[str] = Query(default=None),
+    status_filter: Optional[str] = Query(default=None, alias="status"),
+    asset_id: Optional[int] = Query(default=None),
+    search: Optional[str] = Query(default=None, alias="q"),
+    limit: int = Query(default=5000, ge=1, le=20000),
+    offset: int = Query(default=0, ge=0),
+    session: Session = Depends(session_dep),
+) -> Any:
+    fmt = format.lower()
+    if fmt not in {"json", "csv"}:
+        raise HTTPException(status_code=400, detail="Unsupported export format")
+
+    base_query, where_sql, params = _build_finding_filters(scan_id, severity, status_filter, asset_id, search)
+    total = session.exec(select(func.count()).select_from(base_query.subquery())).one()
+    total_count = int(total or 0)
+    rows = session.exec(
+        base_query.order_by(Finding.detected_at.desc()).limit(limit).offset(offset)
+    ).all()
+    enrichment = _load_enrichment(session, [r.id for r in rows if r.id is not None])
+    export_rows = [_serialize_finding_export(f, enrichment.get(f.id or -1, {})) for f in rows]
+    band_summary = _aggregate_cvss_bands(session, where_sql, params)
+    timestamp = datetime.utcnow().isoformat() + "Z"
+
+    response.headers["X-Total-Count"] = str(total_count)
+    response.headers["X-CVSS-Bands"] = json.dumps(band_summary)
+
+    if fmt == "csv":
+        output = io.StringIO()
+        fieldnames = [
+            "id",
+            "scan_id",
+            "asset_id",
+            "detected_at",
+            "severity",
+            "status",
+            "service_name",
+            "service_version",
+            "host_address",
+            "port",
+            "protocol",
+            "description",
+            "cvss_v31_base",
+            "cvss_vector",
+            "cvss_band",
+            "cve_ids",
+        ]
+        writer = csv.DictWriter(output, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in export_rows:
+            writer.writerow(
+                {
+                    **{k: row.get(k) for k in fieldnames if k != "cve_ids"},
+                    "cve_ids": ";".join(row.get("cve_ids") or []),
+                }
+            )
+        filename = f"findings_export_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.csv"
+        headers = {
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "X-Total-Count": str(total_count),
+            "X-CVSS-Bands": json.dumps(band_summary),
+        }
+        return Response(content=output.getvalue(), media_type="text/csv", headers=headers)
+
+    return {
+        "generated_at": timestamp,
+        "filters": {
+            "scan_id": scan_id,
+            "severity": severity,
+            "status": status_filter,
+            "asset_id": asset_id,
+            "search": search,
+            "limit": limit,
+            "offset": offset,
+        },
+        "total": total_count,
+        "returned": len(export_rows),
+        "cvss_bands": band_summary,
+        "rows": export_rows,
+    }
 
 
 @app.patch("/findings/{finding_id}", response_model=FindingRead)

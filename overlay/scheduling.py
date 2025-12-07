@@ -60,10 +60,21 @@ def _cron_matches(dt: datetime, expr: str) -> bool:
 
 @app.on_event("startup")
 def _ensure_schedule_table() -> None:
-    # Create table if missing
+    # Create table if missing (idempotent)
     with get_session() as s:
-        SQLModel.metadata.create_all(s.get_bind())  # ensure base
-        s.exec(SQLModel.metadata.bind.execute if hasattr(SQLModel.metadata, 'bind') else select(Schedule)).first()  # touch
+        s.exec("""
+        CREATE TABLE IF NOT EXISTS schedule (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          name TEXT NOT NULL,
+          cron TEXT NOT NULL,
+          profile TEXT NOT NULL,
+          asset_ids_json TEXT NOT NULL,
+          active BOOLEAN DEFAULT 1,
+          last_run_at TEXT,
+          next_run_at TEXT
+        )
+        """)
+        s.commit()
 
 
 async def _scheduler_loop() -> None:
@@ -157,4 +168,3 @@ def run_now(schedule_id: int, _: object = Depends(require_roles("admin", "operat
     sch.next_run_at = _now()
     session.add(sch)
     return {"status": "queued"}
-
