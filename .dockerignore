@@ -1,0 +1,9 @@
+.git
+.venv
+__pycache__/
+*.pyc
+scan_artifacts/
+clanker.db
+uvicorn.log
+frontend/node_modules/
+frontend/dist/

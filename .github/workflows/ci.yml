@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install Poetry
+        run: pipx install poetry
+      - name: Install deps
+        run: poetry install --with dev
+      - name: Lint (ruff)
+        run: poetry run ruff check src overlay
+      - name: Format check (black)
+        run: poetry run black --check src overlay
+      - name: Frontend build
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: cd frontend && npm ci && npm run build
+      - name: Docker build
+        run: docker build -t clanker .

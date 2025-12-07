@@ -1,0 +1,365 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Clanker Scanner</title>
+    <style>
+      body { font-family: Arial, sans-serif; margin: 2rem; }
+      h1, h2 { color: #1f2933; }
+      table { border-collapse: collapse; width: 100%; margin-bottom: 2rem; }
+      th, td { border: 1px solid #d1d5db; padding: 0.5rem; text-align: left; }
+      th { background-color: #f3f4f6; }
+      form { margin-bottom: 1.5rem; }
+      label { display: block; margin-bottom: 0.5rem; }
+      input[type="text"], textarea, select { width: 100%; padding: 0.4rem; }
+      textarea { resize: vertical; min-height: 60px; }
+      button { padding: 0.4rem 0.8rem; }
+      .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 1.5rem; }
+      .card { border: 1px solid #e5e7eb; padding: 1rem; border-radius: 6px; }
+      .status-bar { display: flex; flex-wrap: wrap; gap: 0.75rem; margin-bottom: 1.5rem; align-items: center; }
+      .status-chip { background-color: #f3f4f6; border-radius: 999px; padding: 0.4rem 0.9rem; font-size: 0.9rem; }
+      .status-chip span { font-weight: bold; margin-left: 0.25rem; }
+      .activity-indicator { display: flex; align-items: center; gap: 0.4rem; padding: 0.4rem 0.9rem; border-radius: 999px; background-color: rgba(224, 242, 254, 0.8); color: #0369a1; font-weight: 600; position: relative; overflow: hidden; }
+      .activity-indicator::after { content: ''; position: absolute; inset: 0; background: linear-gradient(120deg, rgba(59,130,246,0.3), rgba(45,212,191,0.3)); opacity: 0.5; animation: pulse 2s ease-in-out infinite; }
+      .activity-indicator span { position: relative; }
+      .spinner { width: 14px; height: 14px; border: 2px solid #7dd3fc; border-top-color: transparent; border-radius: 50%; animation: spin 0.8s linear infinite; position: relative; z-index: 1; }
+      @keyframes spin { to { transform: rotate(360deg); } }
+      @keyframes pulse { 0% { opacity: 0.3; transform: translateX(-10%); } 50% { opacity: 0.7; transform: translateX(10%); } 100% { opacity: 0.3; transform: translateX(-10%); } }
+      small { color: #4b5563; display: block; margin-top: 0.2rem; }
+      details { margin: 0.8rem 0 1rem; }
+      summary { cursor: pointer; font-weight: 600; color: #1f2933; }
+      .profile-help { margin: 0.5rem 0 0 1.2rem; font-size: 0.9rem; color: #374151; }
+      .profile-help li { margin-bottom: 0.4rem; word-break: break-word; }
+      pre.nmap-summary { background-color: #0f172a; color: #f8fafc; padding: 1rem; border-radius: 6px; overflow-x: auto; font-size: 0.85rem; }
+      .status-pill, .severity-pill { display: inline-flex; align-items: center; border-radius: 999px; padding: 0.15rem 0.55rem; font-size: 0.8rem; font-weight: 600; text-transform: capitalize; }
+      .status-queued { background-color: #fef3c7; color: #92400e; }
+      .status-running { background-color: #dbeafe; color: #1d4ed8; }
+      .status-completed { background-color: #dcfce7; color: #166534; }
+      .status-completed_with_errors { background-color: #fef9c3; color: #92400e; }
+      .status-failed { background-color: #fee2e2; color: #b91c1c; }
+      .status-pending { background-color: #e0e7ff; color: #3730a3; }
+      .status-open { background-color: #e0f2fe; color: #0369a1; }
+      .status-acknowledged { background-color: #fef9c3; color: #92400e; }
+      .status-mitigated { background-color: #dcfce7; color: #166534; }
+      .summary-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 1rem; margin-bottom: 1rem; }
+      .summary-card { padding: 1rem; border-radius: 8px; border: 1px solid #e2e8f0; background-color: #f9fafb; }
+      .summary-card strong { display: block; font-size: 1.7rem; margin-top: 0.4rem; color: #111827; }
+      .overview-panels { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 1rem; margin-bottom: 1.5rem; }
+      .overview-card { border: 1px solid #e5e7eb; border-radius: 6px; padding: 1rem; }
+      .overview-card ul { list-style: none; padding: 0; margin: 0; }
+      .overview-card li { display: flex; justify-content: space-between; border-bottom: 1px solid #eef2f7; padding: 0.3rem 0; font-size: 0.95rem; }
+      .overview-card li:last-child { border-bottom: none; }
+      .toolbar { display: flex; justify-content: flex-end; margin-bottom: 1rem; }
+      .toolbar button { border: 1px solid #1f2933; background-color: #111827; color: #fff; padding: 0.45rem 0.9rem; border-radius: 4px; cursor: pointer; }
+      .toolbar button:hover { opacity: 0.85; }
+      .severity-informational { background-color: #e0f2fe; color: #0369a1; }
+      .severity-low { background-color: #ecfccb; color: #4d7c0f; }
+      .severity-medium { background-color: #fef3c7; color: #92400e; }
+      .severity-high { background-color: #fee2e2; color: #b91c1c; }
+      .severity-critical { background-color: #fecdd3; color: #9d174d; }
+    </style>
+  </head>
+  <body>
+    <h1>Clanker MVP</h1>
+    <div class="status-bar">
+      {% set queued = scan_status_summary.get('queued', 0) %}
+      {% set running = scan_status_summary.get('running', 0) %}
+      {% set completed = scan_status_summary.get('completed', 0) %}
+      {% set completed_err = scan_status_summary.get('completed_with_errors', 0) %}
+      {% set failed = scan_status_summary.get('failed', 0) %}
+      <div class="status-chip">Queued <span>{{ queued }}</span></div>
+      <div class="status-chip">Running <span>{{ running }}</span></div>
+      <div class="status-chip">Completed <span>{{ completed }}</span></div>
+      <div class="status-chip">Completed w/ Errors <span>{{ completed_err }}</span></div>
+      <div class="status-chip">Failed <span>{{ failed }}</span></div>
+      {% set active = queued + running %}
+      {% if active > 0 %}
+      <div class="activity-indicator" title="Scanner is currently processing jobs">
+        <div class="spinner"></div>
+        <span>Scanning {{ active }} target{{ 's' if active > 1 else '' }}...</span>
+      </div>
+      {% endif %}
+    </div>
+    <div class="toolbar">
+      <button type="button" onclick="window.location.reload()">Refresh Dashboard</button>
+    </div>
+    <div class="summary-grid">
+      <div class="summary-card">
+        Assets
+        <strong>{{ asset_count }}</strong>
+      </div>
+      <div class="summary-card">
+        Scans
+        <strong>{{ scan_count }}</strong>
+      </div>
+      <div class="summary-card">
+        Findings
+        <strong>{{ finding_count }}</strong>
+      </div>
+      <div class="summary-card">
+        Open Findings
+        <strong>{{ open_findings }}</strong>
+      </div>
+    </div>
+    <div class="overview-panels">
+      <div class="overview-card">
+        <h3>Scan Status Overview</h3>
+        <ul>
+          {% for status, count in scan_status_summary.items() %}
+          <li>
+            <span>{{ status.replace('_', ' ').title() }}</span>
+            <span>{{ count }}</span>
+          </li>
+          {% endfor %}
+        </ul>
+      </div>
+      <div class="overview-card">
+        <h3>Finding Severity Overview</h3>
+        <ul>
+          {% for severity, count in finding_severity_summary.items() %}
+          <li>
+            <span>{{ severity.title() }}</span>
+            <span>{{ count }}</span>
+          </li>
+          {% endfor %}
+        </ul>
+      </div>
+    </div>
+    <div class="grid">
+      <div class="card">
+        <h2>Add Asset</h2>
+        <form method="post" action="/assets" onsubmit="return submitForm(event, this);">
+          <label>
+            Name (optional)
+            <input type="text" name="name" />
+          </label>
+          <label>
+            Target (IP / hostname / CIDR)
+            <input type="text" name="target" placeholder="10.0.0.10" required />
+            <small>Examples: 10.0.0.10, 10.0.0.0/24, web01.corp.local</small>
+          </label>
+          <label>
+            Environment
+            <input type="text" name="environment" placeholder="prod, staging, lab" />
+          </label>
+          <label>
+            Owner
+            <input type="text" name="owner" placeholder="team@company" />
+          </label>
+          <label>
+            Notes
+            <textarea name="notes" placeholder="Auth scope, maintenance window, etc."></textarea>
+          </label>
+          <button type="submit">Save Asset</button>
+        </form>
+      </div>
+      <div class="card">
+        <h2>Start Scan</h2>
+        <form method="post" action="/scans" onsubmit="return submitScanForm(event, this);">
+          <label>
+            Asset IDs (comma separated)
+            <input type="text" name="asset_ids" placeholder="1,2" required />
+            <small>Use the asset IDs listed below (e.g., <code>1,3,5</code>)</small>
+          </label>
+          <label>
+            Profile
+            <select name="profile">
+              {% for profile in scan_profiles %}
+              <option value="{{ profile.key }}" {% if profile.key == default_profile %}selected{% endif %}>
+                {{ profile.label }}
+              </option>
+              {% endfor %}
+            </select>
+          </label>
+          <details>
+            <summary>Profile details & commands</summary>
+            <ul class="profile-help">
+              {% for profile in scan_profiles %}
+              <li>
+                <strong>{{ profile.label }}:</strong> {{ profile.description }}
+                <br /><code>{{ profile.command }}</code>
+              </li>
+              {% endfor %}
+            </ul>
+          </details>
+          <button type="submit">Queue Scan</button>
+        </form>
+      </div>
+    </div>
+
+    <h2>Recent Assets</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>ID</th>
+          <th>Name</th>
+          <th>Target</th>
+          <th>Env</th>
+          <th>Owner</th>
+          <th>Created</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for asset in assets %}
+        <tr>
+          <td>{{ asset.id }}</td>
+          <td>{{ asset.name or "-" }}</td>
+          <td>{{ asset.target }}</td>
+          <td>{{ asset.environment or "-" }}</td>
+          <td>{{ asset.owner or "-" }}</td>
+          <td>{{ asset.created_at }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+
+    <h2>Recent Scans</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>ID</th>
+          <th>Status</th>
+          <th>Profile</th>
+          <th>Created</th>
+          <th>Started</th>
+          <th>Completed</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for scan in scans %}
+        <tr>
+          <td>{{ scan.id }}</td>
+          <td><span class="status-pill status-{{ scan.status }}">{{ scan.status.replace('_', ' ') }}</span></td>
+          <td>{{ scan.profile }}</td>
+          <td>{{ scan.created_at }}</td>
+          <td>{{ scan.started_at or "-" }}</td>
+          <td>{{ scan.completed_at or "-" }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+
+    <h2>Recent Findings</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>ID</th>
+          <th>Scan</th>
+          <th>Asset</th>
+          <th>Target</th>
+          <th>Port</th>
+          <th>Service</th>
+          <th>Severity</th>
+          <th>Status</th>
+          <th>Rule</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for finding in findings %}
+        <tr>
+          <td>{{ finding.id }}</td>
+          <td>{{ finding.scan_id }}</td>
+          <td>{{ finding.asset_id }}</td>
+          <td>{{ finding.asset.target if finding.asset else "-" }}</td>
+          <td>{{ finding.port or "-" }}</td>
+          <td>{{ finding.service_name or "-" }}</td>
+          <td><span class="severity-pill severity-{{ finding.severity | lower }}">{{ finding.severity }}</span></td>
+          <td><span class="status-pill status-{{ finding.status }}">{{ finding.status }}</span></td>
+          <td>{{ finding.rule_id or "-" }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+
+    {% if scan_summaries %}
+    <h2>Scan Summaries</h2>
+    {% for summary in scan_summaries %}
+    <pre class="nmap-summary">{{ summary }}</pre>
+    {% endfor %}
+    {% endif %}
+
+    <h2>Recent Scan Events</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>Timestamp</th>
+          <th>Message</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for event in events %}
+        <tr>
+          <td>{{ event.created_at }}</td>
+          <td>{{ event.message }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+
+    <h2>Asset Scan Status</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>Scan ID</th>
+          <th>Asset ID</th>
+          <th>Target</th>
+          <th>Status</th>
+          <th>Attempts</th>
+          <th>Started</th>
+          <th>Completed</th>
+          <th>Last Error</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for status in asset_statuses %}
+        <tr>
+          <td>{{ status.scan_id }}</td>
+          <td>{{ status.asset_id }}</td>
+          <td>{{ status.target or "-" }}</td>
+          <td><span class="status-pill status-{{ status.status }}">{{ status.status }}</span></td>
+          <td>{{ status.attempts }}</td>
+          <td>{{ status.started_at or "-" }}</td>
+          <td>{{ status.completed_at or "-" }}</td>
+          <td>{{ status.last_error or "-" }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+
+    <script>
+      async function submitForm(event, form) {
+        event.preventDefault();
+        const payload = {
+          name: form.name.value || null,
+          target: form.target.value,
+          environment: form.environment.value || null,
+          owner: form.owner.value || null,
+          notes: form.notes.value || null,
+        };
+        await fetch(form.action, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        window.location.reload();
+      }
+
+      async function submitScanForm(event, form) {
+        event.preventDefault();
+        const ids = form.asset_ids.value.split(',').map((v) => parseInt(v.trim(), 10)).filter((v) => !isNaN(v));
+        const payload = { asset_ids: ids, profile: form.profile.value || 'basic' };
+        await fetch(form.action, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        window.location.reload();
+      }
+      setInterval(() => {
+        if (document.visibilityState === 'visible') {
+          window.location.reload();
+        }
+      }, 120000);
+    </script>
+  </body>
+</html>

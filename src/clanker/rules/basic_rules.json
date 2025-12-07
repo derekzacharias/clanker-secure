@@ -1,0 +1,34 @@
+[
+  {
+    "id": "RULE-SSH-001",
+    "match": {
+      "port": 22,
+      "service_name": "OpenSSH",
+      "version_contains": "7.2"
+    },
+    "cve": ["CVE-2016-0777"],
+    "severity": "high",
+    "description": "OpenSSH 7.2 is outdated and susceptible to multiple info-leak issues."
+  },
+  {
+    "id": "RULE-RDP-001",
+    "match": {
+      "port": 3389,
+      "service_name": "ms-wbt-server"
+    },
+    "cve": ["CVE-2019-0708"],
+    "severity": "critical",
+    "description": "Check BlueKeep exposure when RDP is accessible from broad networks."
+  },
+  {
+    "id": "RULE-HTTP-001",
+    "match": {
+      "port": 80,
+      "service_name": "http",
+      "version_contains": "Apache/2.2"
+    },
+    "cve": ["CVE-2011-3368"],
+    "severity": "medium",
+    "description": "Old Apache 2.2 builds allow reverse-proxy bypass."
+  }
+]
