@@ -1,5 +1,17 @@
 # Product Backlog (Open Items Only)
 
+## Near-term backlog (prioritized)
+- [ ] CVE enrichment Phase 1 (UI chips, CSV/JSON exports, CVSS placeholders) — Labels: frontend, ui, api-change
+- [ ] Auth hardening: login rate limiting; audit logging for auth events (login success/fail, password reset, MFA setup) — Labels: auth
+- [ ] Background job queue for scans with retries/cancellation hooks — Labels: core, infra
+- [ ] Server-side pagination and filtering for /findings, /scans, /assets — Labels: api, core
+- [ ] Structured logs + basic metrics for scanner and API — Labels: infra
+- [ ] Scheduled scans (cron/presets) — Labels: core, infra
+- [ ] NVD enrichment Phase 2 (cache + CPE inference + enrichment job) — Labels: core, api, frontend, nmap-profile
+- [ ] Credentialed scanning Linux agent MVP (collect distro/kernel/pkg inventory, config) — Labels: core, infra, auth
+- [ ] SSE/WebSocket scan progress updates — Labels: frontend, core
+- [ ] Reporting: CVSS band aggregation and CSV/PDF/JSON exports — Labels: frontend, api
+
 Note: This backlog excludes features already present in the codebase (e.g., Nmap-based unauthenticated scanning, basic OS/service fingerprinting, basic rule-driven CVE mapping, assets/scans/findings UI). Items below are not implemented yet.
 
 ## Core Vulnerability Scanner Features
