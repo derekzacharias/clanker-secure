@@ -1,0 +1,65 @@
+name: Task / Story
+description: Plan scoped work with clear outcomes, acceptance criteria, and validation.
+title: "feat: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this for feature work or refactors. Keep the outcome explicit and acceptance criteria testable.
+  - type: input
+    id: outcome
+    attributes:
+      label: Outcome
+      description: What will be true when this is done?
+      placeholder: Operators can run IPv6 scans and see parsed results
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Context
+      description: Why this matters now (user benefit, blocker, tech debt).
+      placeholder: IPv6 support is required for the next customer rollout; parser currently rejects addresses.
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope
+      description: What's in/out; mention modules (core, api, db, frontend). Split big efforts instead of one mega issue.
+      placeholder: |
+        In scope: nmap parsing update, CVE mapper change, UI display tweaks
+        Out of scope: auth changes, unrelated UI refactors
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: Concrete, testable statements to close the issue.
+      placeholder: |
+        - [ ] Parser supports IPv6 hosts with no crashes
+        - [ ] Findings include IPv6 targets with correct CVE mappings
+        - [ ] Regression tests cover IPv6 fixtures
+    validations:
+      required: true
+  - type: textarea
+    id: validation
+    attributes:
+      label: Validation / commands
+      description: Expected checks (lint/format/tests/build) and any data needed.
+      placeholder: |
+        poetry run ruff check src frontend && poetry run black src
+        pytest tests/core/test_parser.py -k ipv6
+        frontend: npm test / npm run build if UI touched
+        scripts/rebuild.sh
+    validations:
+      required: true
+  - type: textarea
+    id: risks
+    attributes:
+      label: Risks / dependencies
+      description: Migrations, API changes, env vars, shared modules, cross-team dependencies.
+      placeholder: |
+        Migration adds new column to Scan; frontend consumes new field
+        Touches core scanner; coordinate with Agent B

@@ -1,0 +1,35 @@
+name: Project automation
+
+on:
+  issues:
+    types: [opened, reopened, transferred]
+  pull_request:
+    types: [opened, reopened, ready_for_review]
+
+env:
+  PROJECT_URL: ${{ secrets.PROJECT_URL }}
+  PROJECT_TOKEN: ${{ secrets.PROJECT_TOKEN }}
+
+jobs:
+  add-to-project:
+    runs-on: ubuntu-latest
+    if: env.PROJECT_URL != '' && env.PROJECT_TOKEN != ''
+    steps:
+      - name: Add issue to project
+        if: github.event_name == 'issues'
+        uses: actions/add-to-project@v0.5.0
+        with:
+          project-url: ${{ env.PROJECT_URL }}
+          github-token: ${{ env.PROJECT_TOKEN }}
+      - name: Add pull request to project
+        if: github.event_name == 'pull_request'
+        uses: actions/add-to-project@v0.5.0
+        with:
+          project-url: ${{ env.PROJECT_URL }}
+          github-token: ${{ env.PROJECT_TOKEN }}
+  warn-on-missing-config:
+    runs-on: ubuntu-latest
+    if: env.PROJECT_URL == '' || env.PROJECT_TOKEN == ''
+    steps:
+      - run: |
+          echo "PROJECT_URL or PROJECT_TOKEN is not set; skipping project automation."

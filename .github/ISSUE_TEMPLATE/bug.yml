@@ -1,0 +1,81 @@
+name: Bug
+description: Report a defect with context, impact, and how to validate the fix.
+title: "bug: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this to capture a clear, reproducible defect. Keep acceptance criteria concrete so fixes can be verified quickly.
+  - type: input
+    id: summary
+    attributes:
+      label: Summary
+      description: One sentence describing the problem.
+      placeholder: Scanner fails when parsing IPv6-only hosts
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Context / impact
+      description: Where you saw it, severity, and who is affected.
+      placeholder: >
+        Observed in staging; blocks operators from scanning IPv6 networks.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Include minimal inputs (targets, flags) or payloads to trigger the issue.
+      placeholder: |
+        1) Run POST /scans with target 2001:db8::1
+        2) Download scan artifact; nmap parser crashes
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected vs. actual
+      placeholder: |
+        Expected: Scanner completes and surfaces findings
+        Actual: Parser raises ValueError and scan is marked failed
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope
+      description: What's in/out; mention modules (core, api, db, frontend) you believe are involved.
+      placeholder: |
+        In scope: core nmap parser, CVE mapping
+        Out of scope: UI styling, auth flows
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: Checklist of what must be true to close the bug.
+      placeholder: |
+        - [ ] Scan completes for IPv6 targets without errors
+        - [ ] Findings list populated from parsed XML
+        - [ ] Regression test added in tests/core/...
+    validations:
+      required: true
+  - type: textarea
+    id: validation
+    attributes:
+      label: Validation / commands
+      description: How to prove the fix (commands, sample payloads, datasets).
+      placeholder: |
+        poetry run ruff check src frontend && poetry run black src
+        pytest tests/core/test_parser.py -k ipv6
+        scripts/rebuild.sh
+    validations:
+      required: true
+  - type: textarea
+    id: attachments
+    attributes:
+      label: Logs / artifacts
+      description: Sanitized nmap XML, stack traces, screenshots; avoid PII or customer IPs.

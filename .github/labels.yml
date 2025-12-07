@@ -1,0 +1,39 @@
+- name: bug
+  color: d73a4a
+  description: Defect causing incorrect behavior
+- name: enhancement
+  color: a2eeef
+  description: Feature work or improvement
+- name: blocked
+  color: 9e9e9e
+  description: Needs input or dependency before proceeding
+- name: core
+  color: 0366d6
+  description: Scanner engine, parsing, CVE mapping
+- name: api
+  color: 0e8a16
+  description: FastAPI endpoints or response models
+- name: db
+  color: bfd4f2
+  description: SQLModel tables or migrations
+- name: frontend
+  color: fbca04
+  description: React UI
+- name: infra
+  color: 1d76db
+  description: Build, Docker, or deployment changes
+- name: migration
+  color: bc82ff
+  description: Database schema changes
+- name: api-change
+  color: f9d0c4
+  description: API contract change; coordinate consumers
+- name: auth
+  color: c5def5
+  description: Authentication or RBAC changes
+- name: nmap-profile
+  color: 0052cc
+  description: Scan profiles or nmap flags
+- name: ui
+  color: 5319e7
+  description: UI/UX adjustments
