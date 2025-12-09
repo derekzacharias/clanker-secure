@@ -3,6 +3,13 @@
 ## Project Structure & Module Organization
 Runtime code lives in `src/clanker/` and is split by responsibility: `api/` (FastAPI routers, response models), `core/` (scan engine, nmap parsing, CVE mapping), `db/` (SQLModel tables/migrations), and `rules/` (JSON matchers for banner → CVE). Static HTML templates stay under `templates/`, React assets are in `frontend/`, and raw nmap XML drops into `scan_artifacts/` so they can be inspected. Keep any new automation or notebooks out of `src/` unless they ship with the service.
 
+## Backlog Snapshot (keep in sync with BACKLOG.md)
+- Auth hardening: login rate limiting and auth event audit logging.
+- Background job queue for scans with retries and cancellation hooks.
+- Server-side pagination and filtering for `/findings`, `/scans`, and `/assets`.
+- Structured logs plus basic metrics for the scanner and API.
+- Scheduled scans (cron/presets).
+
 ## Build, Test, and Development Commands
 Use Poetry for everything Python: `poetry install --with dev` to bootstrap, `poetry run uvicorn clanker.main:app --host 0.0.0.0 --port 8000` for local API/UI. Frontend work happens via Vite: `cd frontend && npm install && npm run dev` (set `VITE_API_BASE=http://localhost:8000`). Production parity lives in Docker: `docker build -t clanker .` followed by `docker run -d -p 8181:8000 --cap-add=NET_ADMIN clanker`.
 
