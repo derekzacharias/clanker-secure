@@ -28,7 +28,7 @@ from clanker.config import settings
 from clanker.core.agent_vuln_logic import persist_agent_findings
 from clanker.core.enrichment import enrich_from_feed, sync_nvd_cache
 from clanker.core.findings import build_findings
-from clanker.core.job_queue import ScanJobQueue
+from clanker.core.job_queue import QueueHooks, ScanJobQueue
 from clanker.core.scanner import (
     DEFAULT_PROFILE_KEY,
     execute_nmap,
@@ -936,33 +936,70 @@ def _client_ip(req: Request) -> str:
 def login(payload: LoginRequest, request: Request, session: Session = Depends(session_dep)) -> TokenPair:
     since = now_utc() - timedelta(seconds=WINDOW_SECONDS)
     ip = _client_ip(request)
-    fail_count = session.exec(
+    user_failures = session.exec(
         select(func.count()).select_from(LoginAttempt).where(
             LoginAttempt.email == payload.email, LoginAttempt.success == False, LoginAttempt.created_at >= since  # noqa: E712
         )
     ).one()
-    ip_fail_count = session.exec(
+    ip_failures = session.exec(
         select(func.count()).select_from(LoginAttempt).where(
             LoginAttempt.ip == ip, LoginAttempt.success == False, LoginAttempt.created_at >= since  # noqa: E712
         )
     ).one()
-    if int(fail_count or 0) >= MAX_ATTEMPTS or int(ip_fail_count or 0) >= MAX_IP_ATTEMPTS:
+    if int(user_failures or 0) >= MAX_ATTEMPTS:
         session.add(LoginAttempt(email=payload.email, ip=ip, success=False))
-        session.add(AuditLog(actor_user_id=None, action="login_throttled", target=payload.email, ip=ip, detail=None))
+        session.add(
+            AuditLog(
+                actor_user_id=None,
+                action="login_throttled",
+                target=payload.email,
+                ip=ip,
+                detail=f"user_failures={int(user_failures or 0)} window_seconds={WINDOW_SECONDS}",
+            )
+        )
+        session.flush()
+        raise HTTPException(status_code=429, detail="Too many login attempts. Please try again later.")
+    if int(ip_failures or 0) >= MAX_IP_ATTEMPTS:
+        session.add(LoginAttempt(email=payload.email, ip=ip, success=False))
+        session.add(
+            AuditLog(
+                actor_user_id=None,
+                action="login_throttled_ip",
+                target=payload.email,
+                ip=ip,
+                detail=f"ip_failures={int(ip_failures or 0)} window_seconds={WINDOW_SECONDS}",
+            )
+        )
         session.flush()
         raise HTTPException(status_code=429, detail="Too many login attempts. Please try again later.")
 
     user = session.exec(select(User).where(User.email == payload.email)).first()
     if not user or not verify_password(payload.password, user.hashed_password):
         session.add(LoginAttempt(email=payload.email, ip=ip, success=False))
-        session.add(AuditLog(actor_user_id=None, action="login_failure", target=payload.email, ip=ip, detail=None))
+        session.add(
+            AuditLog(
+                actor_user_id=None,
+                action="login_failure",
+                target=payload.email,
+                ip=ip,
+                detail="invalid_credentials",
+            )
+        )
         session.flush()
         raise HTTPException(status_code=401, detail="Invalid credentials")
     if not user.active:
         raise HTTPException(status_code=403, detail="User disabled")
 
     session.add(LoginAttempt(email=payload.email, ip=ip, success=True))
-    session.add(AuditLog(actor_user_id=user.id, action="login_success", target=payload.email, ip=ip, detail=None))
+    session.add(
+        AuditLog(
+            actor_user_id=user.id,
+            action="login_success",
+            target=payload.email,
+            ip=ip,
+            detail=f"user_failures={int(user_failures or 0)}",
+        )
+    )
 
     access = create_session_token(session, user_id=user.id, token_type="access", lifetime=ACCESS_TTL)
     refresh = create_session_token(session, user_id=user.id, token_type="refresh", lifetime=REFRESH_TTL)

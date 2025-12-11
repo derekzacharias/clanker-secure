@@ -136,7 +136,7 @@ _remove_route("/assets", "GET")
 @app.get("/assets", response_model=List[AssetRead])
 def list_assets(
     _: object = Depends(require_roles("admin", "operator", "viewer")),
-    q: Optional[str] = Query(default=None),
+    q: Optional[str] = Query(default=None, description="Search by target or name"),
     environment: Optional[str] = Query(default=None),
     owner: Optional[str] = Query(default=None),
     limit: int = Query(default=100, ge=1, le=1000),
@@ -146,16 +146,16 @@ def list_assets(
 ) -> List[Asset]:
     query = select(Asset)
     if q:
-        like = f"%{q}%"
-        query = query.where((Asset.target.like(like)) | (Asset.name.like(like)))
+        pattern = f"%{q.lower()}%"
+        query = query.where((func.lower(Asset.target).like(pattern)) | (func.lower(Asset.name).like(pattern)))
     if environment:
         query = query.where(Asset.environment == environment)
     if owner:
         query = query.where(Asset.owner == owner)
-    total = session.exec(select(func.count()).select_from(query.subquery())).one()
-    rows = session.exec(query.order_by(Asset.created_at.desc()).limit(limit).offset(offset)).all()
+
+    rows, total = cm._paginate_query(session, query.order_by(Asset.created_at.desc()), limit, offset)  # type: ignore[attr-defined]
     if response is not None:
-        response.headers["X-Total-Count"] = str(int(total or 0))
+        response.headers["X-Total-Count"] = str(total)
     return rows
 
 
@@ -164,6 +164,8 @@ _remove_route("/scans", "GET")
 def list_scans(
     _: object = Depends(require_roles("admin", "operator", "viewer")),
     status: Optional[str] = Query(default=None),
+    profile: Optional[str] = Query(default=None),
+    q: Optional[str] = Query(default=None, description="Search by notes or scan id"),
     limit: int = Query(default=100, ge=1, le=1000),
     offset: int = Query(default=0, ge=0),
     response: Response = None,  # type: ignore[assignment]
@@ -172,10 +174,18 @@ def list_scans(
     query = select(Scan)
     if status:
         query = query.where(Scan.status == status)
-    total = session.exec(select(func.count()).select_from(query.subquery())).one()
-    rows = session.exec(query.order_by(Scan.created_at.desc()).limit(limit).offset(offset)).all()
+    if profile:
+        query = query.where(Scan.profile == profile)
+    if q:
+        if q.isdigit():
+            query = query.where(Scan.id == int(q))
+        else:
+            pattern = f"%{q.lower()}%"
+            query = query.where(func.lower(Scan.notes).like(pattern))
+
+    rows, total = cm._paginate_query(session, query.order_by(Scan.created_at.desc()), limit, offset)  # type: ignore[attr-defined]
     if response is not None:
-        response.headers["X-Total-Count"] = str(int(total or 0))
+        response.headers["X-Total-Count"] = str(total)
     return rows
 
 
@@ -219,20 +229,15 @@ def list_findings(
     scan_id: Optional[int] = Query(default=None),
     severity: Optional[str] = Query(default=None),
     status_filter: Optional[str] = Query(default=None, alias="status"),
+    asset_id: Optional[int] = Query(default=None),
+    search: Optional[str] = Query(default=None, alias="q"),
     limit: int = Query(default=100, ge=1, le=1000),
     offset: int = Query(default=0, ge=0),
     response: Response = None,  # type: ignore[assignment]
     session: Session = Depends(session_dep),
 ) -> List[Finding]:
-    query = select(Finding)
-    if scan_id is not None:
-        query = query.where(Finding.scan_id == scan_id)
-    if severity is not None:
-        query = query.where(Finding.severity == severity)
-    if status_filter is not None:
-        query = query.where(Finding.status == status_filter)
-    total = session.exec(select(func.count()).select_from(query.subquery())).one()
-    rows = session.exec(query.order_by(Finding.detected_at.desc()).limit(limit).offset(offset)).all()
+    query, where_sql, params = cm._build_finding_filters(scan_id, severity, status_filter, asset_id, search)  # type: ignore[attr-defined]
+    rows, total = cm._paginate_query(session, query.order_by(Finding.detected_at.desc()), limit, offset)  # type: ignore[attr-defined]
     enrichment_by_finding: Dict[int, Dict[str, Any]] = {}
     ids = [f.id for f in rows if f.id is not None]
     if ids:
@@ -255,6 +260,10 @@ def list_findings(
             enrichment_by_finding = {}
     if response is not None:
         response.headers["X-Total-Count"] = str(int(total or 0))
+        try:
+            response.headers["X-CVSS-Bands"] = json.dumps(cm._aggregate_cvss_bands(session, where_sql, params))  # type: ignore[attr-defined]
+        except Exception:
+            response.headers["X-CVSS-Bands"] = json.dumps({})
     enriched: List[FindingWithEnrichment] = []
     for finding in rows:
         base = finding.model_dump()
