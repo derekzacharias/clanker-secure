@@ -551,7 +551,7 @@ def _aggregate_cvss_bands(session: Session, where_sql: str, params: Dict[str, An
 
 def _record_scan_event(session: Session, scan_id: int, message: str) -> None:
     payload = {"scan_id": scan_id, "message": message, "ts": datetime.utcnow().isoformat()}
-    logger.info("scan_event %s", json.dumps(payload))
+    log_event(logger, "scan_event", **payload)
     session.add(ScanEvent(scan_id=scan_id, message=message))
     session.commit()
 
