@@ -6,13 +6,14 @@ from queue import Queue, Empty
 from time import sleep
 from typing import Callable, Dict, Optional
 
+from clanker.core.observability import log_event
 
 logger = logging.getLogger(__name__)
 
 
 def _log(event: str, payload: Dict[str, object]) -> None:
     try:
-        logger.info("%s %s", event, json.dumps(payload))
+        log_event(logger, event, **payload)
     except Exception:
         logger.info("%s %s", event, payload)
 
