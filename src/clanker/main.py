@@ -2447,14 +2447,19 @@ def run_ssh_scan_job(ssh_scan_id: int) -> None:
 def run_scan_job(scan_id: int) -> None:
     from clanker.db.session import get_session as session_factory
 
+    metrics.record_scan_started("network")
+    started = time.perf_counter()
+    metrics_status = "failed"
     try:
         with session_factory() as session:
             scan = session.get(Scan, scan_id)
             if not scan:
                 logger.error("Scan %s vanished before start", scan_id)
+                metrics_status = "failed"
                 return
             if scan.status == "cancelled":
                 _record_scan_event(session, scan_id, "Scan cancelled before start")
+                metrics_status = "cancelled"
                 return
             scan.status = "running"
             scan.started_at = datetime.utcnow()
@@ -2476,6 +2481,7 @@ def run_scan_job(scan_id: int) -> None:
                 _record_scan_event(session, scan_id, "No assets to scan")
                 session.add(scan)
                 session.commit()
+                metrics_status = "failed"
                 return
 
             profile = get_scan_profile(scan.profile)
