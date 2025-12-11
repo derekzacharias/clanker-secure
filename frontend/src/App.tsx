@@ -172,6 +172,8 @@ const INTEGRATION_STATUS_COLORS: Record<Integration['status'], string> = {
 
 const TABLE_HEIGHT = 420;
 const TABLE_HEIGHT_MOBILE = 320;
+const SUMMARY_TILE_HEIGHT = 160;
+const SUMMARY_TILE_HEIGHT_MOBILE = 140;
 const SUMMARY_CARD_HEIGHT = 200;
 const SUMMARY_CARD_HEIGHT_MOBILE = 180;
 const SUMMARY_CARD_BODY_HEIGHT = 120;
@@ -1658,7 +1660,7 @@ const handleLogout = async (): Promise<void> => {
                   padding="lg"
                   style={{
                     ...(isLight ? (surfaces.tile as React.CSSProperties) : gradientCard(card.gradientDark)),
-                    height: isMobile ? SUMMARY_CARD_HEIGHT_MOBILE : SUMMARY_CARD_HEIGHT,
+                    height: isMobile ? SUMMARY_TILE_HEIGHT_MOBILE : SUMMARY_TILE_HEIGHT,
                     display: 'flex',
                     flexDirection: 'column',
                     justifyContent: 'space-between',

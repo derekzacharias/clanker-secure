@@ -2583,6 +2583,7 @@ def run_scan_job(scan_id: int) -> None:
             else:
                 scan.status = "completed"
                 scan.notes = None
+            metrics_status = scan.status
             session.add(scan)
             _record_scan_event(session, scan_id, f"Scan finished with status {scan.status}")
             logger.info(
@@ -2611,6 +2612,9 @@ def run_scan_job(scan_id: int) -> None:
                     _record_scan_event(session, scan_id, f"Scan worker error: {exc}")
                 except Exception:
                     session.commit()
+        metrics_status = "failed"
+    finally:
+        metrics.record_scan_finished("network", metrics_status, time.perf_counter() - started)
 
 
 @app.post("/enrichment/finding/{finding_id}")
