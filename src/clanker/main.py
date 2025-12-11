@@ -7,25 +7,28 @@ import io
 import json
 import logging
 import os
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, Request, Response
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, Request, Response, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, StreamingResponse
 from fastapi.security.http import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import bindparam, text
 from sqlalchemy.orm import selectinload
 from sqlmodel import Session, func, select
 
 from clanker.config import settings
-from clanker.core.enrichment import enrich_from_feed
+from clanker.core.agent_vuln_logic import persist_agent_findings
+from clanker.core.enrichment import enrich_from_feed, sync_nvd_cache
 from clanker.core.findings import build_findings
+from clanker.core.job_queue import ScanJobQueue
 from clanker.core.scanner import (
     DEFAULT_PROFILE_KEY,
     execute_nmap,
@@ -33,14 +36,22 @@ from clanker.core.scanner import (
     list_scan_profiles,
     parse_nmap_xml,
 )
+from clanker.core.ssh_credentialed_scanner import SSHScanner
+from clanker.core.types import ServiceObservation
 from clanker.db.models import (
+    AgentIngest,
     Asset,
     AssetCreate,
     AssetRead,
     AssetUpdate,
+    AuditLog,
     Finding,
+    FindingComment,
+    FindingCommentRead,
     FindingRead,
     FindingUpdate,
+    InviteToken,
+    LoginAttempt,
     Scan,
     ScanAssetStatus,
     ScanAssetStatusRead,
@@ -50,12 +61,12 @@ from clanker.db.models import (
     ScanEventRead,
     ScanRead,
     ScanTarget,
-    User,
+    Schedule,
     SessionToken,
+    User,
     UserRead,
-    LoginAttempt,
-    AuditLog,
-    InviteToken,
+    SSHScan,
+    SSHScanHost,
 )
 from clanker.db.session import get_session, init_db
 
@@ -67,6 +78,16 @@ SCAN_PROFILE_CHOICES = list_scan_profiles()
 SCAN_PROFILE_KEYS = {profile.key for profile in SCAN_PROFILE_CHOICES}
 BASE_DIR = Path(__file__).resolve().parents[2]
 FRONTEND_DIST = BASE_DIR / "frontend" / "dist"
+VALID_FINDING_STATUSES = {"open", "in_progress", "resolved", "ignored"}
+scan_job_queue: Optional[ScanJobQueue] = None
+SSH_TIMEOUT_LIMIT = 60
+SSH_COMMAND_TIMEOUT_LIMIT = 180
+SSH_MAX_WORKERS_LIMIT = 16
+SSH_RETRY_LIMIT = 2
+ssh_scan_job_queue: Optional[ScanJobQueue] = None
+_ssh_secret_cache: Dict[int, Dict[str, Any]] = {}
+_ssh_retry_overrides: Dict[int, int] = {}
+_ssh_secret_lock = threading.Lock()
 
 app.add_middleware(
     CORSMiddleware,
@@ -86,6 +107,40 @@ if FRONTEND_DIST.exists():
 @app.on_event("startup")
 def on_startup() -> None:
     init_db()
+    global scan_job_queue
+    global ssh_scan_job_queue
+    if scan_job_queue is None:
+        scan_job_queue = ScanJobQueue(worker=run_scan_job)
+    scan_job_queue.start()
+    if ssh_scan_job_queue is None:
+        ssh_scan_job_queue = ScanJobQueue(worker=run_ssh_scan_job)
+    ssh_scan_job_queue.start()
+
+
+async def _start_nvd_sync_loop() -> None:
+    if not settings.nvd_sync_enabled:
+        logger.info("NVD cache sync disabled via configuration")
+        return
+    interval_seconds = max(1, settings.nvd_feed_sync_interval_hours) * 3600
+    while True:
+        try:
+            count = await asyncio.to_thread(sync_nvd_cache, False)
+            logger.info("NVD cache sync completed (cached %s CVEs)", count)
+        except asyncio.CancelledError:
+            logger.info("NVD cache sync loop cancelled")
+            break
+        except Exception:
+            logger.exception("NVD cache sync failed")
+        try:
+            await asyncio.sleep(interval_seconds)
+        except asyncio.CancelledError:
+            logger.info("NVD cache sync loop cancelled during sleep")
+            break
+
+
+@app.on_event("startup")
+async def on_startup_async() -> None:
+    asyncio.create_task(_start_nvd_sync_loop())
 
 
 # Dependency
@@ -99,6 +154,94 @@ def _paginate_query(session: Session, query, limit: int, offset: int) -> tuple[l
     total = session.exec(select(func.count()).select_from(query.subquery())).one()
     rows = session.exec(query.limit(limit).offset(offset)).all()
     return rows, int(total or 0)
+
+
+def _build_observation_index(findings: List[Finding]) -> Dict[int, ServiceObservation]:
+    observations: Dict[int, ServiceObservation] = {}
+    for finding in findings:
+        if finding.id is None:
+            continue
+        observations[finding.id] = ServiceObservation(
+            asset_id=finding.asset_id or 0,
+            host_address=finding.host_address,
+            host_os_name=finding.host_os_name,
+            host_os_accuracy=finding.host_os_accuracy,
+            host_vendor=finding.host_vendor,
+            traceroute_summary=finding.traceroute_summary,
+            host_report=finding.host_report,
+            port=finding.port or 0,
+            protocol=finding.protocol or "tcp",
+            service_name=finding.service_name,
+            service_version=finding.service_version,
+            product=finding.service_name,
+        )
+    return observations
+
+
+def _cache_ssh_credentials(host_id: int, payload: Dict[str, Any]) -> None:
+    with _ssh_secret_lock:
+        _ssh_secret_cache[host_id] = payload
+
+
+def _pop_ssh_credentials(host_id: int) -> Optional[Dict[str, Any]]:
+    with _ssh_secret_lock:
+        return _ssh_secret_cache.pop(host_id, None)
+
+
+def _cache_ssh_retry(ssh_scan_id: int, retries: int) -> None:
+    with _ssh_secret_lock:
+        _ssh_retry_overrides[ssh_scan_id] = retries
+
+
+def _pop_ssh_retry(ssh_scan_id: int) -> Optional[int]:
+    with _ssh_secret_lock:
+        return _ssh_retry_overrides.pop(ssh_scan_id, None)
+
+
+def _serialize_ssh_host(row: SSHScanHost) -> SSHScanHostResult:
+    raw: Dict[str, Any] = {}
+    commands: List[Dict[str, Any]] = []
+    hardening: Dict[str, Any] = {}
+    facts: Dict[str, Any] = {}
+    if row.raw_output:
+        try:
+            raw = json.loads(row.raw_output)
+        except Exception:
+            raw = {}
+    if isinstance(raw.get("commands"), list):
+        commands = raw["commands"]
+    if row.ssh_config_hardening:
+        try:
+            hardening = json.loads(row.ssh_config_hardening)
+        except Exception:
+            hardening = {}
+    elif isinstance(raw.get("ssh_config_hardening"), dict):
+        hardening = raw.get("ssh_config_hardening", {})
+    if row.facts:
+        try:
+            facts = json.loads(row.facts)
+        except Exception:
+            facts = {}
+    attempts_val = raw.get("attempts") if isinstance(raw, dict) else 0
+    try:
+        attempts = int(attempts_val or 0)
+    except Exception:
+        attempts = 0
+    return SSHScanHostResult(
+        id=row.id or 0,
+        host=row.host,
+        port=row.port,
+        username=row.username,
+        auth_method=row.auth_method,
+        status=row.status,
+        error=row.error or (raw.get("error") if isinstance(raw, dict) else None),
+        started_at=row.started_at.isoformat() + "Z" if row.started_at else None,
+        completed_at=row.completed_at.isoformat() + "Z" if row.completed_at else None,
+        attempts=attempts,
+        commands=[SSHCommandResult(**cmd) if isinstance(cmd, dict) else cmd for cmd in commands],
+        ssh_config_hardening=hardening,
+        facts=facts,
+    )
 
 
 def _build_finding_filters(
@@ -149,7 +292,7 @@ def _load_enrichment(session: Session, finding_ids: List[int]) -> Dict[int, Dict
         return {}
     stmt = (
         text(
-            "SELECT finding_id, cvss_v31_base, cvss_vector, references_json "
+            "SELECT finding_id, cpe, cpe_confidence, cvss_v31_base, cvss_vector, references_json, last_enriched_at, source "
             "FROM finding_enrichment WHERE finding_id IN :ids"
         ).bindparams(bindparam("ids", expanding=True))
     )
@@ -159,9 +302,13 @@ def _load_enrichment(session: Session, finding_ids: List[int]) -> Dict[int, Dict
             data = dict(row._mapping) if hasattr(row, "_mapping") else dict(row)
             fid = int(data.get("finding_id"))
             enrichment[fid] = {
+                "cpe": data.get("cpe"),
+                "cpe_confidence": data.get("cpe_confidence"),
                 "cvss_v31_base": data.get("cvss_v31_base"),
                 "cvss_vector": data.get("cvss_vector"),
                 "references_json": data.get("references_json"),
+                "last_enriched_at": data.get("last_enriched_at"),
+                "source": data.get("source"),
             }
     except Exception:
         return {}
@@ -181,6 +328,19 @@ def _parse_cve_ids(raw: Optional[str]) -> List[str]:
     return []
 
 
+def _safe_json(raw: Optional[str]):
+    if raw is None:
+        return None
+    if isinstance(raw, (dict, list)):
+        return raw
+    if isinstance(raw, str):
+        try:
+            return json.loads(raw)
+        except Exception:
+            return raw
+    return raw
+
+
 def _cvss_band(score: Optional[float]) -> str:
     if score is None:
         return "unscored"
@@ -197,16 +357,31 @@ def _cvss_band(score: Optional[float]) -> str:
 
 def _serialize_finding_export(finding: Finding, enrichment: Dict[str, Any]) -> Dict[str, Any]:
     score = enrichment.get("cvss_v31_base")
+    references: List[str] = []
+    refs_raw = enrichment.get("references_json")
+    if isinstance(refs_raw, str):
+        try:
+            parsed = json.loads(refs_raw)
+            if isinstance(parsed, list):
+                references = [r for r in parsed if isinstance(r, str)]
+        except Exception:
+            references = []
     cves = _parse_cve_ids(finding.cve_ids)
     return {
         "id": finding.id,
         "scan_id": finding.scan_id,
         "asset_id": finding.asset_id,
+        "assigned_user_id": finding.assigned_user_id,
         "detected_at": finding.detected_at.isoformat() if finding.detected_at else None,
+        "sla_due_at": finding.sla_due_at.isoformat() if finding.sla_due_at else None,
+        "closed_at": finding.closed_at.isoformat() if finding.closed_at else None,
         "severity": finding.severity,
         "status": finding.status,
         "service_name": finding.service_name,
         "service_version": finding.service_version,
+        "fingerprint": _safe_json(finding.fingerprint),
+        "evidence": _safe_json(finding.evidence),
+        "evidence_summary": finding.evidence_summary,
         "host_address": finding.host_address,
         "port": finding.port,
         "protocol": finding.protocol,
@@ -214,8 +389,55 @@ def _serialize_finding_export(finding: Finding, enrichment: Dict[str, Any]) -> D
         "cve_ids": cves,
         "cvss_v31_base": score,
         "cvss_vector": enrichment.get("cvss_vector"),
+        "cpe": enrichment.get("cpe"),
+        "cpe_confidence": enrichment.get("cpe_confidence"),
         "cvss_band": _cvss_band(score if isinstance(score, (float, int)) else None),
+        "references": references,
     }
+
+
+def _serialize_asset_status(rows: List[ScanAssetStatus]) -> List[Dict[str, Any]]:
+    statuses: List[Dict[str, Any]] = []
+    for row in rows:
+        statuses.append(
+            {
+                "asset_id": row.asset_id,
+                "status": row.status,
+                "attempts": row.attempts,
+                "last_error": row.last_error,
+                "started_at": row.started_at.isoformat() if row.started_at else None,
+                "completed_at": row.completed_at.isoformat() if row.completed_at else None,
+            }
+        )
+    return statuses
+
+
+def _asset_progress(statuses: List[ScanAssetStatus]) -> int:
+    if not statuses:
+        return 0
+    total = len(statuses)
+    score = 0.0
+    for row in statuses:
+        status = (row.status or "").lower()
+        if status in {"completed", "failed"}:
+            score += 1.0
+        elif status == "running":
+            score += 0.6
+        elif status in {"queued", "pending"}:
+            score += 0.1
+        else:
+            score += 0.3
+    return min(100, round((score / max(total, 1)) * 100))
+
+
+def _clamp_int(value: Optional[int], default: int, min_value: int, max_value: int) -> int:
+    if value is None:
+        return default
+    try:
+        parsed = int(value)
+    except Exception:
+        return default
+    return max(min_value, min(parsed, max_value))
 
 
 def _aggregate_cvss_bands(session: Session, where_sql: str, params: Dict[str, Any]) -> Dict[str, int]:
@@ -248,8 +470,49 @@ def _aggregate_cvss_bands(session: Session, where_sql: str, params: Dict[str, An
 
 
 def _record_scan_event(session: Session, scan_id: int, message: str) -> None:
+    payload = {"scan_id": scan_id, "message": message, "ts": datetime.utcnow().isoformat()}
+    logger.info("scan_event %s", json.dumps(payload))
     session.add(ScanEvent(scan_id=scan_id, message=message))
     session.commit()
+
+
+def _reenrich_scan(scan_id: int, force_refresh_cache: bool = False) -> None:
+    from clanker.db.session import get_session as session_factory
+
+    try:
+        with session_factory() as session:
+            scan = session.get(Scan, scan_id)
+            if not scan:
+                return
+            findings = session.exec(select(Finding).where(Finding.scan_id == scan_id)).all()
+            if not findings:
+                return
+            observations = _build_observation_index(findings)
+            enrich_from_feed(session, findings, observations=observations, force_refresh_cache=force_refresh_cache)
+            session.commit()
+            _record_scan_event(session, scan_id, "Enrichment refreshed from NVD cache")
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.exception("Re-enrichment failed for scan %s: %s", scan_id, exc)
+
+
+def _reenrich_all_findings(force_refresh_cache: bool = False) -> None:
+    from clanker.db.session import get_session as session_factory
+
+    try:
+        with session_factory() as session:
+            findings = session.exec(select(Finding)).all()
+            if not findings:
+                return
+            observations = _build_observation_index(findings)
+            enrich_from_feed(session, findings, observations=observations, force_refresh_cache=force_refresh_cache)
+            session.commit()
+            logger.info("Enrichment refreshed for all findings")
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.exception("Re-enrichment failed for all findings: %s", exc)
+
+
+def _schedule_reenrich_scan(scan_id: int, force_refresh_cache: bool = False) -> None:
+    threading.Thread(target=_reenrich_scan, args=(scan_id, force_refresh_cache), daemon=True).start()
 
 
 def _ensure_asset_status(session: Session, scan_id: int, asset_id: int) -> ScanAssetStatus:
@@ -265,8 +528,66 @@ def _ensure_asset_status(session: Session, scan_id: int, asset_id: int) -> ScanA
     return status
 
 
+def _is_scan_cancelled(session: Session, scan_id: int) -> bool:
+    scan = session.get(Scan, scan_id)
+    return bool(scan and scan.status == "cancelled")
+
+
+def _cancel_scan_in_db(session: Session, scan_id: int, reason: str) -> Optional[Scan]:
+    scan = session.get(Scan, scan_id)
+    if not scan:
+        return None
+    now = datetime.utcnow()
+    scan.status = "cancelled"
+    scan.completed_at = scan.completed_at or now
+    scan.notes = reason
+    statuses = session.exec(select(ScanAssetStatus).where(ScanAssetStatus.scan_id == scan_id)).all()
+    for status in statuses:
+        if status.status not in {"completed", "failed", "cancelled"}:
+            status.status = "cancelled"
+            status.completed_at = status.completed_at or now
+            session.add(status)
+    session.add(scan)
+    session.commit()
+    _record_scan_event(session, scan_id, reason)
+    return scan
+
+
+def _serialize_schedule(row: Schedule) -> ScheduleRead:
+    return ScheduleRead(
+        id=row.id or 0,
+        name=row.name,
+        profile=row.profile,
+        asset_ids=[int(x) for x in _load_json_list(row.asset_ids_json)],
+        days_of_week=[int(x) for x in _load_json_list(row.days_of_week_json)],
+        times=[str(x) for x in _load_json_list(row.times_json)],
+        active=row.active,
+        created_at=row.created_at.isoformat(),
+        last_run_at=row.last_run_at.isoformat() if row.last_run_at else None,
+    )
+
+
 def _b64encode(value: bytes) -> str:
     return base64.urlsafe_b64encode(value).decode("utf-8").rstrip("=")
+
+
+def _load_json_list(raw: Optional[str]) -> List[Any]:
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+        if isinstance(data, list):
+            return data
+    except Exception:
+        return []
+    return []
+
+
+def _dump_json_list(values: List[Any]) -> str:
+    try:
+        return json.dumps(values)
+    except Exception:
+        return "[]"
 
 
 def _derive_key(password: str, salt: bytes) -> bytes:
@@ -364,6 +685,32 @@ def require_roles(*roles: str):
     return dep
 
 
+def _extract_bearer_token(token_param: Optional[str], authorization: Optional[str]) -> Optional[str]:
+    if token_param:
+        return token_param
+    if authorization and authorization.lower().startswith("bearer "):
+        return authorization.split(" ", 1)[1].strip()
+    return None
+
+
+def _require_stream_user(token_param: Optional[str], authorization: Optional[str]) -> User:
+    token_value = _extract_bearer_token(token_param, authorization)
+    if not token_value:
+        raise HTTPException(status_code=401, detail="Missing access token")
+    with get_session() as session:
+        token = session.exec(
+            select(SessionToken).where(SessionToken.token == token_value, SessionToken.token_type == "access")
+        ).first()
+        if token and token.expires_at and token.expires_at.tzinfo is None:
+            token.expires_at = token.expires_at.replace(tzinfo=timezone.utc)
+        if not token or token.revoked or token.expires_at <= now_utc():
+            raise HTTPException(status_code=401, detail="Invalid or expired token")
+        user = session.get(User, token.user_id)
+        if not user or not user.active:
+            raise HTTPException(status_code=403, detail="User disabled")
+        return user
+
+
 def _password_complex_enough(pw: str) -> bool:
     if len(pw) < 10:
         return False
@@ -431,6 +778,72 @@ class SeedAdminRequest(BaseModel):
     name: Optional[str] = "Administrator"
 
 
+class SSHHostConfig(BaseModel):
+    host: str
+    port: Optional[int] = None
+    username: Optional[str] = None
+    password: Optional[str] = Field(default=None, exclude=True)
+    key_path: Optional[str] = None
+    passphrase: Optional[str] = Field(default=None, exclude=True)
+    allow_agent: bool = False
+    look_for_keys: bool = False
+
+
+class SSHScanRequest(BaseModel):
+    hosts: List[SSHHostConfig]
+    port: Optional[int] = 22
+    timeout: Optional[int] = 10
+    command_timeout: Optional[int] = 30
+    max_workers: Optional[int] = 4
+    retries: Optional[int] = 1
+
+
+class SSHCommandResult(BaseModel):
+    name: str
+    command: str
+    stdout: str
+    stderr: str
+    exit_status: Optional[int]
+    unavailable: bool
+    error: Optional[str] = None
+
+
+class SSHHardeningResult(BaseModel):
+    permit_root_login: str
+    password_authentication: str
+
+
+class SSHScanHostResult(BaseModel):
+    id: int
+    host: Optional[str]
+    port: Optional[int]
+    username: Optional[str]
+    auth_method: str
+    status: str
+    error: Optional[str]
+    started_at: Optional[str]
+    completed_at: Optional[str]
+    attempts: int = 0
+    commands: List[SSHCommandResult] = Field(default_factory=list)
+    ssh_config_hardening: Dict[str, Any] = Field(default_factory=dict)
+    facts: Dict[str, Any] = Field(default_factory=dict)
+
+
+class SSHScanCreateResponse(BaseModel):
+    ssh_scan_id: int
+    status: str
+    host_count: int
+
+
+class SSHScanDetail(BaseModel):
+    id: int
+    status: str
+    created_at: str
+    started_at: Optional[str]
+    completed_at: Optional[str]
+    hosts: List[SSHScanHostResult]
+
+
 class AuditLogRead(BaseModel):
     id: int
     created_at: str
@@ -439,6 +852,77 @@ class AuditLogRead(BaseModel):
     target: Optional[str]
     ip: Optional[str]
     detail: Optional[str]
+
+
+class AgentPackage(BaseModel):
+    name: str
+    version: Optional[str] = None
+    source: Optional[str] = None
+
+
+class AgentService(BaseModel):
+    name: str
+    status: Optional[str] = None
+    port: Optional[int] = None
+    protocol: Optional[str] = None
+    description: Optional[str] = None
+    version: Optional[str] = None
+    listen_address: Optional[str] = None
+
+
+class AgentInterface(BaseModel):
+    name: str
+    address: Optional[str] = None
+    mac: Optional[str] = None
+    netmask: Optional[str] = None
+    gateway: Optional[str] = None
+
+
+class AgentInventory(BaseModel):
+    host_identifier: Optional[str] = None
+    hostname: Optional[str] = None
+    os_name: Optional[str] = None
+    os_version: Optional[str] = None
+    kernel_version: Optional[str] = None
+    distro: Optional[str] = None
+    packages: List[AgentPackage] = Field(default_factory=list)
+    services: List[AgentService] = Field(default_factory=list)
+    interfaces: List[AgentInterface] = Field(default_factory=list)
+    configs: Dict[str, str] = Field(default_factory=dict)
+    collector_errors: Dict[str, str] = Field(default_factory=dict)
+
+
+class AgentIngestRequest(BaseModel):
+    asset_id: Optional[int] = Field(default=None, description="Attach to an existing asset if provided")
+    agent_id: Optional[str] = None
+    agent_version: Optional[str] = None
+    inventory: AgentInventory
+
+
+class AgentIngestResponse(BaseModel):
+    ingest_id: int
+    status: str
+
+
+class SchedulePayload(BaseModel):
+    name: str
+    profile: str
+    asset_ids: List[int]
+    days_of_week: List[int]
+    times: List[str]
+    active: bool = True
+
+
+class ScheduleRead(BaseModel):
+    id: int
+    name: str
+    profile: str
+    asset_ids: List[int]
+    days_of_week: List[int]
+    times: List[str]
+    active: bool
+    created_at: str
+    last_run_at: Optional[str]
 
 
 def _client_ip(req: Request) -> str:
@@ -609,6 +1093,10 @@ def update_user(user_id: int, payload: UserUpdate, _: object = Depends(require_r
     user = session.get(User, user_id)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
+    if payload.role is not None and user.role == "admin" and payload.role != "admin":
+        raise HTTPException(status_code=400, detail="Cannot change role for administrator accounts")
+    if payload.active is not None and user.role == "admin" and payload.active is False:
+        raise HTTPException(status_code=400, detail="Cannot disable administrator accounts")
     if payload.name is not None:
         user.name = payload.name
     if payload.role is not None:
@@ -675,11 +1163,21 @@ def _seed_admin_if_configured(session: Session) -> None:
     password = os.getenv("CLANKER_ADMIN_PASSWORD")
     if not email or not password:
         return
+    hashed = hash_password(password)
     existing = session.exec(select(User).where(User.email == email)).first()
     if existing:
-        return
-    user = User(email=email, name="Administrator", hashed_password=hash_password(password), role="admin", active=True)
-    session.add(user)
+        existing.hashed_password = hashed
+        existing.role = "admin"
+        existing.active = True
+        if not existing.name:
+            existing.name = "Administrator"
+        session.add(existing)
+    else:
+        user = User(email=email, name="Administrator", hashed_password=hashed, role="admin", active=True)
+        session.add(user)
+    # Clear lockouts for the seeded admin account
+    for attempt in session.exec(select(LoginAttempt).where(LoginAttempt.email == email)).all():
+        session.delete(attempt)
 
 
 @app.on_event("startup")
@@ -755,6 +1253,55 @@ def delete_asset(asset_id: int, session: Session = Depends(session_dep)) -> Resp
     return Response(status_code=204)
 
 
+@app.post("/agents/ingest", response_model=AgentIngestResponse, status_code=202)
+def ingest_agent_inventory(
+    payload: AgentIngestRequest,
+    current=Depends(require_roles("admin", "operator")),  # type: ignore[no-redef]
+    session: Session = Depends(session_dep),
+) -> AgentIngestResponse:
+    asset_id: Optional[int] = None
+    if payload.asset_id is not None:
+        asset = session.get(Asset, payload.asset_id)
+        if not asset:
+            raise HTTPException(status_code=404, detail="Asset not found")
+        asset_id = asset.id
+
+    inv = payload.inventory
+    raw_payload = json.dumps(payload.model_dump())
+    ingest = AgentIngest(
+        asset_id=asset_id,
+        agent_id=payload.agent_id,
+        agent_version=payload.agent_version,
+        host_identifier=inv.host_identifier or inv.hostname,
+        hostname=inv.hostname,
+        os_name=inv.os_name,
+        os_version=inv.os_version,
+        kernel_version=inv.kernel_version,
+        distro=inv.distro,
+        package_count=len(inv.packages),
+        service_count=len(inv.services),
+        interface_count=len(inv.interfaces),
+        config_count=len(inv.configs),
+        raw_payload=raw_payload,
+    )
+    session.add(ingest)
+    session.flush()
+    session.add(
+        AuditLog(
+            actor_user_id=current.user.id,
+            action="agent_ingest",
+            target=ingest.host_identifier or ingest.hostname or str(ingest.id),
+            ip=None,
+            detail=payload.agent_id or payload.agent_version,
+        )
+    )
+    try:
+        persist_agent_findings(session, inv, asset_id=asset_id, ingest_id=ingest.id)
+    except Exception as exc:  # Defensive: do not block ingest on vuln logic issues
+        logger.exception("Failed to persist agent findings for ingest %s: %s", ingest.id, exc)
+    return AgentIngestResponse(ingest_id=ingest.id, status="accepted")
+
+
 @app.post("/scans", response_model=ScanRead, status_code=201)
 def create_scan(
     payload: ScanCreate,
@@ -773,16 +1320,23 @@ def create_scan(
     if profile_key not in SCAN_PROFILE_KEYS:
         raise HTTPException(status_code=400, detail="Unknown scan profile")
 
+    scan = _create_scan_record(session, [a.id for a in assets if a.id is not None], profile_key)
+    session.commit()
+    if scan_job_queue is not None:
+        scan_job_queue.enqueue(scan.id)
+    else:
+        background_tasks.add_task(run_scan_job, scan.id)
+    return scan
+
+
+def _create_scan_record(session: Session, asset_ids: List[int], profile_key: str) -> Scan:
     scan = Scan(profile=profile_key, status="queued")
     session.add(scan)
     session.flush()
 
-    for asset in assets:
+    for asset in session.exec(select(Asset).where(Asset.id.in_(asset_ids))).all():
         session.add(ScanTarget(scan_id=scan.id, asset_id=asset.id))
         _ensure_asset_status(session, scan.id, asset.id)
-
-    session.commit()
-    background_tasks.add_task(run_scan_job, scan.id)
     return scan
 
 
@@ -790,6 +1344,8 @@ def create_scan(
 def list_scans(
     response: Response,
     status: Optional[str] = Query(default=None),
+    profile: Optional[str] = Query(default=None),
+    q: Optional[str] = Query(default=None, description="Search by notes or scan id"),
     limit: int = Query(default=100, ge=1, le=1000),
     offset: int = Query(default=0, ge=0),
     session: Session = Depends(session_dep),
@@ -797,9 +1353,114 @@ def list_scans(
     query = select(Scan)
     if status:
         query = query.where(Scan.status == status)
+    if profile:
+        query = query.where(Scan.profile == profile)
+    if q:
+        if q.isdigit():
+            query = query.where(Scan.id == int(q))
+        else:
+            pattern = f"%{q.lower()}%"
+            query = query.where(func.lower(Scan.notes).like(pattern))
     rows, total = _paginate_query(session, query.order_by(Scan.created_at.desc()), limit, offset)
     response.headers["X-Total-Count"] = str(total)
     return rows
+
+
+@app.get("/metrics/queue")
+def get_queue_metrics() -> Dict[str, int]:
+    if scan_job_queue is None:
+        return {"status": "queue_not_initialized"}
+    return scan_job_queue.stats()
+
+
+def _validate_schedule_payload(payload: SchedulePayload, session: Session) -> None:
+    if not payload.name.strip():
+        raise HTTPException(status_code=400, detail="Name is required")
+    if payload.profile not in SCAN_PROFILE_KEYS:
+        raise HTTPException(status_code=400, detail="Unknown scan profile")
+    if not payload.asset_ids:
+        raise HTTPException(status_code=400, detail="At least one asset is required")
+    assets = session.exec(select(Asset.id).where(Asset.id.in_(payload.asset_ids))).all()
+    if len(assets) != len(set(payload.asset_ids)):
+        raise HTTPException(status_code=404, detail="One or more assets not found")
+    if not payload.days_of_week:
+        raise HTTPException(status_code=400, detail="days_of_week must not be empty")
+    for t in payload.times:
+        if ":" not in t:
+            raise HTTPException(status_code=400, detail="Time values must be HH:MM")
+
+
+@app.get("/schedules", response_model=List[ScheduleRead])
+def list_schedules(_: object = Depends(require_roles("admin")), session: Session = Depends(session_dep)) -> List[ScheduleRead]:
+    rows = session.exec(select(Schedule).order_by(Schedule.created_at.desc())).all()
+    return [_serialize_schedule(r) for r in rows]
+
+
+@app.post("/schedules", response_model=ScheduleRead, status_code=201)
+def create_schedule(payload: SchedulePayload, _: object = Depends(require_roles("admin")), session: Session = Depends(session_dep)) -> ScheduleRead:
+    _validate_schedule_payload(payload, session)
+    row = Schedule(
+        name=payload.name,
+        profile=payload.profile,
+        asset_ids_json=_dump_json_list(payload.asset_ids),
+        days_of_week_json=_dump_json_list(payload.days_of_week),
+        times_json=_dump_json_list(payload.times),
+        active=payload.active,
+    )
+    session.add(row)
+    session.commit()
+    session.refresh(row)
+    return _serialize_schedule(row)
+
+
+@app.patch("/schedules/{schedule_id}", response_model=ScheduleRead)
+def update_schedule(schedule_id: int, payload: SchedulePayload, _: object = Depends(require_roles("admin")), session: Session = Depends(session_dep)) -> ScheduleRead:
+    row = session.get(Schedule, schedule_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Schedule not found")
+    _validate_schedule_payload(payload, session)
+    row.name = payload.name
+    row.profile = payload.profile
+    row.asset_ids_json = _dump_json_list(payload.asset_ids)
+    row.days_of_week_json = _dump_json_list(payload.days_of_week)
+    row.times_json = _dump_json_list(payload.times)
+    row.active = payload.active
+    session.add(row)
+    session.commit()
+    session.refresh(row)
+    return _serialize_schedule(row)
+
+
+@app.delete("/schedules/{schedule_id}", status_code=204)
+def delete_schedule(schedule_id: int, _: object = Depends(require_roles("admin")), session: Session = Depends(session_dep)) -> Response:
+    row = session.get(Schedule, schedule_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Schedule not found")
+    session.delete(row)
+    session.commit()
+    return Response(status_code=204)
+
+
+@app.post("/schedules/{schedule_id}/run-now")
+def run_schedule_now(schedule_id: int, background_tasks: BackgroundTasks, _: object = Depends(require_roles("admin", "operator")), session: Session = Depends(session_dep)) -> Dict[str, Any]:
+    row = session.get(Schedule, schedule_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Schedule not found")
+    if not row.active:
+        raise HTTPException(status_code=400, detail="Schedule is paused")
+    asset_ids = [int(x) for x in _load_json_list(row.asset_ids_json)]
+    if not asset_ids:
+        raise HTTPException(status_code=400, detail="Schedule has no assets")
+    profile_key = row.profile or DEFAULT_PROFILE_KEY
+    scan = _create_scan_record(session, asset_ids, profile_key)
+    row.last_run_at = datetime.utcnow()
+    session.add(row)
+    session.commit()
+    if scan_job_queue is not None:
+        scan_job_queue.enqueue(scan.id)
+    else:
+        background_tasks.add_task(run_scan_job, scan.id)
+    return {"status": "queued", "scan_id": scan.id}
 
 
 @app.delete("/scans/{scan_id}", status_code=204)
@@ -822,8 +1483,225 @@ def delete_scan(scan_id: int, session: Session = Depends(session_dep)) -> Respon
     return Response(status_code=204)
 
 
+@app.post("/ssh_scans", response_model=SSHScanCreateResponse, status_code=202)
+def queue_ssh_scan(
+    payload: SSHScanRequest,
+    current=Depends(require_roles("admin", "operator")),  # type: ignore[no-redef]
+    session: Session = Depends(session_dep),
+) -> SSHScanCreateResponse:
+    if not payload.hosts:
+        raise HTTPException(status_code=400, detail="hosts must not be empty")
+
+    normalized_hosts: List[Dict[str, Any]] = []
+    default_port = payload.port or 22
+    timeout = _clamp_int(payload.timeout, 10, 1, SSH_TIMEOUT_LIMIT)
+    command_timeout = _clamp_int(payload.command_timeout, 30, 5, SSH_COMMAND_TIMEOUT_LIMIT)
+    max_workers = _clamp_int(payload.max_workers, 4, 1, SSH_MAX_WORKERS_LIMIT)
+    retries = _clamp_int(payload.retries, 1, 0, SSH_RETRY_LIMIT)
+    for host_cfg in payload.hosts:
+        if not host_cfg.host.strip():
+            raise HTTPException(status_code=400, detail="Host is required for each entry")
+        if not host_cfg.username:
+            raise HTTPException(status_code=400, detail=f"Username missing for host {host_cfg.host}")
+        if not (host_cfg.password or host_cfg.key_path or host_cfg.allow_agent or host_cfg.look_for_keys):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Provide a password, key_path, or enable agent/key discovery for host {host_cfg.host}",
+            )
+        key_path = host_cfg.key_path
+        if key_path:
+            expanded = Path(key_path).expanduser()
+            if not expanded.is_file():
+                raise HTTPException(status_code=400, detail=f"SSH key for {host_cfg.host} not found at {expanded}")
+            key_path = str(expanded)
+        normalized_hosts.append(
+            {
+                "host": host_cfg.host,
+                "port": host_cfg.port or default_port,
+                "username": host_cfg.username,
+                "password": host_cfg.password,
+                "key_path": key_path,
+                "passphrase": host_cfg.passphrase,
+                "allow_agent": host_cfg.allow_agent,
+                "look_for_keys": host_cfg.look_for_keys,
+            }
+        )
+
+    ssh_scan = SSHScan(
+        status="queued",
+        port=default_port,
+        timeout=timeout,
+        command_timeout=command_timeout,
+        max_workers=max_workers,
+        created_by_user_id=current.user.id if getattr(current, "user", None) else None,
+    )
+    session.add(ssh_scan)
+    session.flush()
+    _cache_ssh_retry(ssh_scan.id or 0, retries)
+
+    for host_cfg in normalized_hosts:
+        asset = session.exec(select(Asset).where(Asset.target == host_cfg["host"])).first()
+        host_row = SSHScanHost(
+            ssh_scan_id=ssh_scan.id or 0,
+            asset_id=asset.id if asset else None,
+            host=host_cfg["host"],
+            port=host_cfg.get("port") or default_port,
+            username=host_cfg.get("username"),
+            auth_method="key" if host_cfg.get("key_path") else "password" if host_cfg.get("password") else "unspecified",
+            status="queued",
+        )
+        session.add(host_row)
+        session.flush()
+        if host_row.id:
+            _cache_ssh_credentials(
+                host_row.id,
+                {
+                    "password": host_cfg.get("password"),
+                    "key_path": host_cfg.get("key_path"),
+                    "passphrase": host_cfg.get("passphrase"),
+                    "allow_agent": host_cfg.get("allow_agent", False),
+                    "look_for_keys": host_cfg.get("look_for_keys", False),
+                    "username": host_cfg.get("username"),
+                },
+            )
+
+    session.add(
+        AuditLog(
+            actor_user_id=current.user.id,
+            action="ssh_scan_schedule",
+            target=",".join([h.get("host", "") for h in normalized_hosts])[:120],
+            ip=None,
+            detail=f"{len(normalized_hosts)} host(s) queued for SSH scan",
+        )
+    )
+    session.commit()
+
+    if ssh_scan_job_queue is not None:
+        ssh_scan_job_queue.enqueue(ssh_scan.id or 0)
+    logger.info(
+        "ssh_scan_scheduled %s",
+        json.dumps(
+            {
+                "ssh_scan_id": ssh_scan.id,
+                "hosts": len(normalized_hosts),
+                "timeout": timeout,
+                "command_timeout": command_timeout,
+                "max_workers": max_workers,
+                "retries": retries,
+            }
+        ),
+    )
+
+    return SSHScanCreateResponse(
+        ssh_scan_id=ssh_scan.id or 0,
+        status="queued",
+        host_count=len(normalized_hosts),
+    )
+
+
+@app.post("/assets/{asset_id}/ssh_scan", response_model=SSHScanCreateResponse, status_code=202)
+def queue_asset_ssh_scan(
+    asset_id: int,
+    current=Depends(require_roles("admin", "operator")),  # type: ignore[no-redef]
+    session: Session = Depends(session_dep),
+) -> SSHScanCreateResponse:
+    asset = session.get(Asset, asset_id)
+    if not asset:
+        raise HTTPException(status_code=404, detail="Asset not found")
+    if not asset.credentialed:
+        raise HTTPException(status_code=400, detail="Asset is not marked as credentialed")
+    if not asset.ssh_username:
+        raise HTTPException(status_code=400, detail="SSH username is required")
+    auth_method = asset.ssh_auth_method or "unspecified"
+    has_password = auth_method == "password" and bool(asset.ssh_password)
+    has_key = auth_method == "key" and bool(asset.ssh_key_path)
+    has_agent = auth_method == "agent" and (asset.ssh_allow_agent or asset.ssh_look_for_keys)
+    if not (has_password or has_key or has_agent):
+        raise HTTPException(status_code=400, detail="Missing SSH credential for this asset")
+
+    port = asset.ssh_port or 22
+    ssh_scan = SSHScan(
+        status="queued",
+        port=port,
+        timeout=10,
+        command_timeout=30,
+        max_workers=1,
+        created_by_user_id=current.user.id if getattr(current, "user", None) else None,
+    )
+    session.add(ssh_scan)
+    session.flush()
+    _cache_ssh_retry(ssh_scan.id or 0, 1)
+
+    host_row = SSHScanHost(
+        ssh_scan_id=ssh_scan.id or 0,
+        asset_id=asset.id,
+        host=asset.target,
+        port=port,
+        username=asset.ssh_username,
+        auth_method=auth_method,
+        status="queued",
+    )
+    session.add(host_row)
+    session.flush()
+    if host_row.id:
+        _cache_ssh_credentials(
+            host_row.id,
+            {
+                "password": asset.ssh_password,
+                "key_path": asset.ssh_key_path,
+                "passphrase": None,
+                "allow_agent": bool(asset.ssh_allow_agent),
+                "look_for_keys": bool(asset.ssh_look_for_keys),
+                "username": asset.ssh_username,
+            },
+        )
+
+    session.add(
+        AuditLog(
+            actor_user_id=current.user.id,
+            action="ssh_scan_schedule",
+            target=asset.target,
+            ip=None,
+            detail="1 host queued for SSH scan via asset",
+        )
+    )
+    session.commit()
+
+    if ssh_scan_job_queue is not None:
+        ssh_scan_job_queue.enqueue(ssh_scan.id or 0)
+
+    return SSHScanCreateResponse(
+        ssh_scan_id=ssh_scan.id or 0,
+        status="queued",
+        host_count=1,
+    )
+
+
+@app.get("/ssh_scans/{ssh_scan_id}", response_model=SSHScanDetail)
+def get_ssh_scan_detail(ssh_scan_id: int, session: Session = Depends(session_dep)) -> SSHScanDetail:
+    scan = session.get(SSHScan, ssh_scan_id)
+    if not scan:
+        raise HTTPException(status_code=404, detail="SSH scan not found")
+    hosts = (
+        session.exec(select(SSHScanHost).where(SSHScanHost.ssh_scan_id == ssh_scan_id).order_by(SSHScanHost.id)).all()
+        or []
+    )
+    return SSHScanDetail(
+        id=scan.id or 0,
+        status=scan.status,
+        created_at=scan.created_at.isoformat() + "Z",
+        started_at=scan.started_at.isoformat() + "Z" if scan.started_at else None,
+        completed_at=scan.completed_at.isoformat() + "Z" if scan.completed_at else None,
+        hosts=[_serialize_ssh_host(h) for h in hosts],
+    )
+
+
 @app.get("/scans/{scan_id}", response_model=ScanDetail)
-def get_scan(scan_id: int, session: Session = Depends(session_dep)) -> ScanDetail:
+def get_scan(
+    scan_id: int,
+    _: object = Depends(require_roles("viewer", "operator", "admin")),
+    session: Session = Depends(session_dep),
+) -> ScanDetail:
     scan = session.get(Scan, scan_id)
     if not scan:
         raise HTTPException(status_code=404, detail="Scan not found")
@@ -856,8 +1734,61 @@ def get_scan(scan_id: int, session: Session = Depends(session_dep)) -> ScanDetai
     )
 
 
+@app.post("/scans/{scan_id}/cancel")
+def cancel_scan(
+    scan_id: int,
+    _: object = Depends(require_roles("admin", "operator")),
+    session: Session = Depends(session_dep),
+) -> Dict[str, str]:
+    scan = session.get(Scan, scan_id)
+    if not scan:
+        raise HTTPException(status_code=404, detail="Scan not found")
+    if scan.status in {"completed", "completed_with_errors", "failed", "cancelled"}:
+        return {"status": scan.status}
+    _cancel_scan_in_db(session, scan_id, "Scan cancelled by user")
+    if scan_job_queue is not None:
+        scan_job_queue.cancel(scan_id)
+    return {"status": "cancelled"}
+
+
+@app.post("/scans/{scan_id}/retry", response_model=ScanRead)
+def retry_scan(
+    scan_id: int,
+    _: object = Depends(require_roles("admin", "operator")),
+    session: Session = Depends(session_dep),
+) -> Scan:
+    scan = session.get(Scan, scan_id)
+    if not scan:
+        raise HTTPException(status_code=404, detail="Scan not found")
+    if scan.status not in {"failed", "completed", "completed_with_errors", "cancelled"}:
+        raise HTTPException(status_code=400, detail="Scan is still running or queued")
+
+    scan.status = "queued"
+    scan.started_at = None
+    scan.completed_at = None
+    scan.notes = None
+    asset_statuses = session.exec(select(ScanAssetStatus).where(ScanAssetStatus.scan_id == scan_id)).all()
+    for status in asset_statuses:
+        status.status = "pending"
+        status.attempts = 0
+        status.last_error = None
+        status.started_at = None
+        status.completed_at = None
+        session.add(status)
+    session.add(scan)
+    session.commit()
+    _record_scan_event(session, scan_id, "Scan re-queued for retry")
+    if scan_job_queue is not None:
+        scan_job_queue.enqueue(scan.id, force=True)
+    return scan
+
+
 @app.get("/scans/{scan_id}/assets", response_model=List[ScanAssetStatusRead])
-def get_scan_asset_status(scan_id: int, session: Session = Depends(session_dep)) -> List[ScanAssetStatusRead]:
+def get_scan_asset_status(
+    scan_id: int,
+    _: object = Depends(require_roles("viewer", "operator", "admin")),
+    session: Session = Depends(session_dep),
+) -> List[ScanAssetStatusRead]:
     if not session.get(Scan, scan_id):
         raise HTTPException(status_code=404, detail="Scan not found")
     statuses = session.exec(
@@ -877,7 +1808,11 @@ def get_scan_asset_status(scan_id: int, session: Session = Depends(session_dep))
 
 
 @app.get("/scans/{scan_id}/events", response_model=List[ScanEventRead])
-def list_scan_events(scan_id: int, session: Session = Depends(session_dep)) -> List[ScanEventRead]:
+def list_scan_events(
+    scan_id: int,
+    _: object = Depends(require_roles("viewer", "operator", "admin")),
+    session: Session = Depends(session_dep),
+) -> List[ScanEventRead]:
     if not session.get(Scan, scan_id):
         raise HTTPException(status_code=404, detail="Scan not found")
     events = session.exec(
@@ -887,9 +1822,20 @@ def list_scan_events(scan_id: int, session: Session = Depends(session_dep)) -> L
 
 
 @app.get("/scans/{scan_id}/events/stream")
-def stream_scan_events(scan_id: int):
+def stream_scan_events(
+    scan_id: int,
+    token: Optional[str] = Query(default=None, description="Access token for SSE clients"),
+    authorization: Optional[str] = Header(default=None),
+):
+    _require_stream_user(token, authorization)
+    with get_session() as session:
+        if not session.get(Scan, scan_id):
+            raise HTTPException(status_code=404, detail="Scan not found")
+
     async def event_gen():
         last_id: Optional[int] = None
+        last_ping: float = 0.0
+        last_status_fingerprint: Optional[str] = None
         while True:
             try:
                 with get_session() as session:
@@ -898,14 +1844,38 @@ def stream_scan_events(scan_id: int):
                     ).first()
                     if row and row.id != last_id:
                         last_id = row.id
-                        payload = {"id": row.id, "created_at": row.created_at.isoformat(), "message": row.message}
+                        payload = {
+                            "type": "event",
+                            "id": row.id,
+                            "created_at": row.created_at.isoformat(),
+                            "message": row.message,
+                        }
                         yield f"data: {json.dumps(payload)}\n\n"
+                    statuses = session.exec(
+                        select(ScanAssetStatus).where(ScanAssetStatus.scan_id == scan_id).order_by(ScanAssetStatus.asset_id)
+                    ).all()
+                    serialized_status = _serialize_asset_status(statuses)
+                    fingerprint = json.dumps(serialized_status, sort_keys=True)
+                    if fingerprint != last_status_fingerprint:
+                        last_status_fingerprint = fingerprint
+                        status_payload = {
+                            "type": "asset_status",
+                            "assets": serialized_status,
+                            "progress": _asset_progress(statuses),
+                        }
+                        yield f"data: {json.dumps(status_payload)}\n\n"
+                    now = asyncio.get_event_loop().time()
+                    if now - last_ping >= 10:
+                        last_ping = now
+                        yield ": keepalive\n\n"
+            except HTTPException:
+                raise
             except Exception:
-                # Keep stream alive on transient errors
-                pass
+                logger.debug("scan_event_stream_error", exc_info=True)
             await asyncio.sleep(2)
 
-    return StreamingResponse(event_gen(), media_type="text/event-stream")
+    headers = {"Cache-Control": "no-cache", "Connection": "keep-alive"}
+    return StreamingResponse(event_gen(), media_type="text/event-stream", headers=headers)
 
 
 @app.get("/findings", response_model=List[FindingRead])
@@ -918,11 +1888,13 @@ def list_findings(
     search: Optional[str] = Query(default=None, alias="q"),
     limit: int = Query(default=100, ge=1, le=1000),
     offset: int = Query(default=0, ge=0),
+    _: object = Depends(require_roles("viewer", "operator", "admin")),
     session: Session = Depends(session_dep),
 ) -> List[Finding]:
-    query, _, _ = _build_finding_filters(scan_id, severity, status_filter, asset_id, search)
+    query, where_sql, params = _build_finding_filters(scan_id, severity, status_filter, asset_id, search)
     rows, total = _paginate_query(session, query.order_by(Finding.detected_at.desc()), limit, offset)
     response.headers["X-Total-Count"] = str(total)
+    response.headers["X-CVSS-Bands"] = json.dumps(_aggregate_cvss_bands(session, where_sql, params))
     return rows
 
 
@@ -937,6 +1909,7 @@ def export_findings_report(
     search: Optional[str] = Query(default=None, alias="q"),
     limit: int = Query(default=5000, ge=1, le=20000),
     offset: int = Query(default=0, ge=0),
+    _: object = Depends(require_roles("viewer", "operator", "admin")),
     session: Session = Depends(session_dep),
 ) -> Any:
     fmt = format.lower()
@@ -963,7 +1936,10 @@ def export_findings_report(
             "id",
             "scan_id",
             "asset_id",
+            "assigned_user_id",
             "detected_at",
+            "sla_due_at",
+            "closed_at",
             "severity",
             "status",
             "service_name",
@@ -972,17 +1948,31 @@ def export_findings_report(
             "port",
             "protocol",
             "description",
+            "evidence_summary",
+            "evidence",
+            "fingerprint",
             "cvss_v31_base",
             "cvss_vector",
             "cvss_band",
             "cve_ids",
+            "references",
         ]
         writer = csv.DictWriter(output, fieldnames=fieldnames)
         writer.writeheader()
+        json_fields = {"evidence", "fingerprint"}
         for row in export_rows:
+            normalized = {}
+            for key in fieldnames:
+                value = row.get(key)
+                if key in json_fields and value not in (None, ""):
+                    normalized[key] = json.dumps(value)
+                elif key == "references":
+                    normalized[key] = ";".join(value or [])
+                else:
+                    normalized[key] = value
             writer.writerow(
                 {
-                    **{k: row.get(k) for k in fieldnames if k != "cve_ids"},
+                    **{k: normalized.get(k) for k in fieldnames if k != "cve_ids"},
                     "cve_ids": ";".join(row.get("cve_ids") or []),
                 }
             )
@@ -1018,12 +2008,77 @@ def update_finding(finding_id: int, payload: FindingUpdate, session: Session = D
     if not finding:
         raise HTTPException(status_code=404, detail="Finding not found")
     update_data = payload.model_dump(exclude_unset=True)
+    if "status" in update_data:
+        status_val = update_data["status"]
+        if status_val is not None and status_val not in VALID_FINDING_STATUSES:
+            raise HTTPException(status_code=400, detail=f"Invalid status. Allowed: {', '.join(sorted(VALID_FINDING_STATUSES))}")
+        if status_val in {"resolved", "ignored"}:
+            update_data.setdefault("closed_at", datetime.utcnow())
+        elif status_val == "open":
+            update_data["closed_at"] = None
+    assignee_id = update_data.get("assigned_user_id")
+    if assignee_id is not None:
+        assignee = session.get(User, assignee_id)
+        if not assignee:
+            raise HTTPException(status_code=400, detail="Assignee not found")
     for field, value in update_data.items():
         setattr(finding, field, value)
     session.add(finding)
     session.flush()
     session.refresh(finding)
+    session.add(
+        AuditLog(
+            actor_user_id=None,
+            action="finding_updated",
+            target=str(finding.id),
+            ip=None,
+            detail=json.dumps(update_data),
+        )
+    )
     return finding
+
+
+class FindingCommentCreate(BaseModel):
+    message: str
+
+
+@app.get("/findings/{finding_id}/comments", response_model=List[FindingCommentRead])
+def list_finding_comments(finding_id: int, session: Session = Depends(session_dep)) -> List[FindingComment]:
+    finding = session.get(Finding, finding_id)
+    if not finding:
+        raise HTTPException(status_code=404, detail="Finding not found")
+    rows = session.exec(
+        select(FindingComment).where(FindingComment.finding_id == finding_id).order_by(FindingComment.created_at.desc())
+    ).all()
+    return rows
+
+
+@app.post("/findings/{finding_id}/comments", response_model=FindingCommentRead, status_code=201)
+def add_finding_comment(
+    finding_id: int,
+    payload: FindingCommentCreate,
+    current=Depends(require_roles("admin", "operator")),
+    session: Session = Depends(session_dep),
+) -> FindingComment:
+    finding = session.get(Finding, finding_id)
+    if not finding:
+        raise HTTPException(status_code=404, detail="Finding not found")
+    if not payload.message or not payload.message.strip():
+        raise HTTPException(status_code=400, detail="Message is required")
+    comment = FindingComment(finding_id=finding_id, user_id=current.user.id, message=payload.message.strip())
+    session.add(comment)
+    session.flush()
+    session.refresh(comment)
+    session.add(
+        AuditLog(
+            actor_user_id=current.user.id,
+            action="finding_commented",
+            target=str(finding_id),
+            ip=None,
+            detail=payload.message[:240],
+        )
+    )
+    return comment
 
 
 def render_legacy_ui(request: Request, session: Session) -> HTMLResponse:
@@ -1137,120 +2192,344 @@ else:
         return render_legacy_ui(request, session)
 
 
+def run_ssh_scan_job(ssh_scan_id: int) -> None:
+    from clanker.db.session import get_session as session_factory
+
+    try:
+        with session_factory() as session:
+            scan = session.get(SSHScan, ssh_scan_id)
+            if not scan:
+                logger.error("SSH scan %s missing", ssh_scan_id)
+                return
+            scan.status = "running"
+            scan.started_at = datetime.utcnow()
+            session.add(scan)
+            session.commit()
+
+        with session_factory() as session:
+            scan = session.get(SSHScan, ssh_scan_id)
+            hosts = session.exec(
+                select(SSHScanHost).where(SSHScanHost.ssh_scan_id == ssh_scan_id).order_by(SSHScanHost.id)
+            ).all()
+            if not hosts:
+                scan.status = "failed"
+                scan.notes = "No SSH hosts to scan"
+                scan.completed_at = datetime.utcnow()
+                session.add(scan)
+                session.commit()
+                _pop_ssh_retry(ssh_scan_id)
+                return
+
+            scanner = SSHScanner(
+                port=scan.port,
+                timeout=_clamp_int(scan.timeout, 10, 1, SSH_TIMEOUT_LIMIT),
+                command_timeout=_clamp_int(scan.command_timeout, 30, 5, SSH_COMMAND_TIMEOUT_LIMIT),
+                max_workers=_clamp_int(scan.max_workers, 4, 1, SSH_MAX_WORKERS_LIMIT),
+                max_retries=_clamp_int(_pop_ssh_retry(ssh_scan_id), 1, 0, SSH_RETRY_LIMIT),
+                verbose=False,
+            )
+            host_payloads: List[Dict[str, Any]] = []
+            for host_row in hosts:
+                creds = _pop_ssh_credentials(host_row.id or 0) or {}
+                if not (
+                    creds.get("password")
+                    or creds.get("key_path")
+                    or creds.get("allow_agent")
+                    or creds.get("look_for_keys")
+                ):
+                    host_row.status = "failed"
+                    host_row.error = "Credentials missing for host"
+                    host_row.completed_at = datetime.utcnow()
+                    session.add(host_row)
+                    continue
+                host_row.status = "running"
+                host_row.started_at = datetime.utcnow()
+                session.add(host_row)
+                host_payloads.append(
+                    {
+                        "host": host_row.host,
+                        "port": host_row.port,
+                        "username": creds.get("username") or host_row.username,
+                        "password": creds.get("password"),
+                        "key_path": creds.get("key_path"),
+                        "passphrase": creds.get("passphrase"),
+                        "allow_agent": creds.get("allow_agent"),
+                        "look_for_keys": creds.get("look_for_keys"),
+                        "host_id": host_row.id,
+                    }
+                )
+            session.commit()
+
+        if not host_payloads:
+            with session_factory() as session:
+                scan = session.get(SSHScan, ssh_scan_id)
+                if scan:
+                    scan.status = "failed"
+                    scan.notes = "No hosts with valid credentials to scan"
+                    scan.completed_at = datetime.utcnow()
+                    session.add(scan)
+                    session.commit()
+            _pop_ssh_retry(ssh_scan_id)
+            return
+
+        results = scanner.scan_all(host_payloads)
+        result_map: Dict[Optional[int], Dict[str, Any]] = {res.get("host_id"): res for res in results}
+
+        with session_factory() as session:
+            scan = session.get(SSHScan, ssh_scan_id)
+            hosts = session.exec(
+                select(SSHScanHost).where(SSHScanHost.ssh_scan_id == ssh_scan_id).order_by(SSHScanHost.id)
+            ).all()
+            errors = False
+            for host_row in hosts:
+                res = result_map.get(host_row.id) or {}
+                host_row.error = host_row.error or res.get("error")
+                host_row.status = "success" if res.get("status") == "success" else "failed"
+                host_row.completed_at = datetime.utcnow()
+                if res:
+                    host_row.raw_output = json.dumps(res)
+                    host_row.ssh_config_hardening = json.dumps(res.get("ssh_config_hardening") or {})
+                    host_row.facts = json.dumps(SSHScanner.extract_basic_facts(res))
+                session.add(host_row)
+                if host_row.status != "success":
+                    errors = True
+                else:
+                    try:
+                        inventory = SSHScanner.to_agent_inventory(res)
+                        persist_agent_findings(session, inventory, asset_id=host_row.asset_id, ingest_id=host_row.id)
+                    except Exception as exc:  # do not fail scan if vuln ingestion fails
+                        logger.exception("Failed to persist findings for SSH host %s: %s", host_row.host, exc)
+
+            scan.completed_at = datetime.utcnow()
+            scan.status = "completed_with_errors" if errors else "completed"
+            session.add(scan)
+            session.add(
+                AuditLog(
+                    actor_user_id=scan.created_by_user_id,
+                    action="ssh_scan_complete",
+                    target=str(ssh_scan_id),
+                    ip=None,
+                    detail=f"SSH scan {ssh_scan_id} finished with status {scan.status}",
+                )
+            )
+            session.commit()
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.exception("SSH scan %s crashed unexpectedly: %s", ssh_scan_id, exc)
+        with session_factory() as session:
+            scan = session.get(SSHScan, ssh_scan_id)
+            if scan:
+                scan.status = "failed"
+                scan.completed_at = scan.completed_at or datetime.utcnow()
+                scan.notes = scan.notes or f"SSH scan worker error: {exc}"
+                session.add(scan)
+                session.commit()
+        _pop_ssh_retry(ssh_scan_id)
+
+
 def run_scan_job(scan_id: int) -> None:
     from clanker.db.session import get_session as session_factory
 
-    with session_factory() as session:
-        scan = session.get(Scan, scan_id)
-        if not scan:
-            logger.error("Scan %s vanished before start", scan_id)
-            return
-        scan.status = "running"
-        scan.started_at = datetime.utcnow()
-        session.add(scan)
-        _record_scan_event(session, scan_id, "Scan started")
-        session.commit()
-
-    with session_factory() as session:
-        scan = session.get(Scan, scan_id)
-        asset_links = session.exec(
-            select(Asset)
-            .join(ScanTarget, ScanTarget.asset_id == Asset.id)
-            .where(ScanTarget.scan_id == scan_id)
-        ).all()
-
-        if not asset_links:
-            scan.status = "failed"
-            scan.notes = "No assets were linked to the scan"
-            _record_scan_event(session, scan_id, "No assets to scan")
+    try:
+        with session_factory() as session:
+            scan = session.get(Scan, scan_id)
+            if not scan:
+                logger.error("Scan %s vanished before start", scan_id)
+                return
+            if scan.status == "cancelled":
+                _record_scan_event(session, scan_id, "Scan cancelled before start")
+                return
+            scan.status = "running"
+            scan.started_at = datetime.utcnow()
             session.add(scan)
+            _record_scan_event(session, scan_id, "Scan started")
             session.commit()
-            return
 
-        profile = get_scan_profile(scan.profile)
-        asset_errors = False
-        for asset in asset_links:
-            retrying = True
-            while retrying:
-                status_row = _ensure_asset_status(session, scan_id, asset.id or 0)
-                status_row.status = "running"
-                status_row.started_at = status_row.started_at or datetime.utcnow()
-                status_row.attempts += 1
-                session.add(status_row)
+        with session_factory() as session:
+            scan = session.get(Scan, scan_id)
+            asset_links = session.exec(
+                select(Asset)
+                .join(ScanTarget, ScanTarget.asset_id == Asset.id)
+                .where(ScanTarget.scan_id == scan_id)
+            ).all()
+
+            if not asset_links:
+                scan.status = "failed"
+                scan.notes = "No assets were linked to the scan"
+                _record_scan_event(session, scan_id, "No assets to scan")
+                session.add(scan)
                 session.commit()
-                _record_scan_event(
-                    session, scan_id, f"Scanning {asset.target} (attempt {status_row.attempts})"
-                )
+                return
 
-                try:
-                    xml_path = execute_nmap(asset, profile)
-                    observations = parse_nmap_xml(xml_path, asset)
-                    build_findings(session, scan_id=scan_id, asset_id=asset.id or 0, observations=observations)
-                    status_row.status = "completed"
-                    status_row.completed_at = datetime.utcnow()
-                    status_row.last_error = None
+            profile = get_scan_profile(scan.profile)
+            asset_errors = False
+            for asset in asset_links:
+                session.refresh(scan)
+                if scan.status == "cancelled":
+                    _record_scan_event(session, scan_id, "Scan cancelled while running")
+                    scan.completed_at = scan.completed_at or datetime.utcnow()
+                    session.add(scan)
+                    session.commit()
+                    return
+                retrying = True
+                while retrying:
+                    status_row = _ensure_asset_status(session, scan_id, asset.id or 0)
+                    status_row.status = "running"
+                    status_row.started_at = status_row.started_at or datetime.utcnow()
+                    status_row.attempts += 1
                     session.add(status_row)
                     session.commit()
                     _record_scan_event(
-                        session, scan_id, f"Finished {asset.target} with {len(observations)} open services"
+                        session, scan_id, f"Scanning {asset.target} (attempt {status_row.attempts})"
                     )
-                    retrying = False
-                except FileNotFoundError:
-                    scan.status = "failed"
-                    scan.notes = "nmap binary not found on host"
-                    status_row.status = "failed"
-                    status_row.last_error = "nmap missing"
-                    status_row.completed_at = datetime.utcnow()
-                    session.add_all([scan, status_row])
-                    session.commit()
-                    _record_scan_event(session, scan_id, "nmap binary missing. Aborting scan.")
-                    return
-                except Exception as exc:  # pylint: disable=broad-except
-                    logger.exception("Scan %s failed for asset %s: %s", scan_id, asset.target, exc)
-                    status_row.status = "failed"
-                    status_row.last_error = str(exc)
-                    status_row.completed_at = datetime.utcnow()
-                    session.add(status_row)
-                    session.commit()
-                    _record_scan_event(session, scan_id, f"Failed {asset.target}: {exc}")
-                    if status_row.attempts <= settings.scan_retry_limit:
-                        scan.retry_count += 1
-                        session.add(scan)
+
+                    if _is_scan_cancelled(session, scan_id):
+                        status_row.status = "cancelled"
+                        status_row.completed_at = status_row.completed_at or datetime.utcnow()
+                        session.add(status_row)
                         session.commit()
-                        status_row.status = "pending"
+                        _record_scan_event(session, scan_id, "Scan cancelled mid-run")
+                        return
+
+                    try:
+                        xml_path = execute_nmap(asset, profile)
+                        observations = parse_nmap_xml(xml_path, asset)
+                        observation_map: Dict[int, Any] = {}
+                        findings = build_findings(
+                            session,
+                            scan_id=scan_id,
+                            asset_id=asset.id or 0,
+                            observations=observations,
+                            observation_map=observation_map,
+                        )
+                        session.commit()
+                        try:
+                            enrich_from_feed(session, findings, observations=observation_map)
+                            session.commit()
+                        except Exception as exc:  # pylint: disable=broad-except
+                            session.rollback()
+                            logger.exception("Enrichment failed for scan %s asset %s: %s", scan_id, asset.target, exc)
+                        status_row.status = "completed"
+                        status_row.completed_at = datetime.utcnow()
+                        status_row.last_error = None
                         session.add(status_row)
                         session.commit()
                         _record_scan_event(
-                            session, scan_id, f"Retrying {asset.target} (attempt {status_row.attempts + 1})"
+                            session, scan_id, f"Finished {asset.target} with {len(observations)} open services"
                         )
-                        continue
-                    asset_errors = True
-                    retrying = False
-                    break
+                        retrying = False
+                    except FileNotFoundError:
+                        scan.status = "failed"
+                        scan.notes = "nmap binary not found on host"
+                        status_row.status = "failed"
+                        status_row.last_error = "nmap missing"
+                        status_row.completed_at = datetime.utcnow()
+                        session.add_all([scan, status_row])
+                        session.commit()
+                        _record_scan_event(session, scan_id, "nmap binary missing. Aborting scan.")
+                        return
+                    except Exception as exc:  # pylint: disable=broad-except
+                        logger.exception("Scan %s failed for asset %s: %s", scan_id, asset.target, exc)
+                        status_row.status = "failed"
+                        status_row.last_error = str(exc)
+                        status_row.completed_at = datetime.utcnow()
+                        session.add(status_row)
+                        session.commit()
+                        _record_scan_event(session, scan_id, f"Failed {asset.target}: {exc}")
+                        if status_row.attempts <= settings.scan_retry_limit:
+                            scan.retry_count += 1
+                            session.add(scan)
+                            session.commit()
+                            status_row.status = "pending"
+                            session.add(status_row)
+                            session.commit()
+                            _record_scan_event(
+                                session, scan_id, f"Retrying {asset.target} (attempt {status_row.attempts + 1})"
+                            )
+                            continue
+                        asset_errors = True
+                        retrying = False
+                        break
 
-        scan.completed_at = datetime.utcnow()
-        if asset_errors:
-            scan.status = "completed_with_errors"
-            scan.notes = "One or more assets failed to scan"
-        else:
-            scan.status = "completed"
-            scan.notes = None
-        session.add(scan)
-        _record_scan_event(session, scan_id, f"Scan finished with status {scan.status}")
-        session.commit()
+            scan.completed_at = datetime.utcnow()
+            if asset_errors:
+                scan.status = "completed_with_errors"
+                scan.notes = "One or more assets failed to scan"
+            else:
+                scan.status = "completed"
+                scan.notes = None
+            session.add(scan)
+            _record_scan_event(session, scan_id, f"Scan finished with status {scan.status}")
+            logger.info(
+                "scan_summary %s",
+                json.dumps(
+                    {
+                        "scan_id": scan_id,
+                        "status": scan.status,
+                        "asset_count": len(asset_links),
+                        "asset_errors": asset_errors,
+                    }
+                ),
+            )
+            session.commit()
+            _schedule_reenrich_scan(scan_id)
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.exception("Scan %s crashed unexpectedly: %s", scan_id, exc)
+        with session_factory() as session:
+            scan = session.get(Scan, scan_id)
+            if scan:
+                scan.status = "failed"
+                scan.completed_at = scan.completed_at or datetime.utcnow()
+                scan.notes = scan.notes or f"Scan crashed: {exc}"
+                session.add(scan)
+                try:
+                    _record_scan_event(session, scan_id, f"Scan worker error: {exc}")
+                except Exception:
+                    session.commit()
 
 
 @app.post("/enrichment/finding/{finding_id}")
-def enrich_one(finding_id: int, background_tasks: BackgroundTasks) -> dict:
-    def _task(fid: int):
+def enrich_one(
+    finding_id: int,
+    background_tasks: BackgroundTasks,
+    force_refresh_cache: bool = Query(default=False),
+) -> dict:
+    def _task(fid: int, force_refresh: bool):
         with get_session() as s2:
             row = s2.get(Finding, fid)
             if row:
-                enrich_from_feed(s2, [row])
+                obs_index = _build_observation_index([row])
+                enrich_from_feed(s2, [row], observations=obs_index, force_refresh_cache=force_refresh)
                 s2.commit()
 
-    background_tasks.add_task(_task, finding_id)
-    return {"status": "queued"}
+    background_tasks.add_task(_task, finding_id, force_refresh_cache)
+    return {"status": "queued", "finding_id": finding_id, "force_refresh": force_refresh_cache}
+
+
+@app.post("/enrichment/scan/{scan_id}")
+def enrich_scan(
+    scan_id: int,
+    background_tasks: BackgroundTasks,
+    force_refresh_cache: bool = Query(default=False),
+    session: Session = Depends(session_dep),
+) -> dict:
+    if not session.get(Scan, scan_id):
+        raise HTTPException(status_code=404, detail="Scan not found")
+    background_tasks.add_task(_reenrich_scan, scan_id, force_refresh_cache)
+    return {"status": "queued", "scan_id": scan_id, "force_refresh": force_refresh_cache}
+
+
+@app.post("/enrichment/rebuild_all")
+def enrich_all_findings(
+    background_tasks: BackgroundTasks, force_refresh_cache: bool = Query(default=False)
+) -> dict:
+    background_tasks.add_task(_reenrich_all_findings, force_refresh_cache)
+    return {"status": "queued", "scope": "all_findings", "force_refresh": force_refresh_cache}
+
+
+@app.post("/enrichment/sync")
+def sync_enrichment_cache(background_tasks: BackgroundTasks, force_refresh: bool = Query(default=False)) -> dict:
+    background_tasks.add_task(sync_nvd_cache, force_refresh)
+    return {"status": "queued", "force_refresh": force_refresh}
 
 
 @app.get("/finding_ext/{finding_id}")
@@ -1272,6 +2551,9 @@ def get_finding_ext(finding_id: int, session: Session = Depends(session_dep)) ->
         "protocol": finding.protocol,
         "service_name": finding.service_name,
         "service_version": finding.service_version,
+        "fingerprint": finding.fingerprint,
+        "evidence": finding.evidence,
+        "evidence_summary": finding.evidence_summary,
         "cve_ids": finding.cve_ids,
         "severity": finding.severity,
         "status": finding.status,

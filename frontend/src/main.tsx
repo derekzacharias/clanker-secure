@@ -7,6 +7,9 @@ import '@mantine/notifications/styles.css';
 import { Global } from '@emotion/react';
 import App from './App';
 
+// Ensure browser tab reflects the product name as early as possible
+document.title = 'Clanker Command Console';
+
 // Inject a robot favicon (data URI) to match the Clanker header icon
 (function setClankerFavicon() {
   const svg = `<?xml version="1.0" encoding="UTF-8"?><svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' width='256' height='256' fill='none' stroke='%236366f1' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'>

@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional
 import threading
 import time
 from datetime import datetime
+import logging
 
 from fastapi import Depends, HTTPException, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -87,6 +88,13 @@ def _configure_cors_from_env() -> None:
 
 
 _configure_cors_from_env()
+queue_logger = logging.getLogger("clanker.queue")
+
+
+@app.get("/health", include_in_schema=False)
+def health() -> Dict[str, str]:
+    """Lightweight health check."""
+    return {"status": "ok"}
 
 
 def _parse_references(raw: Optional[str]) -> List[str]:
@@ -328,117 +336,129 @@ def run_scan_job(scan_id: int) -> None:  # noqa: C901
     from clanker.core.scanner import get_scan_profile, execute_nmap, parse_nmap_xml
     from clanker.core.findings import build_findings
 
-    with session_factory() as session:
-        scan = session.get(Scan, scan_id)
-        if not scan:
-            cm.logger.error("Scan %s vanished before start", scan_id)
-            return
-        if scan.status == "cancelled":
-            cm._record_scan_event(session, scan_id, "Scan cancelled before start; skipping")  # type: ignore[attr-defined]
-            session.commit()
-            return
-        scan.status = "running"
-        scan.started_at = datetime.utcnow()
-        session.add(scan)
-        cm._record_scan_event(session, scan_id, "Scan started")  # type: ignore[attr-defined]
-        session.commit()
-
-    with session_factory() as session:
-        scan = session.get(Scan, scan_id)
-        asset_links = session.exec(
-            select(Asset)
-            .join(ScanTarget, ScanTarget.asset_id == Asset.id)
-            .where(ScanTarget.scan_id == scan_id)
-        ).all()
-
-        if not asset_links:
-            scan.status = "failed"
-            scan.notes = "No assets were linked to the scan"
-            cm._record_scan_event(session, scan_id, "No assets to scan")  # type: ignore[attr-defined]
-            session.add(scan)
-            session.commit()
-            return
-
-        profile = get_scan_profile(scan.profile)
-        asset_errors = False
-        for asset in asset_links:
-            # Check if cancelled before processing next asset
+    try:
+        with session_factory() as session:
             scan = session.get(Scan, scan_id)
-            if scan and scan.status == "cancelled":
-                cm._record_scan_event(session, scan_id, "Cancellation detected; stopping further asset scans")  # type: ignore[attr-defined]
+            if not scan:
+                cm.logger.error("Scan %s vanished before start", scan_id)  # type: ignore[attr-defined]
+                return
+            if scan.status == "cancelled":
+                cm._record_scan_event(session, scan_id, "Scan cancelled before start; skipping")  # type: ignore[attr-defined]
                 session.commit()
-                break
-            retrying = True
-            while retrying:
-                status_row = cm._ensure_asset_status(session, scan_id, asset.id or 0)  # type: ignore[attr-defined]
-                status_row.status = "running"
-                status_row.started_at = status_row.started_at or datetime.utcnow()
-                status_row.attempts += 1
-                session.add(status_row)
-                session.commit()
-                cm._record_scan_event(
-                    session, scan_id, f"Scanning {asset.target} (attempt {status_row.attempts})"
-                )  # type: ignore[attr-defined]
+                return
+            scan.status = "running"
+            scan.started_at = datetime.utcnow()
+            session.add(scan)
+            cm._record_scan_event(session, scan_id, "Scan started")  # type: ignore[attr-defined]
+            session.commit()
 
-                try:
-                    xml_path = execute_nmap(asset, profile)
-                    observations = parse_nmap_xml(xml_path, asset)
-                    build_findings(session, scan_id=scan_id, asset_id=asset.id or 0, observations=observations)
-                    status_row.status = "completed"
-                    status_row.completed_at = datetime.utcnow()
-                    status_row.last_error = None
+        with session_factory() as session:
+            scan = session.get(Scan, scan_id)
+            asset_links = session.exec(
+                select(Asset)
+                .join(ScanTarget, ScanTarget.asset_id == Asset.id)
+                .where(ScanTarget.scan_id == scan_id)
+            ).all()
+
+            if not asset_links:
+                scan.status = "failed"
+                scan.notes = "No assets were linked to the scan"
+                cm._record_scan_event(session, scan_id, "No assets to scan")  # type: ignore[attr-defined]
+                session.add(scan)
+                session.commit()
+                return
+
+            profile = get_scan_profile(scan.profile)
+            asset_errors = False
+            for asset in asset_links:
+                scan = session.get(Scan, scan_id)
+                if scan and scan.status == "cancelled":
+                    cm._record_scan_event(session, scan_id, "Cancellation detected; stopping further asset scans")  # type: ignore[attr-defined]
+                    session.commit()
+                    break
+                retrying = True
+                while retrying:
+                    status_row = cm._ensure_asset_status(session, scan_id, asset.id or 0)  # type: ignore[attr-defined]
+                    status_row.status = "running"
+                    status_row.started_at = status_row.started_at or datetime.utcnow()
+                    status_row.attempts += 1
                     session.add(status_row)
                     session.commit()
                     cm._record_scan_event(
-                        session, scan_id, f"Finished {asset.target} with {len(observations)} open services"
+                        session, scan_id, f"Scanning {asset.target} (attempt {status_row.attempts})"
                     )  # type: ignore[attr-defined]
-                    retrying = False
-                except FileNotFoundError:
-                    scan.status = "failed"
-                    scan.notes = "nmap binary not found on host"
-                    status_row.status = "failed"
-                    status_row.last_error = "nmap missing"
-                    status_row.completed_at = datetime.utcnow()
-                    session.add_all([scan, status_row])
-                    session.commit()
-                    cm._record_scan_event(session, scan_id, "nmap binary missing. Aborting scan.")  # type: ignore[attr-defined]
-                    return
-                except Exception as exc:  # pylint: disable=broad-except
-                    cm.logger.exception("Scan %s failed for asset %s: %s", scan_id, asset.target, exc)
-                    status_row.status = "failed"
-                    status_row.last_error = str(exc)
-                    status_row.completed_at = datetime.utcnow()
-                    session.add(status_row)
-                    session.commit()
-                    cm._record_scan_event(session, scan_id, f"Failed {asset.target}: {exc}")  # type: ignore[attr-defined]
-                    if status_row.attempts <= cm.settings.scan_retry_limit:  # type: ignore[attr-defined]
-                        scan.retry_count += 1
-                        session.add(scan)
-                        session.commit()
-                        status_row.status = "pending"
+
+                    try:
+                        xml_path = execute_nmap(asset, profile)
+                        observations = parse_nmap_xml(xml_path, asset)
+                        build_findings(session, scan_id=scan_id, asset_id=asset.id or 0, observations=observations)
+                        status_row.status = "completed"
+                        status_row.completed_at = datetime.utcnow()
+                        status_row.last_error = None
                         session.add(status_row)
                         session.commit()
                         cm._record_scan_event(
-                            session, scan_id, f"Retrying {asset.target} (attempt {status_row.attempts + 1})"
+                            session, scan_id, f"Finished {asset.target} with {len(observations)} open services"
                         )  # type: ignore[attr-defined]
-                        continue
-                    asset_errors = True
-                    retrying = False
-                    break
+                        retrying = False
+                    except FileNotFoundError:
+                        scan.status = "failed"
+                        scan.notes = "nmap binary not found on host"
+                        status_row.status = "failed"
+                        status_row.last_error = "nmap missing"
+                        status_row.completed_at = datetime.utcnow()
+                        session.add_all([scan, status_row])
+                        session.commit()
+                        cm._record_scan_event(session, scan_id, "nmap binary missing. Aborting scan.")  # type: ignore[attr-defined]
+                        return
+                    except Exception as exc:  # pylint: disable=broad-except
+                        cm.logger.exception("Scan %s failed for asset %s: %s", scan_id, asset.target, exc)
+                        status_row.status = "failed"
+                        status_row.last_error = str(exc)
+                        status_row.completed_at = datetime.utcnow()
+                        session.add(status_row)
+                        session.commit()
+                        cm._record_scan_event(session, scan_id, f"Failed {asset.target}: {exc}")  # type: ignore[attr-defined]
+                        if status_row.attempts <= cm.settings.scan_retry_limit:  # type: ignore[attr-defined]
+                            scan.retry_count += 1
+                            session.add(scan)
+                            session.commit()
+                            status_row.status = "pending"
+                            session.add(status_row)
+                            session.commit()
+                            cm._record_scan_event(
+                                session, scan_id, f"Retrying {asset.target} (attempt {status_row.attempts + 1})"
+                            )  # type: ignore[attr-defined]
+                            continue
+                        asset_errors = True
+                        retrying = False
+                        break
 
-        # Finalize only if not cancelled by user
-        scan = session.get(Scan, scan_id)
-        if scan and scan.status != "cancelled":
-            scan.completed_at = datetime.utcnow()
-            if asset_errors:
-                scan.status = "completed_with_errors"
-                scan.notes = "One or more assets failed to scan"
-            else:
-                scan.status = "completed"
-                scan.notes = None
-            session.add(scan)
-            cm._record_scan_event(session, scan_id, f"Scan finished with status {scan.status}")  # type: ignore[attr-defined]
-            session.commit()
+            scan = session.get(Scan, scan_id)
+            if scan and scan.status != "cancelled":
+                scan.completed_at = datetime.utcnow()
+                if asset_errors:
+                    scan.status = "completed_with_errors"
+                    scan.notes = "One or more assets failed to scan"
+                else:
+                    scan.status = "completed"
+                    scan.notes = None
+                session.add(scan)
+                cm._record_scan_event(session, scan_id, f"Scan finished with status {scan.status}")  # type: ignore[attr-defined]
+                session.commit()
+    except Exception as exc:  # pylint: disable=broad-except
+        cm.logger.exception("Scan %s crashed unexpectedly: %s", scan_id, exc)  # type: ignore[attr-defined]
+        with session_factory() as session:
+            scan = session.get(Scan, scan_id)
+            if scan:
+                scan.status = "failed"
+                scan.completed_at = scan.completed_at or datetime.utcnow()
+                scan.notes = scan.notes or f"Scan crashed: {exc}"
+                session.add(scan)
+                try:
+                    cm._record_scan_event(session, scan_id, f"Scan worker error: {exc}")  # type: ignore[attr-defined]
+                except Exception:
+                    session.commit()
 
 
 # Patch the original symbol so existing callers use the override
@@ -574,6 +594,7 @@ def _start_scheduler() -> None:
 def _scan_queue_worker() -> None:
     from clanker.db.session import get_session as session_factory
 
+    queue_logger.info("queue_worker_started", extra={"component": "queue_worker", "event": "started"})
     while True:
         try:
             with session_factory() as session:
@@ -581,13 +602,27 @@ def _scan_queue_worker() -> None:
                     select(Scan).where(Scan.status == "queued").order_by(Scan.created_at).limit(1)
                 ).first()
                 if not scan:
+                    queue_logger.debug("queue_empty", extra={"component": "queue_worker", "event": "idle"})
                     time.sleep(5)
                     continue
                 cm._record_scan_event(session, scan.id, "Dispatching scan from queue")  # type: ignore[attr-defined]
+                queue_logger.info(
+                    "queue_dispatch",
+                    extra={
+                        "component": "queue_worker",
+                        "event": "dispatch",
+                        "scan_id": scan.id,
+                        "profile": scan.profile,
+                    },
+                )
                 session.commit()
                 cm.run_scan_job(scan.id)  # type: ignore[attr-defined]
-        except Exception:
+        except Exception as exc:
             cm.logger.exception("Scan queue worker error")
+            queue_logger.error(
+                "queue_error",
+                extra={"component": "queue_worker", "event": "error", "error": str(exc)},
+            )
             time.sleep(5)
 
 

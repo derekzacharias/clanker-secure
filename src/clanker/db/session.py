@@ -4,6 +4,7 @@ from sqlmodel import Session, SQLModel, create_engine
 
 from clanker.config import settings
 from clanker.db.migrations import apply_migrations
+from clanker.db import models  # noqa: F401  # ensure models are registered with metadata
 
 engine = create_engine(settings.database_url, echo=False, connect_args={"check_same_thread": False})
 

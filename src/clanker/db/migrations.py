@@ -43,6 +43,7 @@ def ensure_finding_enrichment_table(engine: Engine) -> None:
         "id INTEGER PRIMARY KEY AUTOINCREMENT,"
         "finding_id INTEGER NOT NULL UNIQUE,"
         "cpe TEXT,"
+        "cpe_confidence TEXT,"
         "cvss_v31_base REAL,"
         "cvss_vector TEXT,"
         "references_json TEXT,"
@@ -60,6 +61,14 @@ def apply_migrations(engine: Engine) -> None:
     add_column_if_missing(engine, "asset", "environment", "TEXT")
     add_column_if_missing(engine, "asset", "owner", "TEXT")
     add_column_if_missing(engine, "asset", "notes", "TEXT")
+    add_column_if_missing(engine, "asset", "credentialed", "INTEGER DEFAULT 0")
+    add_column_if_missing(engine, "asset", "ssh_username", "TEXT")
+    add_column_if_missing(engine, "asset", "ssh_port", "INTEGER")
+    add_column_if_missing(engine, "asset", "ssh_auth_method", "TEXT")
+    add_column_if_missing(engine, "asset", "ssh_key_path", "TEXT")
+    add_column_if_missing(engine, "asset", "ssh_allow_agent", "INTEGER DEFAULT 0")
+    add_column_if_missing(engine, "asset", "ssh_look_for_keys", "INTEGER DEFAULT 0")
+    add_column_if_missing(engine, "asset", "ssh_password", "TEXT")
     add_column_if_missing(engine, "scan", "retry_count", "INTEGER DEFAULT 0")
     add_column_if_missing(engine, "finding", "owner", "TEXT")
     add_column_if_missing(engine, "finding", "notes", "TEXT")
@@ -69,6 +78,33 @@ def apply_migrations(engine: Engine) -> None:
     add_column_if_missing(engine, "finding", "host_vendor", "TEXT")
     add_column_if_missing(engine, "finding", "traceroute_summary", "TEXT")
     add_column_if_missing(engine, "finding", "host_report", "TEXT")
+    add_column_if_missing(engine, "finding", "fingerprint", "TEXT")
+    add_column_if_missing(engine, "finding", "evidence", "TEXT")
+    add_column_if_missing(engine, "finding", "evidence_summary", "TEXT")
+    add_column_if_missing(engine, "finding", "assigned_user_id", "INTEGER")
+    add_column_if_missing(engine, "finding", "sla_due_at", "TEXT")
+    add_column_if_missing(engine, "finding", "closed_at", "TEXT")
+    add_column_if_missing(engine, "agentingest", "interface_count", "INTEGER DEFAULT 0")
+    add_column_if_missing(engine, "agentingest", "config_count", "INTEGER DEFAULT 0")
+    if not _table_exists(engine, "schedule"):
+        ddl = (
+            "CREATE TABLE schedule ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "created_at TEXT NOT NULL DEFAULT (datetime('now')),"
+            "name TEXT NOT NULL,"
+            "profile TEXT NOT NULL,"
+            "asset_ids_json TEXT NOT NULL DEFAULT '[]',"
+            "days_of_week_json TEXT NOT NULL DEFAULT '[]',"
+            "times_json TEXT NOT NULL DEFAULT '[]',"
+            "active INTEGER NOT NULL DEFAULT 1,"
+            "last_run_at TEXT"
+            ")"
+        )
+        with engine.connect() as connection:
+            connection.execute(text(ddl))
+            connection.commit()
+    add_column_if_missing(engine, "finding_enrichment", "kev", "INTEGER DEFAULT 0")
+    add_column_if_missing(engine, "finding_enrichment", "epss", "REAL")
     with engine.connect() as connection:
         connection.execute(
             text(
@@ -76,6 +112,7 @@ def apply_migrations(engine: Engine) -> None:
                 "  id INTEGER PRIMARY KEY AUTOINCREMENT,\n"
                 "  finding_id INTEGER NOT NULL UNIQUE,\n"
                 "  cpe TEXT,\n"
+                "  cpe_confidence TEXT,\n"
                 "  cvss_v31_base REAL,\n"
                 "  cvss_vector TEXT,\n"
                 "  references_json TEXT,\n"
@@ -86,3 +123,19 @@ def apply_migrations(engine: Engine) -> None:
         )
         connection.commit()
     ensure_finding_enrichment_table(engine)
+    add_column_if_missing(engine, "finding_enrichment", "cpe_confidence", "TEXT")
+    if not _table_exists(engine, "finding_comment"):
+        ddl = (
+            "CREATE TABLE finding_comment ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "finding_id INTEGER NOT NULL,"
+            "user_id INTEGER NOT NULL,"
+            "message TEXT NOT NULL,"
+            "created_at TEXT NOT NULL DEFAULT (datetime('now')),"
+            "FOREIGN KEY(finding_id) REFERENCES finding(id),"
+            "FOREIGN KEY(user_id) REFERENCES user(id)"
+            ")"
+        )
+        with engine.connect() as connection:
+            connection.execute(text(ddl))
+            connection.commit()

@@ -16,8 +16,7 @@ class User(SQLModel, table=True):
     role: str = Field(default="admin", max_length=32)  # admin | operator | viewer
     active: bool = Field(default=True)
 
-    class Config:
-        table_args = {"extend_existing": True}
+    __table_args__ = {"extend_existing": True}
 
 
 class SessionToken(SQLModel, table=True):
@@ -30,8 +29,7 @@ class SessionToken(SQLModel, table=True):
     expires_at: datetime
     revoked: bool = Field(default=False)
 
-    class Config:
-        table_args = {"extend_existing": True}
+    __table_args__ = {"extend_existing": True}
 
 
 class UserRead(SQLModel):
@@ -50,8 +48,7 @@ class LoginAttempt(SQLModel, table=True):
     ip: Optional[str] = Field(default=None, max_length=48)
     success: bool = Field(default=False)
 
-    class Config:
-        table_args = {"extend_existing": True}
+    __table_args__ = {"extend_existing": True}
 
 
 class AuditLog(SQLModel, table=True):
@@ -63,8 +60,7 @@ class AuditLog(SQLModel, table=True):
     ip: Optional[str] = Field(default=None, max_length=48)
     detail: Optional[str] = Field(default=None)
 
-    class Config:
-        table_args = {"extend_existing": True}
+    __table_args__ = {"extend_existing": True}
 
 
 class InviteToken(SQLModel, table=True):
@@ -78,8 +74,7 @@ class InviteToken(SQLModel, table=True):
     used_at: Optional[datetime] = None
     created_by_user_id: Optional[int] = Field(default=None, foreign_key="user.id")
 
-    class Config:
-        table_args = {"extend_existing": True}
+    __table_args__ = {"extend_existing": True}
 
 
 __all__ = [

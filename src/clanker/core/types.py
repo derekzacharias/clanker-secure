@@ -1,5 +1,5 @@
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional
 
 
 @dataclass
@@ -16,3 +16,6 @@ class ServiceObservation:
     service_name: Optional[str]
     service_version: Optional[str]
     product: Optional[str]
+    fingerprint: Optional[Dict[str, object]] = field(default=None)
+    evidence: Optional[List[Dict[str, object]]] = field(default=None)
+    evidence_summary: Optional[str] = field(default=None)

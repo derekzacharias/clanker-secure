@@ -13,6 +13,7 @@ def _ensure_enrichment_table() -> None:
         "  id INTEGER PRIMARY KEY AUTOINCREMENT,\n"
         "  finding_id INTEGER NOT NULL UNIQUE,\n"
         "  cpe TEXT,\n"
+        "  cpe_confidence TEXT,\n"
         "  cvss_v31_base REAL,\n"
         "  cvss_vector TEXT,\n"
         "  references_json TEXT,\n"

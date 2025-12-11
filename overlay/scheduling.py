@@ -114,9 +114,14 @@ async def _scheduler_loop() -> None:
                     sch.last_run_at = now
                     session.add(sch)
                     session.commit()
+        except asyncio.CancelledError:
+            break
         except Exception:
             pass
-        await asyncio.sleep(60)
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            break
 
 
 @app.on_event("startup")

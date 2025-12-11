@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from typing import Dict, List
 
 from clanker.config import settings
+from clanker.core.fingerprint import enrich_with_fingerprints
 from clanker.core.types import ServiceObservation
 from clanker.db.models import Asset
 
@@ -179,8 +180,9 @@ def parse_nmap_xml(xml_file: Path, asset: Asset) -> List[ServiceObservation]:
         if not port_entries:
             continue
         host_report = _render_host_report(host_meta, port_entries)
+        host_observations: List[ServiceObservation] = []
         for entry in port_entries:
-            observations.append(
+            host_observations.append(
                 ServiceObservation(
                     asset_id=asset.id or 0,
                     host_address=host_meta["address"],
@@ -196,6 +198,9 @@ def parse_nmap_xml(xml_file: Path, asset: Asset) -> List[ServiceObservation]:
                     product=entry["product"],
                 )
             )
+        observations.extend(
+            enrich_with_fingerprints(host_observations, host=host_meta["address"] or asset.target)
+        )
     return observations
 def _safe_float(value: str | None) -> float | None:
     if value is None:

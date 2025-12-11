@@ -176,11 +176,21 @@ def _seed_admin_if_configured(session: Session) -> None:
     password = os.getenv("CLANKER_ADMIN_PASSWORD")
     if not email or not password:
         return
+    hashed = hash_password(password)
     existing = session.exec(select(User).where(User.email == email)).first()
     if existing:
-        return
-    user = User(email=email, name="Administrator", hashed_password=hash_password(password), role="admin", active=True)
-    session.add(user)
+        existing.hashed_password = hashed
+        existing.role = "admin"
+        existing.active = True
+        if not existing.name:
+            existing.name = "Administrator"
+        session.add(existing)
+    else:
+        user = User(email=email, name="Administrator", hashed_password=hashed, role="admin", active=True)
+        session.add(user)
+    # Clear lockouts for the seeded admin account
+    for attempt in session.exec(select(LoginAttempt).where(LoginAttempt.email == email)).all():
+        session.delete(attempt)
 
 
 from clanker.db.session import get_session
@@ -253,6 +263,10 @@ def update_user(user_id: int, payload: UserUpdate, _: object = Depends(require_r
     user = session.get(User, user_id)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
+    if payload.role is not None and user.role == "admin" and payload.role != "admin":
+        raise HTTPException(status_code=400, detail="Cannot change role for administrator accounts")
+    if payload.active is not None and user.role == "admin" and payload.active is False:
+        raise HTTPException(status_code=400, detail="Cannot disable administrator accounts")
     if payload.name is not None:
         user.name = payload.name
     if payload.role is not None:

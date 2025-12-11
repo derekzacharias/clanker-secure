@@ -15,5 +15,16 @@
   "postfix": "cpe:2.3:a:postfix:postfix:{version}:*:*:*:*:*:*:*",
   "dovecot": "cpe:2.3:a:dovecot:dovecot:{version}:*:*:*:*:*:*:*",
   "cisco": "cpe:2.3:o:cisco:{product}:{version}:*:*:*:*:*:*:*",
-  "juniper": "cpe:2.3:o:juniper:{product}:{version}:*:*:*:*:*:*:*"
+  "juniper": "cpe:2.3:o:juniper:{product}:{version}:*:*:*:*:*:*:*",
+  "lighttpd": "cpe:2.3:a:lighttpd:lighttpd:{version}:*:*:*:*:*:*:*",
+  "openvpn": "cpe:2.3:a:openvpn:openvpn:{version}:*:*:*:*:*:*:*",
+  "haproxy": "cpe:2.3:a:haproxy:haproxy:{version}:*:*:*:*:*:*:*",
+  "tomcat": "cpe:2.3:a:apache:tomcat:{version}:*:*:*:*:*:*:*",
+  "jetty": "cpe:2.3:a:eclipse:jetty:{version}:*:*:*:*:*:*:*",
+  "elasticsearch": "cpe:2.3:a:elastic:elasticsearch:{version}:*:*:*:*:*:*:*",
+  "kibana": "cpe:2.3:a:elastic:kibana:{version}:*:*:*:*:*:*:*",
+  "grafana": "cpe:2.3:a:grafana:grafana:{version}:*:*:*:*:*:*:*",
+  "jenkins": "cpe:2.3:a:jenkins:jenkins:{version}:*:*:*:*:*:*:*",
+  "gitlab": "cpe:2.3:a:gitlab:gitlab:{version}:*:*:*:*:*:*:*",
+  "minio": "cpe:2.3:a:minio:minio:{version}:*:*:*:*:*:*:*"
 }
