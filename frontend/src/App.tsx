@@ -1402,7 +1402,6 @@ const handleLogout = async (): Promise<void> => {
                   <Button fullWidth variant="light" onClick={() => setColorScheme(colorScheme === 'light' ? 'dark' : 'light')}>
                     Switch to {colorScheme === 'light' ? 'dark' : 'light'} mode
                   </Button>
-                  <Button fullWidth variant="subtle" component="a" href="/legacy" target="_blank">Legacy UI</Button>
                   <Divider />
                   <Button fullWidth variant="light" color="red" leftSection={<IconLogout size={16} />} onClick={handleLogout}>Logout</Button>
                 </>
