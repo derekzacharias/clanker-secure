@@ -10,7 +10,6 @@ import {
   Switch,
   Paper,
   Progress,
-  RingProgress,
   ScrollArea,
   SegmentedControl,
   Select,
@@ -27,6 +26,7 @@ import {
   ActionIcon,
   useMantineColorScheme,
   Drawer,
+  rem,
 } from '@mantine/core';
 import { notifications } from '@mantine/notifications';
 import { Modal, PasswordInput } from '@mantine/core';
@@ -42,8 +42,7 @@ import {
   IconShieldCheck,
   IconSparkles,
   IconTarget,
-  IconSun,
-  IconMoon,
+  IconPlugConnected,
 } from '@tabler/icons-react';
 import { IconLogout, IconUser } from '@tabler/icons-react';
 import axios from 'axios';
@@ -57,6 +56,14 @@ interface Asset {
   environment?: string | null;
   owner?: string | null;
   notes?: string | null;
+  credentialed?: boolean;
+  ssh_username?: string | null;
+  ssh_port?: number | null;
+  ssh_auth_method?: string | null;
+  ssh_key_path?: string | null;
+  ssh_allow_agent?: boolean;
+  ssh_look_for_keys?: boolean;
+  ssh_password?: string | null;
   created_at: string;
 }
 
@@ -110,6 +117,15 @@ interface FindingEnrichment {
   source?: string | null;
 }
 
+interface Integration {
+  id: number;
+  name: string;
+  status: 'connected' | 'pending' | 'error' | 'disabled';
+  lastSync?: string | null;
+  mode?: string | null;
+  notes?: string | null;
+}
+
 const SCAN_PROFILES = [
   { key: 'quick', label: 'Quick Scan' },
   { key: 'quick_plus', label: 'Quick Scan Plus' },
@@ -146,6 +162,19 @@ const SEVERITY_COLORS: Record<string, string> = {
   high: 'orange',
   critical: 'red',
 };
+
+const INTEGRATION_STATUS_COLORS: Record<Integration['status'], string> = {
+  connected: 'teal',
+  pending: 'yellow',
+  error: 'red',
+  disabled: 'gray',
+};
+
+const TABLE_HEIGHT = 420;
+const TABLE_HEIGHT_MOBILE = 320;
+const SUMMARY_CARD_HEIGHT = 200;
+const SUMMARY_CARD_HEIGHT_MOBILE = 180;
+const SUMMARY_CARD_BODY_HEIGHT = 120;
 
 const api = axios.create({ baseURL: API_BASE, timeout: 15000 });
 
@@ -250,8 +279,23 @@ function App() {
   const path = typeof window !== 'undefined' ? window.location.pathname.toLowerCase() : '';
   const isLoginPage = path.endsWith('/app/login') || path.endsWith('/login');
   const isLogoutPage = path.endsWith('/app/logout') || path.endsWith('/logout');
+  const [isMobile, setIsMobile] = useState<boolean>(false);
 
-  const [assetForm, setAssetForm] = useState({ name: '', target: '', environment: '', owner: '', notes: '' });
+  const [assetForm, setAssetForm] = useState({
+    name: '',
+    target: '',
+    environment: '',
+    owner: '',
+    notes: '',
+    credentialed: false,
+    ssh_username: '',
+    ssh_port: '22',
+    ssh_auth_method: 'password',
+    ssh_key_path: '',
+    ssh_allow_agent: false,
+    ssh_look_for_keys: false,
+    ssh_password: '',
+  });
   const [editingAssetId, setEditingAssetId] = useState<number | null>(null);
   const [scanForm, setScanForm] = useState({ profile: 'intense' });
   const [selectedAssetIds, setSelectedAssetIds] = useState<string[]>([]);
@@ -263,7 +307,7 @@ function App() {
   const [assetsOffset, setAssetsOffset] = useState(0);
   const [scansOffset, setScansOffset] = useState(0);
   const [findingsOffset, setFindingsOffset] = useState(0);
-  const [activeTab, setActiveTab] = useState<'assets' | 'scans' | 'findings' | 'schedules'>('assets');
+  const [activeTab, setActiveTab] = useState<'assets' | 'scans' | 'findings' | 'schedules' | 'integrations' | 'reports'>('assets');
   const [loginOpen, setLoginOpen] = useState<boolean>(false);
   const [loginEmail, setLoginEmail] = useState<string>('');
   const [loginPassword, setLoginPassword] = useState<string>('');
@@ -331,6 +375,13 @@ function App() {
   }, []);
 
   useEffect(() => {
+    const update = () => setIsMobile(typeof window !== 'undefined' && window.innerWidth < 768);
+    update();
+    window.addEventListener('resize', update);
+    return () => window.removeEventListener('resize', update);
+  }, []);
+
+  useEffect(() => {
     // Attempt to populate current user if tokens exist; otherwise show login modal (unless on login/logout pages)
     const token = localStorage.getItem('clanker_access_token');
     if (!token) {
@@ -386,7 +437,21 @@ useEffect(() => {
 }, [findingFilter, findingSearch]);
 
 const resetAssetForm = () => {
-  setAssetForm({ name: '', target: '', environment: '', owner: '', notes: '' });
+  setAssetForm({
+    name: '',
+    target: '',
+    environment: '',
+    owner: '',
+    notes: '',
+    credentialed: false,
+    ssh_username: '',
+    ssh_port: '22',
+    ssh_auth_method: 'password',
+    ssh_key_path: '',
+    ssh_allow_agent: false,
+    ssh_look_for_keys: false,
+    ssh_password: '',
+  });
   setEditingAssetId(null);
 };
 
@@ -527,12 +592,33 @@ const handleLogout = async (): Promise<void> => {
   // returned later to preserve consistent hook order across renders.
   const handleAssetSubmit = async () => {
     try {
+      if (assetForm.credentialed) {
+        if (!assetForm.ssh_username.trim()) {
+          notifications.show({ color: 'yellow', title: 'Username required', message: 'Provide an SSH username' });
+          return;
+        }
+        const hasPassword = assetForm.ssh_auth_method === 'password' && assetForm.ssh_password.trim().length > 0;
+        const hasKey = assetForm.ssh_auth_method === 'key' && assetForm.ssh_key_path.trim().length > 0;
+        const hasAgent = assetForm.ssh_auth_method === 'agent' && (assetForm.ssh_allow_agent || assetForm.ssh_look_for_keys);
+        if (!hasPassword && !hasKey && !hasAgent) {
+          notifications.show({ color: 'yellow', title: 'Credential missing', message: 'Add a password, key path, or enable agent/key discovery' });
+          return;
+        }
+      }
       const payload = {
         name: assetForm.name || null,
         target: assetForm.target,
         environment: assetForm.environment || null,
         owner: assetForm.owner || null,
         notes: assetForm.notes || null,
+        credentialed: assetForm.credentialed,
+        ssh_username: assetForm.credentialed ? assetForm.ssh_username || null : null,
+        ssh_port: assetForm.credentialed ? parseInt(assetForm.ssh_port, 10) || 22 : null,
+        ssh_auth_method: assetForm.credentialed ? assetForm.ssh_auth_method : null,
+        ssh_key_path: assetForm.credentialed ? assetForm.ssh_key_path || null : null,
+        ssh_allow_agent: assetForm.credentialed ? assetForm.ssh_allow_agent : false,
+        ssh_look_for_keys: assetForm.credentialed ? assetForm.ssh_look_for_keys : false,
+        ssh_password: assetForm.credentialed ? assetForm.ssh_password || null : null,
       };
       if (editingAssetId != null) {
         await api.patch(`/assets/${editingAssetId}`, payload);
@@ -556,7 +642,24 @@ const handleLogout = async (): Promise<void> => {
       environment: asset.environment ?? '',
       owner: asset.owner ?? '',
       notes: asset.notes ?? '',
+      credentialed: Boolean(asset.credentialed),
+      ssh_username: asset.ssh_username ?? '',
+      ssh_port: asset.ssh_port ? String(asset.ssh_port) : '22',
+      ssh_auth_method: asset.ssh_auth_method ?? 'password',
+      ssh_key_path: asset.ssh_key_path ?? '',
+      ssh_allow_agent: Boolean(asset.ssh_allow_agent),
+      ssh_look_for_keys: Boolean(asset.ssh_look_for_keys),
+      ssh_password: asset.ssh_password ?? '',
     });
+  };
+
+  const runCredentialedScan = async (asset: Asset) => {
+    try {
+      await api.post(`/assets/${asset.id}/ssh_scan`);
+      notifications.show({ color: 'green', title: 'Credentialed scan queued', message: asset.target });
+    } catch (error) {
+      notifications.show({ color: 'red', title: 'SSH scan failed', message: `${error}` });
+    }
   };
 
   const handleScanSubmit = async () => {
@@ -665,12 +768,53 @@ const handleLogout = async (): Promise<void> => {
 
   const openFindings = useMemo(() => findings.filter((finding) => finding.status.toLowerCase() === 'open').length, [findings]);
   const activeScans = (scanStatusSummary.running ?? 0) + (scanStatusSummary.queued ?? 0);
+  const integrations = useMemo<Integration[]>(() => [
+    {
+      id: 1,
+      name: 'CVE Enrichment (NVD mirror)',
+      status: 'connected',
+      mode: 'Enrichment',
+      lastSync: '5 minutes ago',
+      notes: 'Pulls CVSS, CWE, and references for new findings.',
+    },
+    {
+      id: 2,
+      name: 'Jira Cloud',
+      status: 'pending',
+      mode: 'Ticketing',
+      lastSync: null,
+      notes: 'Waiting for project + API token.',
+    },
+    {
+      id: 3,
+      name: 'Slack Webhook',
+      status: 'error',
+      mode: 'Notifications',
+      lastSync: '2 hours ago',
+      notes: 'Recent delivery failed signature verification.',
+    },
+    {
+      id: 4,
+      name: 'ServiceNow',
+      status: 'disabled',
+      mode: 'Ticketing',
+      lastSync: null,
+      notes: 'Enable when change management sign-off is ready.',
+    },
+  ], []);
 
   const severityRingData = Object.entries(severitySummary).map(([severity, count]) => ({
     value: count,
     color: SEVERITY_COLORS[severity] || 'gray',
     tooltip: `${severity.toUpperCase()}: ${count}`,
   }));
+  const totalSeverityCount = Object.values(severitySummary).reduce((acc, val) => acc + val, 0);
+  const severityProgressSections = severityRingData.length
+    ? severityRingData.map(({ value, color }) => ({
+        value: totalSeverityCount > 0 ? (value / totalSeverityCount) * 100 : 0,
+        color,
+      }))
+    : [{ value: 100, color: '#334155' }];
 
   const assetLookup = useMemo(() => {
     const map = new Map<number, Asset>();
@@ -1172,41 +1316,65 @@ const handleLogout = async (): Promise<void> => {
   return (
     <AppShell padding="lg" header={{ height: 70 }} styles={{ main: { background: 'transparent' } }}>
       <AppShell.Header style={{ background: 'rgba(5,8,15,0.7)', borderBottom: '1px solid rgba(255,255,255,0.08)' }}>
-        <Group justify="space-between" px="lg" py="sm">
-          <Group gap="md" align="center" wrap="nowrap">
-            <Burger opened={menuOpen} onClick={() => setMenuOpen((v) => !v)} size="sm" aria-label="Open menu" />
-            <ThemeIcon
-              size={48}
-              radius="xl"
-              variant="gradient"
-              gradient={{ from: 'red', to: 'grape' }}
-              style={{ boxShadow: '0 15px 30px rgba(239,68,68,0.45)' }}
-            >
-              <IconRobot size={24} />
-            </ThemeIcon>
-            <div>
-              <Text
-                component="h1"
-                fw={700}
-                size="xl"
-                style={{
-                  background: 'linear-gradient(120deg, #60a5fa, #a78bfa)',
-                  WebkitBackgroundClip: 'text',
-                  color: 'transparent',
-                  margin: 0,
-                }}
+        <Stack gap="sm" px="lg" py="sm">
+          <Group gap="md" align="center" justify="flex-start" wrap="wrap">
+            <Group gap="md" align="center" wrap="wrap">
+              <Burger opened={menuOpen} onClick={() => setMenuOpen((v) => !v)} size="sm" aria-label="Open menu" />
+              <ThemeIcon
+                size={48}
+                radius="xl"
+                variant="gradient"
+                gradient={{ from: 'red', to: 'grape' }}
+                style={{ boxShadow: '0 15px 30px rgba(239,68,68,0.45)' }}
               >
-                Clanker Command Console
-              </Text>
-              <Text
-                size="md"
-                fw={600}
-                c={colorScheme === 'light' ? '#0b1220' : '#e5e7eb'}
-                style={{ letterSpacing: 0.2, textShadow: colorScheme === 'light' ? 'none' : '0 1px 2px rgba(0,0,0,0.45)' }}
-              >
-                Network awareness & vulnerability visibility
-              </Text>
-            </div>
+                <IconRobot size={24} />
+              </ThemeIcon>
+              <div>
+                <Text
+                  component="h1"
+                  fw={700}
+                  size="xl"
+                  style={{
+                    background: 'linear-gradient(120deg, #60a5fa, #a78bfa)',
+                    WebkitBackgroundClip: 'text',
+                    color: 'transparent',
+                    margin: 0,
+                  }}
+                >
+                  Clanker Command Console
+                </Text>
+                <Text
+                  size="md"
+                  fw={600}
+                  c={colorScheme === 'light' ? '#0b1220' : '#e5e7eb'}
+                  style={{ letterSpacing: 0.2, textShadow: colorScheme === 'light' ? 'none' : '0 1px 2px rgba(0,0,0,0.45)' }}
+                >
+                  Network awareness & vulnerability visibility
+                </Text>
+              </div>
+            </Group>
+            <Group gap="sm" align="center" style={{ marginLeft: 'auto' }}>
+              <Group gap="sm" align="center">
+                <Badge
+                  color={autoRefresh ? 'green' : 'gray'}
+                  variant="light"
+                  radius="xl"
+                  leftSection={<IconClockHour4 size={14} />}
+                  onClick={() => setAutoRefresh((prev) => !prev)}
+                  style={{ cursor: 'pointer' }}
+                >
+                  Auto refresh: {autoRefresh ? 'ON' : 'OFF'}
+                </Badge>
+                <Badge color={activeScans > 0 ? 'indigo' : 'gray'} variant="filled">
+                  Active scans: {activeScans}
+                </Badge>
+              </Group>
+              <Tooltip label="Refresh data now">
+                <Button rightSection={<IconRefresh size={16} />} variant="gradient" gradient={{ from: 'indigo', to: 'cyan' }} onClick={refreshAll} loading={loading}>
+                  Refresh
+                </Button>
+              </Tooltip>
+            </Group>
           </Group>
           <Drawer opened={menuOpen} onClose={() => setMenuOpen(false)} position="left" size="xs" title="Menu">
             <Stack>
@@ -1220,66 +1388,47 @@ const handleLogout = async (): Promise<void> => {
                     </div>
                   </Group>
                   <Divider />
-            <Button variant="light" onClick={() => { setActiveTab('assets'); setMenuOpen(false); }}>Assets</Button>
-            <Button variant="light" onClick={() => { setActiveTab('scans'); setMenuOpen(false); }}>Scans</Button>
-            <Button variant="light" onClick={() => { setActiveTab('findings'); setMenuOpen(false); }}>Findings</Button>
-            <Button variant="light" onClick={() => { setProfileName(currentUser?.name || ''); setProfileOpen(true); }}>My Profile</Button>
-            <Button variant="light" onClick={() => setChangePwOpen(true)}>Change Password</Button>
+            <Button fullWidth variant="light" onClick={() => { setActiveTab('assets'); setMenuOpen(false); }}>Assets</Button>
+            <Button fullWidth variant="light" onClick={() => { setActiveTab('scans'); setMenuOpen(false); }}>Scans</Button>
+            <Button fullWidth variant="light" onClick={() => { setActiveTab('findings'); setMenuOpen(false); }}>Findings</Button>
+            <Button fullWidth variant="light" onClick={() => { setProfileName(currentUser?.name || ''); setProfileOpen(true); }}>My Profile</Button>
+            <Button fullWidth variant="light" onClick={() => setChangePwOpen(true)}>Change Password</Button>
             {currentUser.role === 'admin' && (
-              <Group>
-                <Button variant="light" onClick={() => setUsersOpen(true)}>Users</Button>
-                <Button variant="light" onClick={async () => { try { setAuditOpen(true); const r = await api.get('/audit_logs'); setAuditRows(r.data); } catch (e) { notifications.show({ color: 'red', title: 'Failed to load audit logs', message: `${e}` }); } }}>Audit Logs</Button>
-              </Group>
+              <>
+                <Button fullWidth variant="light" onClick={() => setUsersOpen(true)}>Users</Button>
+                <Button fullWidth variant="light" onClick={async () => { try { setAuditOpen(true); const r = await api.get('/audit_logs'); setAuditRows(r.data); } catch (e) { notifications.show({ color: 'red', title: 'Failed to load audit logs', message: `${e}` }); } }}>Audit Logs</Button>
+              </>
             )}
-                  <Button variant="light" onClick={() => setColorScheme(colorScheme === 'light' ? 'dark' : 'light')}>
+                  <Button fullWidth variant="light" onClick={() => setColorScheme(colorScheme === 'light' ? 'dark' : 'light')}>
                     Switch to {colorScheme === 'light' ? 'dark' : 'light'} mode
                   </Button>
-                  <Button variant="subtle" component="a" href="/legacy" target="_blank">Legacy UI</Button>
+                  <Button fullWidth variant="subtle" component="a" href="/legacy" target="_blank">Legacy UI</Button>
                   <Divider />
-                  <Button variant="light" color="red" leftSection={<IconLogout size={16} />} onClick={handleLogout}>Logout</Button>
+                  <Button fullWidth variant="light" color="red" leftSection={<IconLogout size={16} />} onClick={handleLogout}>Logout</Button>
                 </>
               ) : (
                 <>
                   <Text c="dimmed">Not signed in</Text>
                   <Group gap="xs">
-                    <Button onClick={() => setLoginOpen(true)}>Login</Button>
-                    <Button variant="subtle" component="a" href="/app/login">Login page</Button>
+                    <Button fullWidth onClick={() => setLoginOpen(true)}>Login</Button>
+                    <Button fullWidth variant="subtle" component="a" href="/app/login">Login page</Button>
                   </Group>
                 </>
               )}
             </Stack>
           </Drawer>
-          <Group gap="sm">
-            <ActionIcon
-              variant="subtle"
-              size="lg"
-              aria-label="Toggle color scheme"
-              onClick={() => setColorScheme(colorScheme === 'light' ? 'dark' : 'light')}
-              title={colorScheme === 'light' ? 'Switch to dark mode' : 'Switch to light mode'}
-            >
-              {colorScheme === 'light' ? <IconMoon size={18} /> : <IconSun size={18} />}
-            </ActionIcon>
-            <Badge color={activeScans > 0 ? 'indigo' : 'gray'} variant="filled">
-              Active scans: {activeScans}
-            </Badge>
-            <Badge
-              color={autoRefresh ? 'green' : 'gray'}
-              variant="light"
-              radius="xl"
-              leftSection={<IconClockHour4 size={14} />}
-              onClick={() => setAutoRefresh((prev) => !prev)}
-              style={{ cursor: 'pointer' }}
-            >
-              Auto refresh: {autoRefresh ? 'ON' : 'OFF'}
-            </Badge>
-            {/* Legacy UI removed in runtime; hide button */}
-            <Tooltip label="Refresh data now">
-              <Button leftSection={<IconRefresh size={16} />} variant="gradient" gradient={{ from: 'indigo', to: 'cyan' }} onClick={refreshAll} loading={loading}>
-                Refresh
-              </Button>
-            </Tooltip>
+          <Group gap="sm" justify="space-between" wrap="wrap">
+            <Group gap="sm" wrap="wrap">
+              <ActionIcon
+                variant="subtle"
+                size="lg"
+                aria-label="Toggle color scheme"
+                onClick={() => setColorScheme(colorScheme === 'light' ? 'dark' : 'light')}
+                title={colorScheme === 'light' ? 'Switch to dark mode' : 'Switch to light mode'}
+              />
+            </Group>
           </Group>
-        </Group>
+        </Stack>
       </AppShell.Header>
       <Modal opened={loginOpen} onClose={() => setLoginOpen(false)} title="Sign in" centered>
         <Stack>
@@ -1288,7 +1437,7 @@ const handleLogout = async (): Promise<void> => {
           <Button onClick={handleLogin} leftSection={<IconSend size={14} />}>Login</Button>
         </Stack>
       </Modal>
-      <Modal opened={usersOpen} onClose={() => setUsersOpen(false)} title="Users" size="lg" centered>
+      <Modal opened={usersOpen} onClose={() => setUsersOpen(false)} title="Users" size="lg" fullScreen={isMobile} centered>
         <Stack>
           <Group grow>
             <TextInput label="Email" value={newUser.email} onChange={(e) => setNewUser((p) => ({ ...p, email: e.currentTarget.value }))} />
@@ -1352,7 +1501,7 @@ const handleLogout = async (): Promise<void> => {
           </Group>
         </Stack>
       </Modal>
-      <Modal opened={profileOpen} onClose={() => setProfileOpen(false)} title="My Profile" centered>
+      <Modal opened={profileOpen} onClose={() => setProfileOpen(false)} title="My Profile" fullScreen={isMobile} centered>
         <Stack>
           <TextInput label="Name" value={profileName} onChange={(e) => setProfileName(e.currentTarget.value)} />
           <Group justify="flex-end">
@@ -1360,7 +1509,7 @@ const handleLogout = async (): Promise<void> => {
           </Group>
         </Stack>
       </Modal>
-      <Modal opened={changePwOpen} onClose={() => setChangePwOpen(false)} title="Change Password" centered>
+      <Modal opened={changePwOpen} onClose={() => setChangePwOpen(false)} title="Change Password" fullScreen={isMobile} centered>
         <Stack>
           <PasswordInput label="Current password" value={oldPw} onChange={(e) => setOldPw(e.currentTarget.value)} />
           <PasswordInput label="New password" value={newPw} onChange={(e) => setNewPw(e.currentTarget.value)} description="Min 10 chars with upper, lower, number, and symbol" />
@@ -1369,7 +1518,7 @@ const handleLogout = async (): Promise<void> => {
           </Group>
         </Stack>
       </Modal>
-      <Modal opened={auditOpen} onClose={() => setAuditOpen(false)} title="Audit Logs" size="lg" centered>
+      <Modal opened={auditOpen} onClose={() => setAuditOpen(false)} title="Audit Logs" size="lg" fullScreen={isMobile} centered>
         <Stack>
           <Group grow>
             <TextInput label="User ID" value={auditFilter.user_id || ''} onChange={(e) => setAuditFilter((p) => ({ ...p, user_id: e.currentTarget.value }))} />
@@ -1412,7 +1561,7 @@ const handleLogout = async (): Promise<void> => {
           </ScrollArea>
         </Stack>
       </Modal>
-      <Modal opened={scheduleModalOpen} onClose={() => { setScheduleModalOpen(false); resetScheduleForm(); }} title={editingScheduleId ? 'Edit schedule' : 'New schedule'} size="lg" centered>
+      <Modal opened={scheduleModalOpen} onClose={() => { setScheduleModalOpen(false); resetScheduleForm(); }} title={editingScheduleId ? 'Edit schedule' : 'New schedule'} size="lg" fullScreen={isMobile} centered>
         <Stack>
           <TextInput label="Name" value={scheduleForm.name} onChange={(e) => setScheduleForm((p) => ({ ...p, name: e.currentTarget.value }))} />
           <Group grow>
@@ -1458,8 +1607,8 @@ const handleLogout = async (): Promise<void> => {
         </Stack>
       </Modal>
       <AppShell.Main>
-        <Stack gap="xl">
-          <SimpleGrid cols={{ base: 1, sm: 2, lg: 4 }}>
+        <Stack gap="lg">
+          <SimpleGrid cols={{ base: 1, sm: 2, md: 3, lg: 4 }} spacing={{ base: 'sm', sm: 'md', lg: 'lg' }}>
             {(() => {
               const isLight = colorScheme === 'light';
               const tiles = [
@@ -1508,7 +1657,13 @@ const handleLogout = async (): Promise<void> => {
                 <Card
                   key={card.label}
                   padding="lg"
-                  style={isLight ? (surfaces.tile as React.CSSProperties) : gradientCard(card.gradientDark)}
+                  style={{
+                    ...(isLight ? (surfaces.tile as React.CSSProperties) : gradientCard(card.gradientDark)),
+                    height: isMobile ? SUMMARY_CARD_HEIGHT_MOBILE : SUMMARY_CARD_HEIGHT,
+                    display: 'flex',
+                    flexDirection: 'column',
+                    justifyContent: 'space-between',
+                  }}
                   radius="md"
                   shadow="xl"
                 >
@@ -1539,7 +1694,10 @@ const handleLogout = async (): Promise<void> => {
               <Card
                 padding="lg"
                 radius="md"
-                style={colorScheme === 'light' ? (surfaces.tile as React.CSSProperties) : glassStyles}
+                style={{
+                  ...(colorScheme === 'light' ? (surfaces.tile as React.CSSProperties) : glassStyles),
+                  height: isMobile ? SUMMARY_CARD_HEIGHT_MOBILE : SUMMARY_CARD_HEIGHT,
+                }}
                 shadow="xl"
               >
                 <Group justify="space-between" mb="md">
@@ -1558,36 +1716,41 @@ const handleLogout = async (): Promise<void> => {
                     </ThemeIcon>
                   </Group>
                 </Group>
-                <Stack gap="xs">
-                  {Object.keys(scanStatusSummary).length === 0 && <Text c="dimmed">No scans yet.</Text>}
-                  {Object.entries(scanStatusSummary).map(([status, count]) => (
-                    <Paper key={status} withBorder p="sm" radius="md" style={surfaces.glass}>
-                      <Group justify="space-between">
-                        <Group gap="sm">
-                          <StatusBadge status={status} />
+                <ScrollArea h={SUMMARY_CARD_BODY_HEIGHT} offsetScrollbars>
+                  <Stack gap="xs">
+                    {Object.keys(scanStatusSummary).length === 0 && <Text c="dimmed">No scans yet.</Text>}
+                    {Object.entries(scanStatusSummary).map(([status, count]) => (
+                      <Paper key={status} withBorder p="sm" radius="md" style={surfaces.glass}>
+                        <Group justify="space-between">
+                          <Group gap="sm">
+                            <StatusBadge status={status} />
+                          </Group>
+                          <Group gap="xs">
+                            <Text fw={600}>{count}</Text>
+                            <Progress
+                              className="animate-progress"
+                              value={Math.min(100, (count / Math.max(scans.length, 1)) * 100)}
+                              w={168}
+                              color={STATUS_COLORS[status] || 'gray'}
+                              striped={status === 'running' || status === 'queued'}
+                              animated={status === 'running' || status === 'queued'}
+                            />
+                          </Group>
                         </Group>
-                        <Group gap="xs">
-                          <Text fw={600}>{count}</Text>
-                          <Progress
-                            className="animate-progress"
-                            value={Math.min(100, (count / Math.max(scans.length, 1)) * 100)}
-                            w={168}
-                            color={STATUS_COLORS[status] || 'gray'}
-                            striped={status === 'running' || status === 'queued'}
-                            animated={status === 'running' || status === 'queued'}
-                          />
-                        </Group>
-                      </Group>
-                    </Paper>
-                  ))}
-                </Stack>
+                      </Paper>
+                    ))}
+                  </Stack>
+                </ScrollArea>
               </Card>
             </Grid.Col>
             <Grid.Col span={{ base: 12, lg: 6 }}>
               <Card
                 padding="lg"
                 radius="md"
-                style={colorScheme === 'light' ? (surfaces.tile as React.CSSProperties) : glassStyles}
+                style={{
+                  ...(colorScheme === 'light' ? (surfaces.tile as React.CSSProperties) : glassStyles),
+                  height: isMobile ? SUMMARY_CARD_HEIGHT_MOBILE : SUMMARY_CARD_HEIGHT,
+                }}
                 shadow="xl"
               >
                 <Group justify="space-between" mb="md">
@@ -1598,31 +1761,28 @@ const handleLogout = async (): Promise<void> => {
                     </Text>
                   </div>
                 </Group>
-                <Group wrap="nowrap" gap="lg">
-                  <RingProgress
-                    size={160}
-                    thickness={16}
-                    sections={severityRingData.length ? severityRingData : [{ value: 100, color: '#334155' }]}
-                    label={
-                      <Stack gap={0} align="center">
-                        <Text size="sm" c="gray.5">
-                          Severity
-                        </Text>
-                        <Title order={4}>{findings.length}</Title>
-                      </Stack>
-                    }
-                  />
-                  <Stack gap="xs">
+                <Stack gap="md" align="flex-end">
+                  <Stack gap={4} w={isMobile ? '100%' : 360} align="flex-end">
+                    <Text size="sm" c="gray.6" ta="right" w="100%">
+                      Total findings: {findings.length}
+                    </Text>
+                    <Progress.Root size="lg" radius="xl" w="100%">
+                      {severityProgressSections.map(({ value, color }, idx) => (
+                        <Progress.Section key={idx} value={value} color={color} />
+                      ))}
+                    </Progress.Root>
+                  </Stack>
+                  <Stack gap="xs" w={isMobile ? '100%' : 360}>
                     {Object.entries(severitySummary)
                       .sort(([a], [b]) => a.localeCompare(b))
                       .map(([severity, count]) => (
-                        <Group key={severity} justify="space-between" w={220}>
+                        <Group key={severity} justify="space-between">
                           <SeverityBadge severity={severity} />
                           <Text fw={600}>{count}</Text>
                         </Group>
                       ))}
                   </Stack>
-                </Group>
+                </Stack>
               </Card>
             </Grid.Col>
           </Grid>
@@ -1633,10 +1793,71 @@ const handleLogout = async (): Promise<void> => {
               <Tabs.Tab value="scans">Scans</Tabs.Tab>
               <Tabs.Tab value="findings">Findings</Tabs.Tab>
               {currentUser?.role === 'admin' && <Tabs.Tab value="schedules">Schedules</Tabs.Tab>}
+              <Tabs.Tab value="integrations">Integrations</Tabs.Tab>
+              <Tabs.Tab value="reports">Reports</Tabs.Tab>
             </Tabs.List>
 
-            <Tabs.Panel value="assets" pt="md">
-              <Grid>
+            <Tabs.Panel value="integrations" pt="sm">
+              <Card padding="lg" radius="md" shadow="xl" style={colorScheme === 'light' ? (surfaces.tile as React.CSSProperties) : glassStyles}>
+                <Stack gap="md">
+                  <Group justify="space-between" align="flex-start">
+                    <div>
+                      <Title order={4}>Integrations</Title>
+                      <Text c="dimmed" size="sm">Connect enrichers, ticketing, and notifications. Configure credentials and webhooks here.</Text>
+                    </div>
+                    <Badge color="indigo" variant="light">Preview</Badge>
+                  </Group>
+                  <Table verticalSpacing="sm" horizontalSpacing="md">
+                    <Table.Thead>
+                      <Table.Tr>
+                        <Table.Th>Integration</Table.Th>
+                        <Table.Th>Status</Table.Th>
+                        <Table.Th>Mode</Table.Th>
+                        <Table.Th>Last sync</Table.Th>
+                      </Table.Tr>
+                    </Table.Thead>
+                    <Table.Tbody>
+                      {integrations.map((integration) => (
+                        <Table.Tr key={integration.id}>
+                          <Table.Td>
+                            <Group gap="sm">
+                              <ThemeIcon variant="light" color="indigo" radius="md">
+                                <IconPlugConnected size={16} />
+                              </ThemeIcon>
+                              <div>
+                                <Text fw={600}>{integration.name}</Text>
+                                {integration.notes && <Text size="xs" c="dimmed">{integration.notes}</Text>}
+                              </div>
+                            </Group>
+                          </Table.Td>
+                          <Table.Td>
+                            <Badge color={INTEGRATION_STATUS_COLORS[integration.status]} variant="light" radius="sm">
+                              {integration.status.charAt(0).toUpperCase() + integration.status.slice(1)}
+                            </Badge>
+                          </Table.Td>
+                          <Table.Td>
+                            <Text size="sm">{integration.mode || '—'}</Text>
+                          </Table.Td>
+                          <Table.Td>
+                            <Text size="sm" c="dimmed">{integration.lastSync || 'Not synced yet'}</Text>
+                          </Table.Td>
+                        </Table.Tr>
+                      ))}
+                    </Table.Tbody>
+                  </Table>
+                </Stack>
+              </Card>
+            </Tabs.Panel>
+
+            <Tabs.Panel value="reports" pt="sm">
+              <Card padding="lg" radius="md" shadow="xl" style={colorScheme === 'light' ? (surfaces.tile as React.CSSProperties) : glassStyles}>
+                <Title order={4}>Reports</Title>
+                <Text c="dimmed" size="sm">Coming soon: rollups and exports.</Text>
+              </Card>
+            </Tabs.Panel>
+
+            <Tabs.Panel value="assets" pt="sm">
+              <Grid gutter={{ base: 'md', md: 'xl' }}>
                 <Grid.Col span={{ base: 12, md: 4 }}>
                   <Card
                     padding="lg"
@@ -1665,7 +1886,78 @@ const handleLogout = async (): Promise<void> => {
                       />
                       <TextInput label="Environment" placeholder="prod, staging" value={assetForm.environment} onChange={(event) => setAssetForm((prev) => ({ ...prev, environment: event.currentTarget.value }))} />
                       <TextInput label="Owner" value={assetForm.owner} onChange={(event) => setAssetForm((prev) => ({ ...prev, owner: event.currentTarget.value }))} />
-                      <Textarea label="Notes" minRows={2} value={assetForm.notes} onChange={(event) => setAssetForm((prev) => ({ ...prev, notes: event.currentTarget.value }))} />
+                        <Textarea label="Notes" minRows={2} value={assetForm.notes} onChange={(event) => setAssetForm((prev) => ({ ...prev, notes: event.currentTarget.value }))} />
+                        <Paper withBorder p="sm" radius="md">
+                          <Group justify="space-between" mb="xs">
+                            <div>
+                              <Text fw={600}>Credentialed SSH</Text>
+                              <Text size="xs" c="dimmed">Attach credentials so scans can pull OS/packages/services.</Text>
+                            </div>
+                            <Switch
+                              checked={assetForm.credentialed}
+                              onChange={(e) => setAssetForm((prev) => ({ ...prev, credentialed: e.currentTarget.checked }))}
+                              label="Enable"
+                            />
+                          </Group>
+                          {assetForm.credentialed && (
+                            <Stack gap="xs">
+                              <Group grow>
+                                <TextInput
+                                  label="Username"
+                                  required
+                                  value={assetForm.ssh_username}
+                                  onChange={(e) => setAssetForm((prev) => ({ ...prev, ssh_username: e.currentTarget.value }))}
+                                />
+                                <TextInput
+                                  label="Port"
+                                  value={assetForm.ssh_port}
+                                  onChange={(e) => setAssetForm((prev) => ({ ...prev, ssh_port: e.currentTarget.value }))}
+                                  type="number"
+                                />
+                              </Group>
+                              <SegmentedControl
+                                fullWidth
+                                value={assetForm.ssh_auth_method}
+                                onChange={(v) => setAssetForm((prev) => ({ ...prev, ssh_auth_method: v }))}
+                                data={[
+                                  { label: 'Password', value: 'password' },
+                                  { label: 'SSH key', value: 'key' },
+                                  { label: 'Agent', value: 'agent' },
+                                ]}
+                              />
+                              {assetForm.ssh_auth_method === 'password' && (
+                                <PasswordInput
+                                  label="Password"
+                                  placeholder="Stored only for credentialed scans"
+                                  value={assetForm.ssh_password}
+                                  onChange={(e) => setAssetForm((prev) => ({ ...prev, ssh_password: e.currentTarget.value }))}
+                                />
+                              )}
+                              {assetForm.ssh_auth_method === 'key' && (
+                                <TextInput
+                                  label="Private key path"
+                                  placeholder="/home/audit/.ssh/id_rsa"
+                                  value={assetForm.ssh_key_path}
+                                  onChange={(e) => setAssetForm((prev) => ({ ...prev, ssh_key_path: e.currentTarget.value }))}
+                                />
+                              )}
+                              {assetForm.ssh_auth_method === 'agent' && (
+                                <Group>
+                                  <Switch
+                                    label="Use ssh-agent"
+                                    checked={assetForm.ssh_allow_agent}
+                                    onChange={(e) => setAssetForm((prev) => ({ ...prev, ssh_allow_agent: e.currentTarget.checked }))}
+                                  />
+                                  <Switch
+                                    label="Discover keys on host"
+                                    checked={assetForm.ssh_look_for_keys}
+                                    onChange={(e) => setAssetForm((prev) => ({ ...prev, ssh_look_for_keys: e.currentTarget.checked }))}
+                                  />
+                                </Group>
+                              )}
+                            </Stack>
+                          )}
+                        </Paper>
                       <Button leftSection={<IconSend size={16} />} onClick={handleAssetSubmit} disabled={!assetForm.target.trim()}>
                         {editingAssetId != null ? 'Update asset' : 'Save asset'}
                       </Button>
@@ -1681,16 +1973,13 @@ const handleLogout = async (): Promise<void> => {
                         <Button variant="light" onClick={() => exportJson(visibleAssets, 'assets.json')}>Export JSON</Button>
                       </Group>
                     </Group>
-                    <Group justify="space-between" mb="sm">
-                      <Group gap="xs">
-                        <Title order={4} c={colorScheme === 'light' ? '#0b1220' : undefined}>Assets</Title>
-                        <Badge variant="filled" color="indigo">{assets.length}</Badge>
+                      <Group justify="space-between" mb="sm">
+                        <Group gap="xs">
+                          <Title order={4} c={colorScheme === 'light' ? '#0b1220' : undefined}>Assets</Title>
+                          <Badge variant="filled" color="indigo">{assets.length}</Badge>
+                        </Group>
                       </Group>
-                      <Button size="xs" variant="light" onClick={resetAssetForm} leftSection={<IconTarget size={14} />} disabled={!canWrite}>
-                        Add
-                      </Button>
-                    </Group>
-                    <ScrollArea h={360} offsetScrollbars>
+                    <ScrollArea h={isMobile ? TABLE_HEIGHT_MOBILE : TABLE_HEIGHT} offsetScrollbars>
                       <Table highlightOnHover verticalSpacing="sm" striped>
                         <Table.Thead>
                           <Table.Tr>
@@ -1706,7 +1995,15 @@ const handleLogout = async (): Promise<void> => {
                           {visibleAssets.map((asset) => (
                             <Table.Tr key={asset.id}>
                               <Table.Td>{asset.id}</Table.Td>
-                              <Table.Td>{asset.target}</Table.Td>
+                              <Table.Td>
+                                <Stack gap={2}>
+                                  <Text>{asset.target}</Text>
+                                  <Group gap={4}>
+                                    {asset.credentialed && <Badge size="xs" color="indigo" variant="light">Credentialed</Badge>}
+                                    {asset.environment && <Badge size="xs" variant="light">{asset.environment}</Badge>}
+                                  </Group>
+                                </Stack>
+                              </Table.Td>
                               <Table.Td>{asset.name || '-'}</Table.Td>
                               <Table.Td>{asset.environment || '-'}</Table.Td>
                               <Table.Td>{asset.owner || '-'}</Table.Td>
@@ -1715,6 +2012,11 @@ const handleLogout = async (): Promise<void> => {
                                   <Button size="xs" variant="light" onClick={() => handleAssetEdit(asset)} disabled={!canWrite}>
                                     Edit
                                   </Button>
+                                  {asset.credentialed && (
+                                    <Button size="xs" variant="light" color="indigo" onClick={() => runCredentialedScan(asset)} disabled={!canWrite}>
+                                      Run credentialed
+                                    </Button>
+                                  )}
                                   <Button size="xs" color="red" variant="light" onClick={() => handleAssetDelete(asset.id)} disabled={!canWrite}>
                                     Remove
                                   </Button>
@@ -1735,8 +2037,8 @@ const handleLogout = async (): Promise<void> => {
               </Grid>
             </Tabs.Panel>
 
-            <Tabs.Panel value="scans" pt="md">
-              <Grid>
+            <Tabs.Panel value="scans" pt="sm">
+              <Grid gutter={{ base: 'md', md: 'xl' }}>
                 <Grid.Col span={{ base: 12, md: 4 }}>
                   <Card padding="lg" radius="md" style={colorScheme === 'light' ? (surfaces.tile as React.CSSProperties) : glassStyles} shadow="xl">
                     <Title order={5} mb="sm">
@@ -1776,7 +2078,7 @@ const handleLogout = async (): Promise<void> => {
                       </Group>
                       <Badge variant="light">{scansTotal} total</Badge>
                     </Group>
-                    <ScrollArea h={360} offsetScrollbars>
+                    <ScrollArea h={isMobile ? TABLE_HEIGHT_MOBILE : TABLE_HEIGHT} offsetScrollbars>
                       <Table highlightOnHover verticalSpacing="sm" striped>
                         <Table.Thead>
                           <Table.Tr>
@@ -1828,11 +2130,11 @@ const handleLogout = async (): Promise<void> => {
               </Grid>
             </Tabs.Panel>
 
-            <Tabs.Panel value="findings" pt="md">
+            <Tabs.Panel value="findings" pt="sm">
               <Card padding="lg" radius="md" style={colorScheme === 'light' ? (surfaces.tile as React.CSSProperties) : glassStyles} shadow="xl">
-                <Group justify="space-between" mb="md">
+                <Stack gap="sm" mb="md">
                   <Title order={5}>Findings</Title>
-                  <Group gap="xs">
+                  <Group gap="xs" wrap="wrap">
                     <SegmentedControl
                       value={findingFilter}
                       onChange={(value) => setFindingFilter(value as typeof findingFilter)}
@@ -1853,11 +2155,13 @@ const handleLogout = async (): Promise<void> => {
                         { label: 'Port', value: 'port' },
                       ]}
                     />
-                    <TextInput placeholder="Search service, host, text" value={findingSearch} onChange={(e) => setFindingSearch(e.currentTarget.value)} />
-                    <Button variant="light" onClick={() => exportFindings('csv')}>Export CSV</Button>
-                    <Button variant="light" onClick={() => exportFindings('json')}>Export JSON</Button>
+                    <TextInput placeholder="Search service, host, text" value={findingSearch} onChange={(e) => setFindingSearch(e.currentTarget.value)} style={{ minWidth: rem(180), flex: 1 }} />
+                    <Group gap="xs" wrap="wrap">
+                      <Button variant="light" onClick={() => exportFindings('csv')}>Export CSV</Button>
+                      <Button variant="light" onClick={() => exportFindings('json')}>Export JSON</Button>
+                    </Group>
                   </Group>
-                </Group>
+                </Stack>
                 <Stack gap="md">
                   {findingsByHost.length === 0 && <Text c="dimmed">No findings to summarize.</Text>}
                   {findingsByHost.slice(0, findingGroupLimit).map((group) => (
@@ -1960,7 +2264,7 @@ const handleLogout = async (): Promise<void> => {
             </Tabs.Panel>
 
             {currentUser?.role === 'admin' && (
-              <Tabs.Panel value="schedules" pt="md">
+              <Tabs.Panel value="schedules" pt="sm">
                 <Card padding="lg" radius="md" style={colorScheme === 'light' ? (surfaces.tile as React.CSSProperties) : glassStyles} shadow="xl">
                   <Group justify="space-between" mb="md">
                     <div>
@@ -1972,7 +2276,7 @@ const handleLogout = async (): Promise<void> => {
                       <Button onClick={() => { resetScheduleForm(); setScheduleModalOpen(true); }}>New schedule</Button>
                     </Group>
                   </Group>
-                  <ScrollArea h={360} offsetScrollbars>
+                  <ScrollArea h={isMobile ? TABLE_HEIGHT_MOBILE : TABLE_HEIGHT} offsetScrollbars>
                     <Table striped highlightOnHover>
                       <Table.Thead>
                         <Table.Tr>
@@ -2042,7 +2346,7 @@ const handleLogout = async (): Promise<void> => {
         onClose={() => setSelectedFinding(null)}
         title={selectedFinding ? `Finding #${selectedFinding.id}` : ''}
         position="right"
-        size="lg"
+        size={isMobile ? '100%' : 'lg'}
       >
         {selectedFinding && (
           <Stack gap="sm">
@@ -2158,7 +2462,7 @@ const handleLogout = async (): Promise<void> => {
         onClose={() => setSelectedScanId(null)}
         title={selectedScanId ? `Scan #${selectedScanId} progress` : ''}
         position="right"
-        size="md"
+        size={isMobile ? '100%' : 'md'}
       >
         {selectedScan && (
           <Group justify="space-between" mb="sm">
