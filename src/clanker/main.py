@@ -2493,6 +2493,7 @@ def run_scan_job(scan_id: int) -> None:
                     scan.completed_at = scan.completed_at or datetime.utcnow()
                     session.add(scan)
                     session.commit()
+                    metrics_status = "cancelled"
                     return
                 retrying = True
                 while retrying:
@@ -2512,6 +2513,7 @@ def run_scan_job(scan_id: int) -> None:
                         session.add(status_row)
                         session.commit()
                         _record_scan_event(session, scan_id, "Scan cancelled mid-run")
+                        metrics_status = "cancelled"
                         return
 
                     try:
