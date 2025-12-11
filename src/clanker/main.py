@@ -89,6 +89,30 @@ _ssh_secret_cache: Dict[int, Dict[str, Any]] = {}
 _ssh_retry_overrides: Dict[int, int] = {}
 _ssh_secret_lock = threading.Lock()
 
+
+def _build_scan_queue_hooks() -> QueueHooks:
+    from clanker.db.session import get_session as session_factory
+
+    def _record_if_exists(scan_id: int, message: str) -> None:
+        with session_factory() as session:
+            scan = session.get(Scan, scan_id)
+            if scan:
+                _record_scan_event(session, scan_id, message)
+
+    return QueueHooks(
+        on_start=lambda scan_id, attempt: _record_if_exists(
+            scan_id, f"Dequeued for processing (attempt {attempt})"
+        ),
+        on_retry=lambda scan_id, attempt: _record_if_exists(
+            scan_id, f"Retrying scan job (attempt {attempt + 1})"
+        ),
+        on_cancel=lambda scan_id: _record_if_exists(scan_id, "Scan cancelled before worker start"),
+        on_fail=lambda scan_id, attempts, error: _record_if_exists(
+            scan_id, f"Scan job failed after {attempts} attempt(s): {error}"
+        ),
+    )
+
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -110,7 +134,7 @@ def on_startup() -> None:
     global scan_job_queue
     global ssh_scan_job_queue
     if scan_job_queue is None:
-        scan_job_queue = ScanJobQueue(worker=run_scan_job)
+        scan_job_queue = ScanJobQueue(worker=run_scan_job, hooks=_build_scan_queue_hooks())
     scan_job_queue.start()
     if ssh_scan_job_queue is None:
         ssh_scan_job_queue = ScanJobQueue(worker=run_ssh_scan_job)
@@ -1374,6 +1398,8 @@ def _create_scan_record(session: Session, asset_ids: List[int], profile_key: str
     for asset in session.exec(select(Asset).where(Asset.id.in_(asset_ids))).all():
         session.add(ScanTarget(scan_id=scan.id, asset_id=asset.id))
         _ensure_asset_status(session, scan.id, asset.id)
+    if scan.id is not None:
+        _record_scan_event(session, scan.id, "Scan queued")
     return scan
 
 
