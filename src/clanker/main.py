@@ -8,10 +8,12 @@ import json
 import logging
 import os
 import threading
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from uuid import uuid4
 
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, Request, Response, Header
 from fastapi.middleware.cors import CORSMiddleware
@@ -29,6 +31,7 @@ from clanker.core.agent_vuln_logic import persist_agent_findings
 from clanker.core.enrichment import enrich_from_feed, sync_nvd_cache
 from clanker.core.findings import build_findings
 from clanker.core.job_queue import QueueHooks, ScanJobQueue
+from clanker.core.observability import Timer, configure_logging, log_event, metrics
 from clanker.core.scanner import (
     DEFAULT_PROFILE_KEY,
     execute_nmap,
@@ -70,8 +73,8 @@ from clanker.db.models import (
 )
 from clanker.db.session import get_session, init_db
 
+configure_logging()
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO)
 
 app = FastAPI(title="Clanker Vulnerability Scanner", version="0.2.0")
 SCAN_PROFILE_CHOICES = list_scan_profiles()
@@ -113,12 +116,61 @@ def _build_scan_queue_hooks() -> QueueHooks:
     )
 
 
+def _ensure_scan_queue() -> ScanJobQueue:
+    global scan_job_queue
+    if scan_job_queue is None:
+        scan_job_queue = ScanJobQueue(worker=run_scan_job, hooks=_build_scan_queue_hooks())
+    scan_job_queue.start()
+    return scan_job_queue
+
+
+def _enqueue_scan_job(scan_id: int, *, force: bool = False) -> None:
+    queue = _ensure_scan_queue()
+    queue.enqueue(scan_id, force=force)
+
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def request_observability(request: Request, call_next):
+    request_id = request.headers.get("x-request-id") or str(uuid4())
+    request.state.request_id = request_id
+    started = time.perf_counter()
+    try:
+        response = await call_next(request)
+    except Exception:
+        duration_ms = (time.perf_counter() - started) * 1000
+        metrics.record_api_request(500, duration_ms)
+        log_event(
+            logger,
+            "http_request",
+            method=request.method,
+            path=request.url.path,
+            status=500,
+            duration_ms=round(duration_ms, 2),
+            request_id=request_id,
+        )
+        raise
+    duration_ms = (time.perf_counter() - started) * 1000
+    metrics.record_api_request(response.status_code, duration_ms)
+    log_event(
+        logger,
+        "http_request",
+        method=request.method,
+        path=request.url.path,
+        status=response.status_code,
+        duration_ms=round(duration_ms, 2),
+        request_id=request_id,
+    )
+    response.headers["X-Request-ID"] = request_id
+    return response
+
 templates = Jinja2Templates(directory="templates")
 if FRONTEND_DIST.exists():
     app.mount("/app", StaticFiles(directory=FRONTEND_DIST, html=True), name="react-app")
@@ -131,11 +183,8 @@ if FRONTEND_DIST.exists():
 @app.on_event("startup")
 def on_startup() -> None:
     init_db()
-    global scan_job_queue
     global ssh_scan_job_queue
-    if scan_job_queue is None:
-        scan_job_queue = ScanJobQueue(worker=run_scan_job, hooks=_build_scan_queue_hooks())
-    scan_job_queue.start()
+    _ensure_scan_queue()
     if ssh_scan_job_queue is None:
         ssh_scan_job_queue = ScanJobQueue(worker=run_ssh_scan_job)
     ssh_scan_job_queue.start()
@@ -172,6 +221,13 @@ async def on_startup_async() -> None:
 def session_dep() -> Session:
     with get_session() as session:
         yield session
+
+
+@app.get("/metrics")
+def read_metrics() -> Dict[str, Any]:
+    queue_stats = scan_job_queue.stats() if scan_job_queue else {}
+    ssh_stats = ssh_scan_job_queue.stats() if ssh_scan_job_queue else {}
+    return metrics.snapshot(queue_stats=queue_stats, ssh_queue_stats=ssh_stats)
 
 
 def _paginate_query(session: Session, query, limit: int, offset: int) -> tuple[list[Any], int]:
@@ -1383,11 +1439,14 @@ def create_scan(
 
     scan = _create_scan_record(session, [a.id for a in assets if a.id is not None], profile_key)
     session.commit()
-    if scan_job_queue is not None:
-        scan_job_queue.enqueue(scan.id)
-    else:
-        background_tasks.add_task(run_scan_job, scan.id)
+    _enqueue_scan_job(scan.id)
     return scan
+
+
+@app.get("/queues/scan")
+def scan_queue_status(_: object = Depends(require_roles("admin", "operator"))) -> Dict[str, object]:
+    queue = _ensure_scan_queue()
+    return queue.snapshot()
 
 
 def _create_scan_record(session: Session, asset_ids: List[int], profile_key: str) -> Scan:
@@ -1519,10 +1578,7 @@ def run_schedule_now(schedule_id: int, background_tasks: BackgroundTasks, _: obj
     row.last_run_at = datetime.utcnow()
     session.add(row)
     session.commit()
-    if scan_job_queue is not None:
-        scan_job_queue.enqueue(scan.id)
-    else:
-        background_tasks.add_task(run_scan_job, scan.id)
+    _enqueue_scan_job(scan.id)
     return {"status": "queued", "scan_id": scan.id}
 
 
@@ -1841,8 +1897,7 @@ def retry_scan(
     session.add(scan)
     session.commit()
     _record_scan_event(session, scan_id, "Scan re-queued for retry")
-    if scan_job_queue is not None:
-        scan_job_queue.enqueue(scan.id, force=True)
+    _enqueue_scan_job(scan.id, force=True)
     return scan
 
 

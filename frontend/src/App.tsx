@@ -1720,22 +1720,20 @@ const handleLogout = async (): Promise<void> => {
                     {Object.keys(scanStatusSummary).length === 0 && <Text c="dimmed">No scans yet.</Text>}
                     {Object.entries(scanStatusSummary).map(([status, count]) => (
                       <Paper key={status} withBorder p="sm" radius="md" style={surfaces.glass}>
-                        <Group justify="space-between">
-                          <Group gap="sm">
+                        <Stack gap={6}>
+                          <Group justify="space-between">
                             <StatusBadge status={status} />
-                          </Group>
-                          <Group gap="xs">
                             <Text fw={600}>{count}</Text>
-                            <Progress
-                              className="animate-progress"
-                              value={Math.min(100, (count / Math.max(scans.length, 1)) * 100)}
-                              w={168}
-                              color={STATUS_COLORS[status] || 'gray'}
-                              striped={status === 'running' || status === 'queued'}
-                              animated={status === 'running' || status === 'queued'}
-                            />
                           </Group>
-                        </Group>
+                          <Progress
+                            className="animate-progress"
+                            value={Math.min(100, (count / Math.max(scans.length, 1)) * 100)}
+                            w="100%"
+                            color={STATUS_COLORS[status] || 'gray'}
+                            striped={status === 'running' || status === 'queued'}
+                            animated={status === 'running' || status === 'queued'}
+                          />
+                        </Stack>
                       </Paper>
                     ))}
                   </Stack>
@@ -1760,8 +1758,8 @@ const handleLogout = async (): Promise<void> => {
                     </Text>
                   </div>
                 </Group>
-                <Stack gap="md" align="flex-end">
-                  <Stack gap={4} w={isMobile ? '100%' : 360} align="flex-end">
+                <Stack gap="md" align="stretch">
+                  <Stack gap={4} w="100%" align="stretch">
                     <Text size="sm" c="gray.6" ta="right" w="100%">
                       Total findings: {findings.length}
                     </Text>
@@ -1771,7 +1769,7 @@ const handleLogout = async (): Promise<void> => {
                       ))}
                     </Progress.Root>
                   </Stack>
-                  <Stack gap="xs" w={isMobile ? '100%' : 360}>
+                  <Stack gap="xs" w="100%">
                     {Object.entries(severitySummary)
                       .sort(([a], [b]) => a.localeCompare(b))
                       .map(([severity, count]) => (
