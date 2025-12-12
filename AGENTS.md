@@ -81,3 +81,9 @@ The scanner must support:
 - Cloud, container, and IaC awareness
 - Integration into CI/CD workflows
 - Machine-readable outputs for automation
+
+## Non-Goals
+
+- We do not aim to replicate full exploit frameworks
+- We do not prioritize unauthenticated scans when credentials are available
+- We do not optimize for raw scan speed at the expense of accuracy
