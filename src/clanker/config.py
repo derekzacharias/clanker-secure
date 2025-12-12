@@ -15,9 +15,11 @@ class Settings(BaseSettings):
     nvd_recent_feed_url: str = Field(
         default="https://nvd.nist.gov/feeds/json/cve/1.1/nvdcve-1.1-recent.json.gz"
     )
+    nvd_cve_api_base: str = Field(default="https://services.nvd.nist.gov/rest/json/cve/2.0")
     nvd_sync_enabled: bool = Field(default=True)
     nvd_cache_ttl_hours: int = Field(default=24, ge=1, le=168)
     nvd_feed_sync_interval_hours: int = Field(default=24, ge=1, le=168)
+    nvd_api_min_interval_seconds: float = Field(default=0.6, ge=0.0, le=10.0)
     nvd_max_reference_urls: int = Field(default=6, ge=1, le=20)
     cpe_map_path: Path = Field(default=Path(__file__).resolve().parent / "core" / "cpe_map.json")
     protocol_fingerprinting_enabled: bool = Field(default=True)

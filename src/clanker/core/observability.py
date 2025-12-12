@@ -193,11 +193,89 @@ class Metrics:
                 },
             }
 
+    def reset(self) -> None:
+        """Zero metrics for tests or process reuse in dev."""
+        with self._lock:
+            self.api = ApiMetrics()
+            self.scans = ScanMetrics()
+            self.ssh_scans = ScanMetrics()
+
     def _target(self, kind: str) -> ScanMetrics:
         return self.ssh_scans if kind == "ssh" else self.scans
 
 
 metrics = Metrics()
+
+
+def _metric_lines(name: str, value: float, help_text: str) -> str:
+    return f"# HELP {name} {help_text}\n# TYPE {name} gauge\n{name} {value}\n"
+
+
+def render_prometheus_metrics(snapshot: Dict[str, Any]) -> str:
+    """Render a Prometheus text exposition from a metrics snapshot."""
+
+    def _num(val: Any) -> float:
+        try:
+            return float(val or 0)
+        except Exception:
+            return 0.0
+
+    api = snapshot.get("api", {})
+    scanner = snapshot.get("scanner", {})
+    queue_network = snapshot.get("queues", {}).get("network", {}) if snapshot.get("queues") else {}
+    queue_ssh = snapshot.get("queues", {}).get("ssh", {}) if snapshot.get("queues") else {}
+
+    parts = [
+        _metric_lines("clanker_api_requests_total", _num(api.get("requests_total")), "Total API requests"),
+        _metric_lines("clanker_api_error_responses_total", _num(api.get("error_responses")), "Total 5xx responses"),
+        _metric_lines("clanker_api_latency_ms_avg", _num(api.get("avg_latency_ms")), "Average API latency in ms"),
+        _metric_lines("clanker_api_latency_ms_last", _num(api.get("last_latency_ms")), "Last API latency in ms"),
+    ]
+
+    def _scanner_section(prefix: str, data: Dict[str, Any]) -> None:
+        parts.extend(
+            [
+                _metric_lines(f"{prefix}_started_total", _num(data.get("started")), f"{prefix} scans started"),
+                _metric_lines(f"{prefix}_completed_total", _num(data.get("completed")), f"{prefix} scans completed"),
+                _metric_lines(f"{prefix}_failed_total", _num(data.get("failed")), f"{prefix} scans failed"),
+                _metric_lines(f"{prefix}_cancelled_total", _num(data.get("cancelled")), f"{prefix} scans cancelled"),
+                _metric_lines(f"{prefix}_in_progress", _num(data.get("in_progress")), f"{prefix} scans in progress"),
+                _metric_lines(
+                    f"{prefix}_duration_seconds_avg",
+                    _num(data.get("avg_duration_seconds")),
+                    f"Average {prefix} scan duration seconds",
+                ),
+                _metric_lines(
+                    f"{prefix}_duration_seconds_last",
+                    _num(data.get("last_duration_seconds")),
+                    f"Last {prefix} scan duration seconds",
+                ),
+            ]
+        )
+
+    net = scanner.get("network", {})
+    ssh = scanner.get("ssh", {})
+    _scanner_section("clanker_scanner_network", net)
+    _scanner_section("clanker_scanner_ssh", ssh)
+
+    def _queue_section(prefix: str, data: Dict[str, Any]) -> None:
+        parts.extend(
+            [
+                _metric_lines(f"{prefix}_queued_total", _num(data.get("enqueued")), "Jobs enqueued"),
+                _metric_lines(f"{prefix}_started_total", _num(data.get("started")), "Jobs started"),
+                _metric_lines(f"{prefix}_completed_total", _num(data.get("completed")), "Jobs completed"),
+                _metric_lines(f"{prefix}_failed_total", _num(data.get("failed")), "Jobs failed"),
+                _metric_lines(f"{prefix}_cancelled_total", _num(data.get("cancelled")), "Jobs cancelled"),
+                _metric_lines(f"{prefix}_in_queue", _num(data.get("in_queue")), "Jobs waiting in queue"),
+                _metric_lines(f"{prefix}_attempting", _num(data.get("attempting")), "Jobs currently attempting"),
+                _metric_lines(f"{prefix}_cancelled_jobs", _num(data.get("cancelled_jobs")), "Jobs cancelled markers"),
+            ]
+        )
+
+    _queue_section("clanker_queue_network", queue_network)
+    _queue_section("clanker_queue_ssh", queue_ssh)
+
+    return "".join(parts)
 
 
 class Timer:
@@ -209,4 +287,3 @@ class Timer:
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
         self.duration = time.perf_counter() - self._start
-

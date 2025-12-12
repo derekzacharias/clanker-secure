@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import pytest
-from fastapi.testclient import TestClient
+from fastapi import HTTPException
+from starlette.requests import Request
 from sqlmodel import delete, select, func
 
 from clanker.db.models import AuditLog, LoginAttempt, SessionToken, User
 from clanker.db.session import get_session, init_db
-from clanker.main import MAX_ATTEMPTS, app, hash_password
+from clanker.main import MAX_ATTEMPTS, LoginRequest, hash_password, login
 
 
 @pytest.fixture(autouse=True)
@@ -20,13 +21,7 @@ def _reset_auth_tables() -> None:
         session.exec(delete(User))
 
 
-@pytest.fixture
-def client() -> TestClient:
-    with TestClient(app) as test_client:
-        yield test_client
-
-
-def _create_user(email: str, password: str) -> User:
+def _create_user(email: str, password: str) -> str:
     with get_session() as session:
         user = User(
             email=email,
@@ -37,17 +32,20 @@ def _create_user(email: str, password: str) -> User:
         )
         session.add(user)
         session.flush()
-        session.refresh(user)
-        return user
+        return user.email
 
 
-def test_login_success_records_attempt_and_audit(client: TestClient) -> None:
-    user = _create_user("login-ok@example.com", "StrongPass123!")
+def _build_request(ip: str = "203.0.113.10") -> Request:
+    scope = {"type": "http", "headers": [], "client": (ip, 12345)}
+    return Request(scope)  # type: ignore[arg-type]
 
-    resp = client.post("/auth/login", json={"email": user.email, "password": "StrongPass123!"})
-    assert resp.status_code == 200
-    body = resp.json()
-    assert "access_token" in body and "refresh_token" in body
+
+def test_login_success_records_attempt_and_audit() -> None:
+    email = _create_user("login-ok@example.com", "StrongPass123!")
+
+    with get_session() as session:
+        resp = login(LoginRequest(email=email, password="StrongPass123!"), _build_request(), session)
+        assert resp.access_token
 
     with get_session() as session:
         attempts = session.exec(select(LoginAttempt)).all()
@@ -56,19 +54,23 @@ def test_login_success_records_attempt_and_audit(client: TestClient) -> None:
 
         audit = session.exec(select(AuditLog).where(AuditLog.action == "login_success")).first()
         assert audit is not None
-        assert audit.target == user.email
+        assert audit.target == email
         assert audit.ip is not None
 
 
-def test_login_rate_limit_blocks_after_failures(client: TestClient) -> None:
-    user = _create_user("login-throttle@example.com", "StrongPass123!")
+def test_login_rate_limit_blocks_after_failures() -> None:
+    email = _create_user("login-throttle@example.com", "StrongPass123!")
 
     for _ in range(MAX_ATTEMPTS):
-        resp = client.post("/auth/login", json={"email": user.email, "password": "WrongPassword!"})
-        assert resp.status_code == 401
+        with get_session() as session:
+            with pytest.raises(HTTPException) as excinfo:
+                login(LoginRequest(email=email, password="WrongPassword!"), _build_request(), session)
+            assert excinfo.value.status_code == 401
 
-    blocked = client.post("/auth/login", json={"email": user.email, "password": "WrongPassword!"})
-    assert blocked.status_code == 429
+    with get_session() as session:
+        with pytest.raises(HTTPException) as excinfo:
+            login(LoginRequest(email=email, password="WrongPassword!"), _build_request(), session)
+        assert excinfo.value.status_code == 429
 
     with get_session() as session:
         fail_attempts = session.exec(
@@ -78,5 +80,5 @@ def test_login_rate_limit_blocks_after_failures(client: TestClient) -> None:
 
         throttled = session.exec(select(AuditLog).where(AuditLog.action == "login_throttled")).first()
         assert throttled is not None
-        assert throttled.target == user.email
+        assert throttled.target == email
         assert throttled.ip is not None

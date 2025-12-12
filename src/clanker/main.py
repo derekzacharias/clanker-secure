@@ -17,7 +17,7 @@ from uuid import uuid4
 
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, Request, Response, Header
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, StreamingResponse, PlainTextResponse
 from fastapi.security.http import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -31,7 +31,7 @@ from clanker.core.agent_vuln_logic import persist_agent_findings
 from clanker.core.enrichment import enrich_from_feed, sync_nvd_cache
 from clanker.core.findings import build_findings
 from clanker.core.job_queue import QueueHooks, ScanJobQueue
-from clanker.core.observability import Timer, configure_logging, log_event, metrics
+from clanker.core.observability import configure_logging, log_event, metrics, render_prometheus_metrics
 from clanker.core.scanner import (
     DEFAULT_PROFILE_KEY,
     execute_nmap,
@@ -91,6 +91,15 @@ ssh_scan_job_queue: Optional[ScanJobQueue] = None
 _ssh_secret_cache: Dict[int, Dict[str, Any]] = {}
 _ssh_retry_overrides: Dict[int, int] = {}
 _ssh_secret_lock = threading.Lock()
+
+
+class FrontendStaticFiles(StaticFiles):
+    # Avoid cached index.html pointing at stale hashed assets
+    def file_response(self, path: str, stat_result, scope, status_code: int = 200):  # type: ignore[override]
+        response = super().file_response(path, stat_result, scope, status_code=status_code)
+        if path == "" or path.endswith("index.html"):
+            response.headers["Cache-Control"] = "no-store"
+        return response
 
 
 def _build_scan_queue_hooks() -> QueueHooks:
@@ -173,7 +182,7 @@ async def request_observability(request: Request, call_next):
 
 templates = Jinja2Templates(directory="templates")
 if FRONTEND_DIST.exists():
-    app.mount("/app", StaticFiles(directory=FRONTEND_DIST, html=True), name="react-app")
+    app.mount("/app", FrontendStaticFiles(directory=FRONTEND_DIST, html=True), name="react-app")
 
     @app.get("/", include_in_schema=False)
     def root_react() -> RedirectResponse:
@@ -228,6 +237,15 @@ def read_metrics() -> Dict[str, Any]:
     queue_stats = scan_job_queue.stats() if scan_job_queue else {}
     ssh_stats = ssh_scan_job_queue.stats() if ssh_scan_job_queue else {}
     return metrics.snapshot(queue_stats=queue_stats, ssh_queue_stats=ssh_stats)
+
+
+@app.get("/metrics/prometheus", response_class=PlainTextResponse)
+def read_prometheus_metrics() -> PlainTextResponse:
+    queue_stats = scan_job_queue.stats() if scan_job_queue else {}
+    ssh_stats = ssh_scan_job_queue.stats() if ssh_scan_job_queue else {}
+    snapshot = metrics.snapshot(queue_stats=queue_stats, ssh_queue_stats=ssh_stats)
+    body = render_prometheus_metrics(snapshot)
+    return PlainTextResponse(body, media_type="text/plain; version=0.0.4")
 
 
 def _paginate_query(session: Session, query, limit: int, offset: int) -> tuple[list[Any], int]:
@@ -544,15 +562,30 @@ def _aggregate_cvss_bands(session: Session, where_sql: str, params: Dict[str, An
             count = data.get("count")
             if band in summary:
                 summary[band] = int(count or 0)
+        if sum(summary.values()) == 0:
+            fallback_total = session.exec(text(f"SELECT COUNT(*) FROM finding f WHERE {where_sql}"), params).one()
+            summary["unscored"] = int(fallback_total or 0)
     except Exception:
         return summary
     return summary
 
 
 def _record_scan_event(session: Session, scan_id: int, message: str) -> None:
-    payload = {"scan_id": scan_id, "message": message, "ts": datetime.utcnow().isoformat()}
+    scan = session.get(Scan, scan_id)
+    correlation_id = getattr(scan, "correlation_id", None) if scan else None
+    if scan and not correlation_id:
+        correlation_id = str(uuid4())
+        scan.correlation_id = correlation_id
+        session.add(scan)
+    payload = {
+        "scan_id": scan_id,
+        "message": message,
+        "ts": datetime.utcnow().isoformat(),
+    }
+    if correlation_id:
+        payload["correlation_id"] = correlation_id
     log_event(logger, "scan_event", **payload)
-    session.add(ScanEvent(scan_id=scan_id, message=message))
+    session.add(ScanEvent(scan_id=scan_id, message=message, correlation_id=correlation_id))
     session.commit()
 
 
@@ -979,6 +1012,43 @@ class AgentIngestRequest(BaseModel):
     inventory: AgentInventory
 
 
+def _persist_agent_ingest(
+    session: Session,
+    inventory: AgentInventory | Dict[str, Any],
+    *,
+    asset_id: Optional[int],
+    agent_id: Optional[str],
+    agent_version: Optional[str],
+    raw_payload: Optional[str] = None,
+) -> AgentIngest:
+    inv = inventory if isinstance(inventory, AgentInventory) else AgentInventory.model_validate(inventory)
+    payload = raw_payload
+    if payload is None:
+        try:
+            payload = json.dumps({"agent_id": agent_id, "agent_version": agent_version, "inventory": inv.model_dump()})
+        except Exception:
+            payload = None
+    ingest = AgentIngest(
+        asset_id=asset_id,
+        agent_id=agent_id,
+        agent_version=agent_version,
+        host_identifier=inv.host_identifier or inv.hostname,
+        hostname=inv.hostname,
+        os_name=inv.os_name,
+        os_version=inv.os_version,
+        kernel_version=inv.kernel_version,
+        distro=inv.distro,
+        package_count=len(inv.packages),
+        service_count=len(inv.services),
+        interface_count=len(inv.interfaces),
+        config_count=len(inv.configs),
+        raw_payload=payload,
+    )
+    session.add(ingest)
+    session.flush()
+    return ingest
+
+
 class AgentIngestResponse(BaseModel):
     ingest_id: int
     status: str
@@ -1385,24 +1455,14 @@ def ingest_agent_inventory(
 
     inv = payload.inventory
     raw_payload = json.dumps(payload.model_dump())
-    ingest = AgentIngest(
+    ingest = _persist_agent_ingest(
+        session,
+        inv,
         asset_id=asset_id,
         agent_id=payload.agent_id,
         agent_version=payload.agent_version,
-        host_identifier=inv.host_identifier or inv.hostname,
-        hostname=inv.hostname,
-        os_name=inv.os_name,
-        os_version=inv.os_version,
-        kernel_version=inv.kernel_version,
-        distro=inv.distro,
-        package_count=len(inv.packages),
-        service_count=len(inv.services),
-        interface_count=len(inv.interfaces),
-        config_count=len(inv.configs),
         raw_payload=raw_payload,
     )
-    session.add(ingest)
-    session.flush()
     session.add(
         AuditLog(
             actor_user_id=current.user.id,
@@ -1450,7 +1510,7 @@ def scan_queue_status(_: object = Depends(require_roles("admin", "operator"))) -
 
 
 def _create_scan_record(session: Session, asset_ids: List[int], profile_key: str) -> Scan:
-    scan = Scan(profile=profile_key, status="queued")
+    scan = Scan(profile=profile_key, status="queued", correlation_id=str(uuid4()))
     session.add(scan)
     session.flush()
 
@@ -1844,6 +1904,7 @@ def get_scan(
         profile=scan.profile,
         notes=scan.notes,
         retry_count=scan.retry_count,
+        correlation_id=scan.correlation_id,
         created_at=scan.created_at,
         started_at=scan.started_at,
         completed_at=scan.completed_at,
@@ -1936,7 +1997,15 @@ def list_scan_events(
     events = session.exec(
         select(ScanEvent).where(ScanEvent.scan_id == scan_id).order_by(ScanEvent.created_at.desc())
     ).all()
-    return [ScanEventRead(id=event.id, created_at=event.created_at, message=event.message) for event in events]
+    return [
+        ScanEventRead(
+            id=event.id,
+            created_at=event.created_at,
+            message=event.message,
+            correlation_id=event.correlation_id,
+        )
+        for event in events
+    ]
 
 
 @app.get("/scans/{scan_id}/events/stream")
@@ -1967,6 +2036,7 @@ def stream_scan_events(
                             "id": row.id,
                             "created_at": row.created_at.isoformat(),
                             "message": row.message,
+                            "correlation_id": row.correlation_id,
                         }
                         yield f"data: {json.dumps(payload)}\n\n"
                     statuses = session.exec(
@@ -2313,16 +2383,28 @@ else:
 def run_ssh_scan_job(ssh_scan_id: int) -> None:
     from clanker.db.session import get_session as session_factory
 
+    metrics.record_scan_started("ssh")
+    started = time.perf_counter()
+    metrics_status = "failed"
     try:
         with session_factory() as session:
             scan = session.get(SSHScan, ssh_scan_id)
             if not scan:
                 logger.error("SSH scan %s missing", ssh_scan_id)
+                metrics_status = "failed"
                 return
             scan.status = "running"
             scan.started_at = datetime.utcnow()
             session.add(scan)
             session.commit()
+            log_event(
+                logger,
+                "ssh_scan_started",
+                ssh_scan_id=ssh_scan_id,
+                host_count=session.exec(
+                    select(func.count()).select_from(SSHScanHost).where(SSHScanHost.ssh_scan_id == ssh_scan_id)
+                ).one(),
+            )
 
         with session_factory() as session:
             scan = session.get(SSHScan, ssh_scan_id)
@@ -2336,6 +2418,7 @@ def run_ssh_scan_job(ssh_scan_id: int) -> None:
                 session.add(scan)
                 session.commit()
                 _pop_ssh_retry(ssh_scan_id)
+                metrics_status = "failed"
                 return
 
             scanner = SSHScanner(
@@ -2363,6 +2446,14 @@ def run_ssh_scan_job(ssh_scan_id: int) -> None:
                 host_row.status = "running"
                 host_row.started_at = datetime.utcnow()
                 session.add(host_row)
+                log_event(
+                    logger,
+                    "ssh_host_started",
+                    ssh_scan_id=ssh_scan_id,
+                    host_id=host_row.id,
+                    host=host_row.host,
+                    port=host_row.port,
+                )
                 host_payloads.append(
                     {
                         "host": host_row.host,
@@ -2388,6 +2479,7 @@ def run_ssh_scan_job(ssh_scan_id: int) -> None:
                     session.add(scan)
                     session.commit()
             _pop_ssh_retry(ssh_scan_id)
+            metrics_status = "failed"
             return
 
         results = scanner.scan_all(host_payloads)
@@ -2414,12 +2506,38 @@ def run_ssh_scan_job(ssh_scan_id: int) -> None:
                 else:
                     try:
                         inventory = SSHScanner.to_agent_inventory(res)
-                        persist_agent_findings(session, inventory, asset_id=host_row.asset_id, ingest_id=host_row.id)
+                        inventory_model = AgentInventory.model_validate(inventory)
+                        ingest = _persist_agent_ingest(
+                            session,
+                            inventory_model,
+                            asset_id=host_row.asset_id,
+                            agent_id=f"ssh-scan-{ssh_scan_id}-{host_row.id}",
+                            agent_version="ssh_scanner",
+                            raw_payload=json.dumps(
+                                {
+                                    "ssh_scan_id": ssh_scan_id,
+                                    "ssh_scan_host_id": host_row.id,
+                                    "inventory": inventory_model.model_dump(),
+                                }
+                            ),
+                        )
+                        persist_agent_findings(session, inventory_model, asset_id=host_row.asset_id, ingest_id=ingest.id)
                     except Exception as exc:  # do not fail scan if vuln ingestion fails
+                        errors = True
                         logger.exception("Failed to persist findings for SSH host %s: %s", host_row.host, exc)
+                log_event(
+                    logger,
+                    "ssh_host_completed",
+                    ssh_scan_id=ssh_scan_id,
+                    host_id=host_row.id,
+                    host=host_row.host,
+                    status=host_row.status,
+                    error=host_row.error,
+                )
 
             scan.completed_at = datetime.utcnow()
             scan.status = "completed_with_errors" if errors else "completed"
+            metrics_status = scan.status
             session.add(scan)
             session.add(
                 AuditLog(
@@ -2431,6 +2549,14 @@ def run_ssh_scan_job(ssh_scan_id: int) -> None:
                 )
             )
             session.commit()
+            log_event(
+                logger,
+                "ssh_scan_completed",
+                ssh_scan_id=ssh_scan_id,
+                status=scan.status,
+                host_count=len(hosts),
+                errors=int(errors),
+            )
     except Exception as exc:  # pylint: disable=broad-except
         logger.exception("SSH scan %s crashed unexpectedly: %s", ssh_scan_id, exc)
         with session_factory() as session:
@@ -2442,6 +2568,9 @@ def run_ssh_scan_job(ssh_scan_id: int) -> None:
                 session.add(scan)
                 session.commit()
         _pop_ssh_retry(ssh_scan_id)
+        metrics_status = "failed"
+    finally:
+        metrics.record_scan_finished("ssh", metrics_status, time.perf_counter() - started)
 
 
 def run_scan_job(scan_id: int) -> None:
@@ -2457,6 +2586,7 @@ def run_scan_job(scan_id: int) -> None:
                 logger.error("Scan %s vanished before start", scan_id)
                 metrics_status = "failed"
                 return
+            corr_id = scan.correlation_id
             if scan.status == "cancelled":
                 _record_scan_event(session, scan_id, "Scan cancelled before start")
                 metrics_status = "cancelled"
@@ -2466,9 +2596,18 @@ def run_scan_job(scan_id: int) -> None:
             session.add(scan)
             _record_scan_event(session, scan_id, "Scan started")
             session.commit()
+            log_event(
+                logger,
+                "scan_job_started",
+                scan_id=scan_id,
+                profile=scan.profile,
+                created_by=scan.created_by_user_id,
+                correlation_id=corr_id,
+            )
 
         with session_factory() as session:
             scan = session.get(Scan, scan_id)
+            corr_id = scan.correlation_id if scan else None
             asset_links = session.exec(
                 select(Asset)
                 .join(ScanTarget, ScanTarget.asset_id == Asset.id)
@@ -2506,6 +2645,16 @@ def run_scan_job(scan_id: int) -> None:
                     _record_scan_event(
                         session, scan_id, f"Scanning {asset.target} (attempt {status_row.attempts})"
                     )
+                    log_event(
+                        logger,
+                        "scan_asset_started",
+                        scan_id=scan_id,
+                        asset_id=asset.id,
+                        target=asset.target,
+                        attempt=status_row.attempts,
+                        profile=scan.profile,
+                        correlation_id=corr_id,
+                    )
 
                     if _is_scan_cancelled(session, scan_id):
                         status_row.status = "cancelled"
@@ -2539,6 +2688,15 @@ def run_scan_job(scan_id: int) -> None:
                         status_row.last_error = None
                         session.add(status_row)
                         session.commit()
+                        log_event(
+                            logger,
+                            "scan_asset_completed",
+                            scan_id=scan_id,
+                            asset_id=asset.id,
+                            target=asset.target,
+                            observations=len(observations),
+                            correlation_id=corr_id,
+                        )
                         _record_scan_event(
                             session, scan_id, f"Finished {asset.target} with {len(observations)} open services"
                         )
@@ -2561,6 +2719,16 @@ def run_scan_job(scan_id: int) -> None:
                         session.add(status_row)
                         session.commit()
                         _record_scan_event(session, scan_id, f"Failed {asset.target}: {exc}")
+                        log_event(
+                            logger,
+                            "scan_asset_failed",
+                            scan_id=scan_id,
+                            asset_id=asset.id,
+                            target=asset.target,
+                            attempt=status_row.attempts,
+                            error=str(exc),
+                            correlation_id=corr_id,
+                        )
                         if status_row.attempts <= settings.scan_retry_limit:
                             scan.retry_count += 1
                             session.add(scan)
@@ -2586,16 +2754,14 @@ def run_scan_job(scan_id: int) -> None:
             metrics_status = scan.status
             session.add(scan)
             _record_scan_event(session, scan_id, f"Scan finished with status {scan.status}")
-            logger.info(
-                "scan_summary %s",
-                json.dumps(
-                    {
-                        "scan_id": scan_id,
-                        "status": scan.status,
-                        "asset_count": len(asset_links),
-                        "asset_errors": asset_errors,
-                    }
-                ),
+            log_event(
+                logger,
+                "scan_summary",
+                scan_id=scan_id,
+                status=scan.status,
+                asset_count=len(asset_links),
+                asset_errors=asset_errors,
+                correlation_id=corr_id,
             )
             session.commit()
             _schedule_reenrich_scan(scan_id)

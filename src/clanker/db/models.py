@@ -66,6 +66,7 @@ class ScanBase(SQLModel):
     profile: str = Field(default="basic", max_length=50)
     notes: Optional[str] = None
     retry_count: int = Field(default=0)
+    correlation_id: Optional[str] = Field(default=None, max_length=64, index=True)
 
 
 class Scan(ScanBase, table=True):
@@ -178,6 +179,7 @@ class ScanEvent(SQLModel, table=True):
     scan_id: int = Field(foreign_key="scan.id")
     created_at: datetime = Field(default_factory=datetime.utcnow)
     message: str
+    correlation_id: Optional[str] = Field(default=None, max_length=64, index=True)
 
     scan: Optional[Scan] = Relationship(back_populates="events")
 
@@ -186,6 +188,7 @@ class ScanEventRead(SQLModel):
     id: int
     created_at: datetime
     message: str
+    correlation_id: Optional[str]
 
 
 class FindingBase(SQLModel):

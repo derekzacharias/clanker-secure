@@ -5,7 +5,7 @@
 - [x] Auth hardening: login rate limiting and auth event audit logging (login success/fail/throttled) — Labels: auth
 - [ ] Background job queue for scans with retries/cancellation hooks — Labels: core, infra
 - [x] Server-side pagination and filtering for /findings, /scans, /assets — Labels: api, core
-- [ ] Structured logs + basic metrics for scanner and API — Labels: infra
+- [x] Structured logs + basic metrics for scanner and API — Labels: infra
 - [x] Scheduled scans (cron/presets) — Labels: core, infra
 - [x] NVD enrichment Phase 2 (cache + CPE inference + enrichment job) — Labels: core, api, frontend, nmap-profile
 - [x] Credentialed scanning Linux agent MVP (collect distro/kernel/pkg inventory, config) — Labels: core, infra, auth

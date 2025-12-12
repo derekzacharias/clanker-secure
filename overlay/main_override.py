@@ -526,8 +526,8 @@ def _parse_days(raw: Optional[str]) -> List[int]:
                 except Exception:
                     continue
             return days
-        except Exception:
-            pass
+    except Exception:
+        pass
     return []
 
 

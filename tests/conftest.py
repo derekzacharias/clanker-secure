@@ -7,7 +7,8 @@ from pathlib import Path
 # Disable background NVD sync during tests to avoid long-running network work.
 os.environ.setdefault("NVD_SYNC_ENABLED", "0")
 # Use an isolated test database so we don't mutate local dev data.
-os.environ.setdefault("CLANKER_DATABASE_URL", "sqlite:///./clanker.test.db")
+os.environ.setdefault("DATABASE_URL", "sqlite:///./clanker.test.db")
+os.environ.setdefault("CLANKER_DATABASE_URL", os.environ["DATABASE_URL"])
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:

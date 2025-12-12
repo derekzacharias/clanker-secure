@@ -14,6 +14,8 @@ def _has_column(engine: Engine, table: str, column: str) -> bool:
 
 
 def add_column_if_missing(engine: Engine, table: str, column: str, ddl: str) -> None:
+    if not _table_exists(engine, table):
+        return
     if _has_column(engine, table, column):
         return
     with engine.connect() as connection:
@@ -70,6 +72,7 @@ def apply_migrations(engine: Engine) -> None:
     add_column_if_missing(engine, "asset", "ssh_look_for_keys", "INTEGER DEFAULT 0")
     add_column_if_missing(engine, "asset", "ssh_password", "TEXT")
     add_column_if_missing(engine, "scan", "retry_count", "INTEGER DEFAULT 0")
+    add_column_if_missing(engine, "scan", "correlation_id", "TEXT")
     add_column_if_missing(engine, "finding", "owner", "TEXT")
     add_column_if_missing(engine, "finding", "notes", "TEXT")
     add_column_if_missing(engine, "finding", "host_address", "TEXT")
@@ -105,6 +108,7 @@ def apply_migrations(engine: Engine) -> None:
             connection.commit()
     add_column_if_missing(engine, "finding_enrichment", "kev", "INTEGER DEFAULT 0")
     add_column_if_missing(engine, "finding_enrichment", "epss", "REAL")
+    add_column_if_missing(engine, "scan_event", "correlation_id", "TEXT")
     with engine.connect() as connection:
         connection.execute(
             text(

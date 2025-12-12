@@ -18,6 +18,7 @@ from clanker.core.types import ServiceObservation
 from clanker.db.models import Finding
 
 logger = logging.getLogger(__name__)
+_NVD_LAST_REQUEST: List[float] = []
 
 
 @dataclass
@@ -183,6 +184,36 @@ def _respect_min_interval(last_request: List[float], min_interval: float = 0.6) 
     if delta < min_interval:
         time.sleep(min_interval - delta)
     last_request.append(time.time())
+    if len(last_request) > 10:
+        del last_request[:-3]
+
+
+def fetch_nvd_cve(
+    cache: NvdCache, cve_id: str, min_interval: Optional[float] = None, force_refresh: bool = False
+) -> Optional[Dict[str, Any]]:
+    """
+    Fetch a single CVE from the NVD 2.0 API with local caching.
+    """
+    cache_key = f"cve-detail-{cve_id}"
+    cached = None if force_refresh else cache.read(cache_key)
+    if cached:
+        return cached
+
+    headers = {"User-Agent": "clanker/0.2"}
+    url = f"{settings.nvd_cve_api_base.rstrip('/')}/{cve_id}"
+    last_request = _NVD_LAST_REQUEST
+    try:
+        _respect_min_interval(last_request, min_interval or settings.nvd_api_min_interval_seconds)
+        with httpx.Client(timeout=30.0) as client:
+            resp = client.get(url, headers=headers)
+            if resp.status_code != 200:
+                return None
+            data = resp.json()
+            data["_cached_at"] = datetime.now(timezone.utc).isoformat()
+            cache.write(cache_key, data)
+            return data
+    except Exception:
+        return None
 
 
 def fetch_nvd_recent_feed(cache: NvdCache, min_interval: float = 0.6, force_refresh: bool = False) -> Optional[Dict[str, Any]]:
@@ -193,7 +224,7 @@ def fetch_nvd_recent_feed(cache: NvdCache, min_interval: float = 0.6, force_refr
 
     headers = {"User-Agent": "clanker/0.2"}
     url = settings.nvd_recent_feed_url
-    last_request: List[float] = []
+    last_request = _NVD_LAST_REQUEST
     try:
         _respect_min_interval(last_request, min_interval)
         with httpx.Client(timeout=30.0) as client:
@@ -239,6 +270,47 @@ def _extract_cvss_and_refs_from_feed(feed: Dict[str, Any]) -> Dict[str, Tuple[Op
         refs_obj = item.get("cve", {}).get("references", {}).get("reference_data", [])
         for r in refs_obj:
             url = r.get("url")
+            if url and url not in refs:
+                refs.append(url)
+            if len(refs) >= settings.nvd_max_reference_urls:
+                break
+        results[cve_id] = (score, vector, refs)
+    return results
+
+
+def _extract_cvss_and_refs_from_cve_detail(
+    cve_detail: Dict[str, Any]
+) -> Dict[str, Tuple[Optional[float], Optional[str], List[str]]]:
+    """
+    Parse the NVD 2.0 per-CVE response into a simplified mapping.
+    """
+    results: Dict[str, Tuple[Optional[float], Optional[str], List[str]]] = {}
+    vulns = cve_detail.get("vulnerabilities") or cve_detail.get("Vulnerabilities") or []
+    for item in vulns:
+        cve_obj = item.get("cve") or {}
+        cve_id = cve_obj.get("id") or cve_obj.get("CVE_data_meta", {}).get("ID")
+        if not cve_id:
+            continue
+        metrics_obj = cve_obj.get("metrics") or {}
+        score = None
+        vector = None
+        if "cvssMetricV31" in metrics_obj:
+            m31 = metrics_obj.get("cvssMetricV31") or []
+            if m31:
+                cvd = m31[0].get("cvssData", {})
+                score = cvd.get("baseScore")
+                vector = cvd.get("vectorString")
+        elif "cvssMetricV3" in metrics_obj:
+            m3 = metrics_obj.get("cvssMetricV3") or []
+            if m3:
+                cvd = m3[0].get("cvssData", {})
+                score = cvd.get("baseScore")
+                vector = cvd.get("vectorString")
+
+        refs: List[str] = []
+        refs_obj = cve_obj.get("references") or []
+        for ref in refs_obj:
+            url = ref.get("url") if isinstance(ref, dict) else None
             if url and url not in refs:
                 refs.append(url)
             if len(refs) >= settings.nvd_max_reference_urls:
@@ -366,6 +438,23 @@ def enrich_from_feed(
             cached = cache.read_entry(cve)
             if cached:
                 metric_candidates.append(cached)
+            # Fall back to per-CVE API if cache/feed miss
+            has_entry_for_cve = any(entry.cve_id == cve for entry in metric_candidates)
+            if not has_entry_for_cve:
+                detail = fetch_nvd_cve(cache, cve, force_refresh=force_refresh_cache)
+                if detail:
+                    extracted = _extract_cvss_and_refs_from_cve_detail(detail).get(cve)
+                    if extracted:
+                        entry = NvdCacheEntry(
+                            cve_id=cve,
+                            cvss_v31_base=extracted[0],
+                            cvss_vector=extracted[1],
+                            references=extracted[2],
+                            fetched_at=datetime.now(timezone.utc),
+                            source="nvd-api",
+                        )
+                        cache.write_entry(cve, entry)
+                        metric_candidates.append(entry)
 
         best_score, best_vector, refs_accum, source = _merge_metric_entries(metric_candidates)
         obs = (observations or {}).get(finding.id or -1) if observations else None
@@ -438,6 +527,7 @@ __all__ = [
     "enrich_from_feed",
     "enrich_cpe_only",
     "infer_cpe",
+    "fetch_nvd_cve",
     "sync_nvd_cache",
     "CpeGuess",
 ]

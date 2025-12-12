@@ -39,7 +39,6 @@ import {
   IconRefresh,
   IconRobot,
   IconSend,
-  IconShieldCheck,
   IconSparkles,
   IconTarget,
   IconPlugConnected,
@@ -371,6 +370,10 @@ function App() {
       setLoading(false);
     }
   };
+  const refreshAllRef = useRef(refreshAll);
+  useEffect(() => {
+    refreshAllRef.current = refreshAll;
+  }, [refreshAll]);
 
   useEffect(() => {
     refreshAll();
@@ -426,7 +429,9 @@ function App() {
 
 useEffect(() => {
   if (!autoRefresh) return undefined;
-  const interval = setInterval(refreshAll, 120000);
+  const interval = setInterval(() => {
+    refreshAllRef.current();
+  }, 30000);
   return () => clearInterval(interval);
 }, [autoRefresh]);
 
@@ -1708,35 +1713,28 @@ const handleLogout = async (): Promise<void> => {
                       Lifecycle snapshot
                     </Text>
                   </div>
-                  <Group gap="xs">
-                    {(scans.some((s) => s.status === 'running' || s.status === 'queued')) && (
-                      <Badge variant="filled" color="blue">Active</Badge>
-                    )}
-                    <ThemeIcon variant="light" color="blue">
-                      <IconShieldCheck size={18} />
-                    </ThemeIcon>
-                  </Group>
+                  {(scans.some((s) => s.status === 'running' || s.status === 'queued')) && (
+                    <Badge variant="filled" color="blue">Active</Badge>
+                  )}
                 </Group>
                 <ScrollArea h={SUMMARY_CARD_BODY_HEIGHT} offsetScrollbars>
                   <Stack gap="xs">
                     {Object.keys(scanStatusSummary).length === 0 && <Text c="dimmed">No scans yet.</Text>}
                     {Object.entries(scanStatusSummary).map(([status, count]) => (
-                      <Paper key={status} withBorder p="sm" radius="md" style={surfaces.glass}>
-                        <Stack gap={6}>
-                          <Group justify="space-between">
-                            <StatusBadge status={status} />
-                            <Text fw={600}>{count}</Text>
-                          </Group>
-                          <Progress
-                            className="animate-progress"
+                      <Stack key={status} gap={6} p="sm" style={{ background: 'transparent' }}>
+                        <Group justify="space-between">
+                          <StatusBadge status={status} />
+                          <Text fw={600}>{count}</Text>
+                        </Group>
+                        <Progress.Root size="lg" radius="xl" w="100%">
+                          <Progress.Section
                             value={Math.min(100, (count / Math.max(scans.length, 1)) * 100)}
-                            w="100%"
                             color={STATUS_COLORS[status] || 'gray'}
                             striped={status === 'running' || status === 'queued'}
                             animated={status === 'running' || status === 'queued'}
                           />
-                        </Stack>
-                      </Paper>
+                        </Progress.Root>
+                      </Stack>
                     ))}
                   </Stack>
                 </ScrollArea>
@@ -1761,16 +1759,6 @@ const handleLogout = async (): Promise<void> => {
                   </div>
                 </Group>
                 <Stack gap="md" align="stretch">
-                  <Stack gap={4} w="100%" align="stretch">
-                    <Text size="sm" c="gray.6" ta="right" w="100%">
-                      Total findings: {findings.length}
-                    </Text>
-                    <Progress.Root size="lg" radius="xl" w="100%">
-                      {severityProgressSections.map(({ value, color }, idx) => (
-                        <Progress.Section key={idx} value={value} color={color} />
-                      ))}
-                    </Progress.Root>
-                  </Stack>
                   <Stack gap="xs" w="100%">
                     {Object.entries(severitySummary)
                       .sort(([a], [b]) => a.localeCompare(b))
@@ -1780,6 +1768,13 @@ const handleLogout = async (): Promise<void> => {
                           <Text fw={600}>{count}</Text>
                         </Group>
                       ))}
+                  </Stack>
+                  <Stack gap={4} w="100%" align="stretch">
+                    <Progress.Root size="lg" radius="xl" w="100%">
+                      {severityProgressSections.map(({ value, color }, idx) => (
+                        <Progress.Section key={idx} value={value} color={color} />
+                      ))}
+                    </Progress.Root>
                   </Stack>
                 </Stack>
               </Card>
