@@ -71,3 +71,13 @@ This applies to frontend and backend edits to ensure the running app reflects th
 - Favor low-noise, high-signal findings
 - Always provide remediation context
 - Design for automation and API-first usage
+
+## Mandatory Capabilities
+
+The scanner must support:
+
+- Asset discovery across network, cloud, and ephemeral environments
+- CVE-based vulnerability detection with exploitability context
+- Cloud, container, and IaC awareness
+- Integration into CI/CD workflows
+- Machine-readable outputs for automation
