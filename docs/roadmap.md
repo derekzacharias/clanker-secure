@@ -1,8 +1,15 @@
-# Roadmap
+# Product Roadmap
 
-- Background job queue with retries and cancellation hooks.
-- Service fingerprinting across major protocols with version confidence.
-- CPE inference library with curated mappings and confidence scores.
-- Credentialed vuln detection Phase 2 (OVAL/OSV feeds, config checks, CPE upgrades).
-- CI/CD integrations for automation and gating.
+## MVP
+- Asset discovery
+- Network and host scanning
+- CVE ingestion
+- Risk-based scoring
+- REST API
 
+## Competitive v1
+- Cloud and container scanning
+- CI/CD integration
+- Workflow automation
+- Executive reporting
+- Distributed architecture
