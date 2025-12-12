@@ -1,5 +1,7 @@
 # Product Roadmap
 
+Purpose: Scope control
+
 ## MVP
 - Asset discovery
 - Network and host scanning

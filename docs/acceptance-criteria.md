@@ -1,5 +1,7 @@
 # Acceptance Criteria
 
+Purpose: Enforce requirements
+
 ## Authenticated Scanning
 - Valid credentials succeed
 - Invalid credentials fail gracefully

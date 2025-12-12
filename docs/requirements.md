@@ -1,5 +1,7 @@
 # Vulnerability Scanner Functional Requirements
 
+Purpose: Non-negotiable functional requirements
+
 ## 1. Core Scanning Capabilities (Required)
 
 The system SHALL support:

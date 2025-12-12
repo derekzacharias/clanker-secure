@@ -1,5 +1,7 @@
 # Requirement Traceability
 
+Purpose: Prevent drift
+
 | Requirement Section | Component          | Status  |
 |---------------------|--------------------|---------|
 | 1. Core Scanning    | Scanner Engine     | Planned |
