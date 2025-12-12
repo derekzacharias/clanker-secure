@@ -24,10 +24,11 @@ from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 from sqlalchemy import bindparam, text
 from sqlalchemy.orm import selectinload
-from sqlmodel import Session, func, select
+from sqlmodel import Session, func, select, delete
 
 from clanker.config import settings
-from clanker.core.agent_vuln_logic import persist_agent_findings
+from clanker.core.agent_vuln_logic import agent_rule_counts, persist_agent_findings, reload_agent_rules
+from clanker.core.coverage import load_rule_gaps, summarize_rule_gaps, stub_rule_from_gap
 from clanker.core.enrichment import enrich_from_feed, sync_nvd_cache
 from clanker.core.findings import build_findings
 from clanker.core.job_queue import QueueHooks, ScanJobQueue
@@ -439,6 +440,20 @@ def _safe_json(raw: Optional[str]):
     return raw
 
 
+def _extract_rule_source(finding: Finding) -> Optional[str]:
+    evidence = _safe_json(finding.evidence)
+    if isinstance(evidence, list):
+        for item in evidence:
+            if not isinstance(item, dict):
+                continue
+            data = item.get("data")
+            if isinstance(data, dict):
+                src = data.get("rule_source")
+                if isinstance(src, str) and src:
+                    return src
+    return None
+
+
 def _cvss_band(score: Optional[float]) -> str:
     if score is None:
         return "unscored"
@@ -451,6 +466,25 @@ def _cvss_band(score: Optional[float]) -> str:
     if score > 0:
         return "low"
     return "none"
+
+
+def _ensure_scanevent_correlation_id(session: Session) -> None:
+    """
+    SQLite deployments may lack the correlation_id column on scanevent if the DB predates the field.
+    Attempt a lightweight migration in-place to unblock deletes and queries.
+    """
+    try:
+        cols = session.exec(text("PRAGMA table_info(scanevent)")).all()
+    except Exception:
+        return
+    names = {str(row[1]) for row in cols if len(row) > 1}
+    if "correlation_id" in names:
+        return
+    try:
+        session.exec(text("ALTER TABLE scanevent ADD COLUMN correlation_id VARCHAR(64)"))
+        session.commit()
+    except Exception:
+        session.rollback()
 
 
 def _serialize_finding_export(finding: Finding, enrichment: Dict[str, Any]) -> Dict[str, Any]:
@@ -491,6 +525,7 @@ def _serialize_finding_export(finding: Finding, enrichment: Dict[str, Any]) -> D
         "cpe_confidence": enrichment.get("cpe_confidence"),
         "cvss_band": _cvss_band(score if isinstance(score, (float, int)) else None),
         "references": references,
+        "rule_source": _extract_rule_source(finding),
     }
 
 
@@ -983,6 +1018,12 @@ class AgentService(BaseModel):
     listen_address: Optional[str] = None
 
 
+class AgentFile(BaseModel):
+    path: str
+    mode: Optional[str] = Field(default=None, description="Octal mode representation (e.g., 0644)")
+    permissions: Optional[str] = Field(default=None, description="Alternate permissions field")
+
+
 class AgentInterface(BaseModel):
     name: str
     address: Optional[str] = None
@@ -1002,6 +1043,7 @@ class AgentInventory(BaseModel):
     services: List[AgentService] = Field(default_factory=list)
     interfaces: List[AgentInterface] = Field(default_factory=list)
     configs: Dict[str, str] = Field(default_factory=dict)
+    files: List[AgentFile] = Field(default_factory=list)
     collector_errors: Dict[str, str] = Field(default_factory=dict)
 
 
@@ -1042,6 +1084,7 @@ def _persist_agent_ingest(
         service_count=len(inv.services),
         interface_count=len(inv.interfaces),
         config_count=len(inv.configs),
+        # file_count intentionally omitted from schema to avoid schema drift
         raw_payload=payload,
     )
     session.add(ingest)
@@ -1052,6 +1095,14 @@ def _persist_agent_ingest(
 class AgentIngestResponse(BaseModel):
     ingest_id: int
     status: str
+
+
+class AgentRuleReloadResponse(BaseModel):
+    status: str
+    packages: int
+    services: int
+    kernels: int
+    path: str
 
 
 class SchedulePayload(BaseModel):
@@ -1073,6 +1124,107 @@ class ScheduleRead(BaseModel):
     active: bool
     created_at: str
     last_run_at: Optional[str]
+
+
+class RuleGapExample(BaseModel):
+    host: Optional[str] = None
+    service_version: Optional[str] = None
+    fingerprint: Optional[Dict[str, Any]] = None
+    reason: Optional[str] = None
+    evidence_summary: Optional[str] = None
+
+
+class RuleGapBucket(BaseModel):
+    protocol: str
+    port: Optional[int] = None
+    service_name: str
+    count: int
+    examples: List[RuleGapExample] = Field(default_factory=list)
+    stub_rule: Dict[str, Any]
+
+
+class RuleGapRaw(BaseModel):
+    host: Optional[str] = None
+    port: Optional[int] = None
+    protocol: Optional[str] = None
+    service_name: Optional[str] = None
+    service_version: Optional[str] = None
+    fingerprint: Optional[Dict[str, Any]] = None
+    evidence_summary: Optional[str] = None
+    reason: Optional[str] = None
+
+
+class RuleGapSummaryResponse(BaseModel):
+    total: int
+    buckets: List[RuleGapBucket]
+
+
+class RuleGapRawResponse(BaseModel):
+    total: int
+    items: List[RuleGapRaw]
+
+
+class FindingReadWithSource(FindingRead):
+    rule_source: Optional[str] = None
+
+
+def _load_rule_gap_entries() -> List[Dict[str, Any]]:
+    try:
+        return load_rule_gaps()
+    except Exception:
+        return []
+
+
+@app.get(
+    "/coverage/rule_gaps/summary",
+    response_model=RuleGapSummaryResponse,
+    dependencies=[Depends(require_roles("admin", "operator"))],
+)
+def summarize_rule_gaps_endpoint() -> RuleGapSummaryResponse:
+    entries = _load_rule_gap_entries()
+    summary = summarize_rule_gaps(entries)
+    buckets: List[RuleGapBucket] = []
+    for bucket in summary:
+        stub = stub_rule_from_gap(bucket)
+        buckets.append(
+            RuleGapBucket(
+                protocol=bucket.get("protocol", "unknown"),
+                port=bucket.get("port"),
+                service_name=bucket.get("service_name") or "unknown",
+                count=bucket.get("count", 0),
+                examples=[RuleGapExample(**example) for example in bucket.get("examples", [])],
+                stub_rule=stub,
+            )
+        )
+    return RuleGapSummaryResponse(total=len(entries), buckets=buckets)
+
+
+@app.get(
+    "/coverage/rule_gaps/raw",
+    response_model=RuleGapRawResponse,
+    dependencies=[Depends(require_roles("admin", "operator"))],
+)
+def list_rule_gaps_raw(
+    limit: int = Query(default=200, ge=1, le=2000),
+    offset: int = Query(default=0, ge=0),
+) -> RuleGapRawResponse:
+    entries = _load_rule_gap_entries()
+    window = entries[offset : offset + limit] if entries else []
+    return RuleGapRawResponse(total=len(entries), items=[RuleGapRaw(**item) for item in window])
+
+
+@app.delete(
+    "/coverage/rule_gaps",
+    response_model=Dict[str, str],
+    dependencies=[Depends(require_roles("admin"))],
+)
+def clear_rule_gap_log() -> Dict[str, str]:
+    path = settings.rule_gap_path
+    try:
+        path.write_text("")
+    except Exception:
+        raise HTTPException(status_code=500, detail="Failed to clear rule gap log")
+    return {"status": "cleared", "path": str(path)}
 
 
 def _client_ip(req: Request) -> str:
@@ -1479,6 +1631,23 @@ def ingest_agent_inventory(
     return AgentIngestResponse(ingest_id=ingest.id, status="accepted")
 
 
+@app.post(
+    "/agents/rules/reload",
+    response_model=AgentRuleReloadResponse,
+    dependencies=[Depends(require_roles("admin"))],
+)
+def reload_agent_rules_endpoint() -> AgentRuleReloadResponse:
+    reload_agent_rules()
+    pkg_count, svc_count, kernel_count = agent_rule_counts()
+    return AgentRuleReloadResponse(
+        status="reloaded",
+        packages=pkg_count,
+        services=svc_count,
+        kernels=kernel_count,
+        path=str(settings.agent_advisories_path),
+    )
+
+
 @app.post("/scans", response_model=ScanRead, status_code=201)
 def create_scan(
     payload: ScanCreate,
@@ -1648,15 +1817,11 @@ def delete_scan(scan_id: int, session: Session = Depends(session_dep)) -> Respon
     if not scan:
         raise HTTPException(status_code=404, detail="Scan not found")
 
-    for finding in session.exec(select(Finding).where(Finding.scan_id == scan_id)).all():
-        session.delete(finding)
-    for status in session.exec(select(ScanAssetStatus).where(ScanAssetStatus.scan_id == scan_id)).all():
-        session.delete(status)
-    for event in session.exec(select(ScanEvent).where(ScanEvent.scan_id == scan_id)).all():
-        session.delete(event)
-    for link in session.exec(select(ScanTarget).where(ScanTarget.scan_id == scan_id)).all():
-        session.delete(link)
-
+    _ensure_scanevent_correlation_id(session)
+    session.exec(delete(Finding).where(Finding.scan_id == scan_id))
+    session.exec(delete(ScanAssetStatus).where(ScanAssetStatus.scan_id == scan_id))
+    session.exec(delete(ScanEvent).where(ScanEvent.scan_id == scan_id))
+    session.exec(delete(ScanTarget).where(ScanTarget.scan_id == scan_id))
     session.delete(scan)
     session.commit()
     return Response(status_code=204)
@@ -2066,7 +2231,7 @@ def stream_scan_events(
     return StreamingResponse(event_gen(), media_type="text/event-stream", headers=headers)
 
 
-@app.get("/findings", response_model=List[FindingRead])
+@app.get("/findings", response_model=List[FindingReadWithSource])
 def list_findings(
     response: Response,
     scan_id: Optional[int] = Query(default=None),
@@ -2083,7 +2248,10 @@ def list_findings(
     rows, total = _paginate_query(session, query.order_by(Finding.detected_at.desc()), limit, offset)
     response.headers["X-Total-Count"] = str(total)
     response.headers["X-CVSS-Bands"] = json.dumps(_aggregate_cvss_bands(session, where_sql, params))
-    return rows
+    return [
+        FindingReadWithSource(**row.model_dump(), rule_source=_extract_rule_source(row))
+        for row in rows
+    ]
 
 
 @app.get("/reports/findings/export")
@@ -2144,6 +2312,7 @@ def export_findings_report(
             "cvss_band",
             "cve_ids",
             "references",
+            "rule_source",
         ]
         writer = csv.DictWriter(output, fieldnames=fieldnames)
         writer.writeheader()

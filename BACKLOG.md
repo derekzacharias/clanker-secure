@@ -14,7 +14,8 @@
 - [ ] Service fingerprinting + protocol parsers (HTTP/TLS/SSH/SMB/SQL/SNMP/RDP) with version confidence and structured evidence — Labels: core, nmap-profile
 - [ ] CPE inference library + curated mapping file with confidence scores and source tags — Labels: core, api
 - [ ] Evidence grading, deduping, and “why this finding” traces — Labels: core, ui
-- [ ] Rule coverage audit (unmatched services/banners with suggested rule stubs and fixtures) — Labels: core, tests
+- [x] Rule coverage audit (unmatched services/banners with suggested rule stubs and fixtures) — Labels: core, tests
+- [ ] Credentialed vuln detection Phase 2: expand package advisories + distro OVAL/OSV feeds, service-version rules, kernel/OS release checks, config-level findings, and CPE inference upgrades for SSH scans — Labels: core, agent, vuln-detection
 
 Note: This backlog excludes features already present in the codebase (e.g., Nmap-based unauthenticated scanning, basic OS/service fingerprinting, basic rule-driven CVE mapping, assets/scans/findings UI). Items below are not implemented yet.
 

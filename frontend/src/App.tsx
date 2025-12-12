@@ -105,6 +105,7 @@ interface Finding {
   cvss_v31_base?: number | null;
   cvss_vector?: string | null;
   references?: string[] | null;
+  rule_source?: string | null;
 }
 
 interface FindingEnrichment {
@@ -123,6 +124,39 @@ interface Integration {
   lastSync?: string | null;
   mode?: string | null;
   notes?: string | null;
+}
+
+interface RuleGapExample {
+  host?: string | null;
+  service_version?: string | null;
+  fingerprint?: Record<string, unknown> | null;
+  reason?: string | null;
+  evidence_summary?: string | null;
+}
+
+interface RuleGapBucket {
+  protocol: string;
+  port?: number | null;
+  service_name: string;
+  count: number;
+  examples: RuleGapExample[];
+  stub_rule: Record<string, unknown>;
+}
+
+interface RuleGapSummary {
+  total: number;
+  buckets: RuleGapBucket[];
+}
+
+interface RuleGapRawEntry {
+  host?: string | null;
+  port?: number | null;
+  protocol?: string | null;
+  service_name?: string | null;
+  service_version?: string | null;
+  fingerprint?: Record<string, unknown> | null;
+  evidence_summary?: string | null;
+  reason?: string | null;
 }
 
 const SCAN_PROFILES = [
@@ -308,7 +342,7 @@ function App() {
   const [assetsOffset, setAssetsOffset] = useState(0);
   const [scansOffset, setScansOffset] = useState(0);
   const [findingsOffset, setFindingsOffset] = useState(0);
-  const [activeTab, setActiveTab] = useState<'assets' | 'scans' | 'findings' | 'schedules' | 'integrations' | 'reports'>('assets');
+  const [activeTab, setActiveTab] = useState<'assets' | 'scans' | 'findings' | 'coverage' | 'schedules' | 'integrations' | 'reports'>('assets');
   const [loginOpen, setLoginOpen] = useState<boolean>(false);
   const [loginEmail, setLoginEmail] = useState<string>('');
   const [loginPassword, setLoginPassword] = useState<string>('');
@@ -348,6 +382,10 @@ function App() {
   });
   const [scheduleTimesText, setScheduleTimesText] = useState<string>('09:00');
   const [scheduleError, setScheduleError] = useState<string>('');
+  const [ruleGapSummary, setRuleGapSummary] = useState<RuleGapSummary | null>(null);
+  const [ruleGapRaw, setRuleGapRaw] = useState<RuleGapRawEntry[]>([]);
+  const [ruleGapLoading, setRuleGapLoading] = useState<boolean>(false);
+  const [ruleReloading, setRuleReloading] = useState<boolean>(false);
   const findingsFetchedOnce = useRef(false);
 
   const refreshAll = async () => {
@@ -1186,6 +1224,23 @@ const handleLogout = async (): Promise<void> => {
     }
   };
 
+  const reloadAgentRules = async () => {
+    if (!currentUser || currentUser.role !== 'admin') return;
+    setRuleReloading(true);
+    try {
+      const res = await api.post<{ status: string; packages: number; services: number; kernels: number; path: string }>('/agents/rules/reload');
+      notifications.show({
+        color: 'teal',
+        title: 'Agent advisories reloaded',
+        message: `Loaded ${res.data.packages} package, ${res.data.services} service, ${res.data.kernels} kernel rules`,
+      });
+    } catch (e) {
+      notifications.show({ color: 'red', title: 'Failed to reload advisories', message: `${e}` });
+    } finally {
+      setRuleReloading(false);
+    }
+  };
+
   const parseAssetIds = (raw: unknown): number[] => {
     if (Array.isArray(raw)) {
       return raw.map((v) => parseInt(String(v), 10)).filter((v) => !Number.isNaN(v));
@@ -1225,6 +1280,48 @@ const handleLogout = async (): Promise<void> => {
   useEffect(() => {
     if (activeTab === 'schedules') loadSchedules();
   }, [activeTab, currentUser?.role]);
+
+  useEffect(() => {
+    if (activeTab === 'coverage' && canWrite) {
+      loadRuleGaps();
+    }
+    if (activeTab === 'coverage' && !canWrite) {
+      setActiveTab('assets');
+    }
+  }, [activeTab, canWrite]);
+ 
+  const loadRuleGaps = async () => {
+    if (!canWrite) return;
+    setRuleGapLoading(true);
+    try {
+      const [summaryRes, rawRes] = await Promise.all([
+        api.get<RuleGapSummary>('/coverage/rule_gaps/summary'),
+        api.get<{ total: number; items: RuleGapRawEntry[] }>('/coverage/rule_gaps/raw', { params: { limit: 400, offset: 0 } }),
+      ]);
+      setRuleGapSummary(summaryRes.data);
+      setRuleGapRaw(rawRes.data.items || []);
+    } catch (e) {
+      notifications.show({ color: 'red', title: 'Failed to load coverage gaps', message: `${e}` });
+    } finally {
+      setRuleGapLoading(false);
+    }
+  };
+
+  const handleClearRuleGaps = async () => {
+    if (!currentUser || currentUser.role !== 'admin') return;
+    if (!window.confirm('Clear captured rule gaps? This cannot be undone.')) return;
+    setRuleGapLoading(true);
+    try {
+      await api.delete('/coverage/rule_gaps');
+      setRuleGapSummary({ total: 0, buckets: [] });
+      setRuleGapRaw([]);
+      notifications.show({ color: 'green', title: 'Rule gaps cleared', message: 'Log file emptied' });
+    } catch (e) {
+      notifications.show({ color: 'red', title: 'Failed to clear rule gaps', message: `${e}` });
+    } finally {
+      setRuleGapLoading(false);
+    }
+  };
 
   
 
@@ -1786,10 +1883,144 @@ const handleLogout = async (): Promise<void> => {
               <Tabs.Tab value="assets">Assets</Tabs.Tab>
               <Tabs.Tab value="scans">Scans</Tabs.Tab>
               <Tabs.Tab value="findings">Findings</Tabs.Tab>
+              {canWrite && <Tabs.Tab value="coverage">Coverage</Tabs.Tab>}
               {currentUser?.role === 'admin' && <Tabs.Tab value="schedules">Schedules</Tabs.Tab>}
               <Tabs.Tab value="integrations">Integrations</Tabs.Tab>
               <Tabs.Tab value="reports">Reports</Tabs.Tab>
             </Tabs.List>
+
+            <Tabs.Panel value="coverage" pt="sm">
+              <Card padding="lg" radius="md" shadow="xl" style={colorScheme === 'light' ? (surfaces.tile as React.CSSProperties) : glassStyles}>
+                <Stack gap="md">
+                  <Group justify="space-between" align="flex-start">
+                    <div>
+                      <Title order={4}>Rule coverage gaps</Title>
+                      <Text c="dimmed" size="sm">Unmatched services/banners captured during scans with suggested rule stubs.</Text>
+                    </div>
+                    <Group gap="xs">
+                      {currentUser?.role === 'admin' && (
+                        <Button variant="light" color="red" onClick={handleClearRuleGaps} loading={ruleGapLoading}>
+                          Clear log
+                        </Button>
+                      )}
+                      <Button variant="light" onClick={loadRuleGaps} loading={ruleGapLoading} leftSection={<IconRefresh size={16} />}>
+                        Refresh
+                      </Button>
+                    </Group>
+                  </Group>
+                  {ruleGapLoading && (
+                    <Group justify="center">
+                      <Loader />
+                    </Group>
+                  )}
+                  {!ruleGapLoading && (
+                    <Stack gap="md">
+                      <Group gap="sm">
+                        <Badge color="blue" variant="light">Captured: {ruleGapSummary?.total ?? 0}</Badge>
+                        <Badge color="violet" variant="light">Buckets: {ruleGapSummary?.buckets?.length ?? 0}</Badge>
+                      </Group>
+                      {ruleGapSummary?.buckets?.length ? (
+                        <SimpleGrid cols={{ base: 1, md: 2 }} spacing="md">
+                          {ruleGapSummary.buckets.map((bucket) => (
+                            <Paper key={`${bucket.protocol}-${bucket.port ?? 'any'}-${bucket.service_name}`} withBorder p="md" radius="md" style={colorScheme === 'light' ? (surfaces.tile as React.CSSProperties) : glassStyles}>
+                              <Group justify="space-between" mb="xs">
+                                <div>
+                                  <Group gap="xs">
+                                    <Badge variant="light" color="indigo">{bucket.protocol.toUpperCase()}</Badge>
+                                    <Badge variant="outline" color="gray">{bucket.port ?? 'any'}</Badge>
+                                    <Text fw={600}>{bucket.service_name}</Text>
+                                  </Group>
+                                  <Text size="sm" c="dimmed">Occurrences: {bucket.count}</Text>
+                                </div>
+                                <Badge color="teal" variant="light">Stub ready</Badge>
+                              </Group>
+                              <Stack gap="xs">
+                                <Text size="sm" fw={600}>Stub rule</Text>
+                                <Text component="pre" style={{ whiteSpace: 'pre-wrap', fontFamily: 'SFMono-Regular, Menlo, Monaco, Consolas, monospace', fontSize: '0.8rem' }}>
+                                  {JSON.stringify(bucket.stub_rule, null, 2)}
+                                </Text>
+                                {bucket.examples.length > 0 && (
+                                  <Stack gap={6}>
+                                    <Text size="sm" fw={600}>Examples</Text>
+                                    {bucket.examples.slice(0, 3).map((ex, idx) => (
+                                      <Paper key={idx} withBorder p="sm" radius="md">
+                                        <Group gap="xs">
+                                          <Badge variant="light" color="blue">{ex.host ?? 'unknown host'}</Badge>
+                                          {ex.service_version && <Badge variant="outline">{ex.service_version}</Badge>}
+                                          {ex.reason && <Badge variant="outline" color="gray">{ex.reason}</Badge>}
+                                        </Group>
+                                        {ex.evidence_summary && <Text size="sm" c="dimmed">{ex.evidence_summary}</Text>}
+                                      </Paper>
+                                    ))}
+                                  </Stack>
+                                )}
+                              </Stack>
+                            </Paper>
+                          ))}
+                        </SimpleGrid>
+                      ) : (
+                        <Text c="dimmed">No unmatched services captured yet.</Text>
+                      )}
+                      <Card padding="md" radius="md" style={surfaces.glass} withBorder>
+                        <Group justify="space-between" mb="sm">
+                          <div>
+                            <Text fw={600}>Raw entries</Text>
+                            <Text size="sm" c="dimmed">First 400 captured lines</Text>
+                          </div>
+                          <Button variant="light" size="xs" onClick={loadRuleGaps} loading={ruleGapLoading}>
+                            Reload
+                          </Button>
+                        </Group>
+                        <ScrollArea h={isMobile ? TABLE_HEIGHT_MOBILE : TABLE_HEIGHT} offsetScrollbars>
+                          <Table striped highlightOnHover>
+                            <Table.Thead>
+                              <Table.Tr>
+                                <Table.Th>Host</Table.Th>
+                                <Table.Th>Service</Table.Th>
+                                <Table.Th>Port</Table.Th>
+                                <Table.Th>Evidence</Table.Th>
+                              </Table.Tr>
+                            </Table.Thead>
+                            <Table.Tbody>
+                              {ruleGapRaw.map((row, idx) => (
+                                <Table.Tr key={`${row.host}-${row.port}-${idx}`}>
+                                  <Table.Td>
+                                    <Stack gap={2}>
+                                      <Text fw={600}>{row.host ?? 'unknown'}</Text>
+                                      <Text size="xs" c="dimmed">{row.protocol?.toUpperCase() ?? 'N/A'}</Text>
+                                    </Stack>
+                                  </Table.Td>
+                                  <Table.Td>
+                                    <Stack gap={2}>
+                                      <Text>{row.service_name ?? 'unknown'}</Text>
+                                      {row.service_version && <Text size="sm" c="dimmed">{row.service_version}</Text>}
+                                    </Stack>
+                                  </Table.Td>
+                                  <Table.Td>{row.port ?? 'n/a'}</Table.Td>
+                                  <Table.Td>
+                                    <Stack gap={4}>
+                                      {row.evidence_summary && <Text size="sm">{row.evidence_summary}</Text>}
+                                      {row.reason && <Badge variant="light" color="gray">{row.reason}</Badge>}
+                                    </Stack>
+                                  </Table.Td>
+                                </Table.Tr>
+                              ))}
+                              {ruleGapRaw.length === 0 && (
+                                <Table.Tr>
+                                  <Table.Td colSpan={4}>
+                                    <Text c="dimmed">No raw gap entries available.</Text>
+                                  </Table.Td>
+                                </Table.Tr>
+                              )}
+                            </Table.Tbody>
+                          </Table>
+                        </ScrollArea>
+                      </Card>
+                    </Stack>
+                  )}
+                </Stack>
+              </Card>
+            </Tabs.Panel>
 
             <Tabs.Panel value="integrations" pt="sm">
               <Card padding="lg" radius="md" shadow="xl" style={colorScheme === 'light' ? (surfaces.tile as React.CSSProperties) : glassStyles}>
@@ -2153,6 +2384,11 @@ const handleLogout = async (): Promise<void> => {
                     <Group gap="xs" wrap="wrap">
                       <Button variant="light" onClick={() => exportFindings('csv')}>Export CSV</Button>
                       <Button variant="light" onClick={() => exportFindings('json')}>Export JSON</Button>
+                      {currentUser?.role === 'admin' && (
+                        <Button variant="outline" color="indigo" loading={ruleReloading} onClick={reloadAgentRules}>
+                          Reload agent advisories
+                        </Button>
+                      )}
                     </Group>
                   </Group>
                 </Stack>
@@ -2356,6 +2592,9 @@ const handleLogout = async (): Promise<void> => {
               Host: {findingGroupIndex.get(selectedFinding.id)?.hostLabel || selectedFinding.host_address || 'unknown'}
             </Text>
             <Text>Port: {selectedFinding.port ? `${selectedFinding.port}/${selectedFinding.protocol || 'tcp'}` : '-'}</Text>
+            {selectedFinding.rule_source && (
+              <Badge color="gray" variant="light">Rule source: {selectedFinding.rule_source}</Badge>
+            )}
             {selectedFinding.description && (
               <Paper p="sm" withBorder>
                 <Text size="sm">{selectedFinding.description}</Text>

@@ -89,6 +89,8 @@ def _configure_cors_from_env() -> None:
 
 _configure_cors_from_env()
 queue_logger = logging.getLogger("clanker.queue")
+SCHEDULER_ENABLED = os.getenv("CLANKER_SCHEDULER_ENABLED", "0").lower() in {"1", "true", "yes", "y"}
+QUEUE_WORKER_ENABLED = os.getenv("CLANKER_QUEUE_WORKER_ENABLED", "1").lower() in {"1", "true", "yes", "y"}
 
 PRESET_CRONS = {
     "hourly": "0 * * * *",
@@ -652,6 +654,12 @@ def _scheduler_ticker() -> None:
 
 @app.on_event("startup")
 def _start_scheduler() -> None:
+    if not SCHEDULER_ENABLED:
+        queue_logger.info(
+            "scheduler_disabled",
+            extra={"component": "scheduler", "event": "disabled", "reason": "CLANKER_SCHEDULER_ENABLED=0"},
+        )
+        return
     t = threading.Thread(target=_scheduler_ticker, name="scheduler-ticker", daemon=True)
     t.start()
 
@@ -697,6 +705,12 @@ def _scan_queue_worker() -> None:
 
 @app.on_event("startup")
 def _start_scan_queue() -> None:
+    if not QUEUE_WORKER_ENABLED:
+        queue_logger.info(
+            "queue_worker_disabled",
+            extra={"component": "queue_worker", "event": "disabled", "reason": "CLANKER_QUEUE_WORKER_ENABLED=0"},
+        )
+        return
     t = threading.Thread(target=_scan_queue_worker, name="scan-queue-worker", daemon=True)
     t.start()
 

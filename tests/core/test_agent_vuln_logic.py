@@ -1,6 +1,9 @@
+import json
+from pathlib import Path
 from types import SimpleNamespace
 
-from clanker.core.agent_vuln_logic import AgentFindingCandidate, evaluate_inventory
+from clanker.config import settings
+from clanker.core.agent_vuln_logic import AgentFindingCandidate, evaluate_inventory, reload_agent_rules
 
 
 def _build_inventory() -> SimpleNamespace:
@@ -47,3 +50,73 @@ def test_candidate_structure():
     assert isinstance(finding, AgentFindingCandidate)
     assert finding.evidence_summary
     assert isinstance(finding.evidence, list)
+
+
+def test_external_advisory_loader(monkeypatch, tmp_path):
+    advisory_path = Path(tmp_path / "agent_advisories.json")
+    payload = {
+        "package_advisories": [
+            {
+                "rule_id": "AGENT-PKG-EXTERNAL-TEST",
+                "package": "custompkg",
+                "fixed_version": "2.0",
+                "cve_ids": ["CVE-TEST-0001"],
+                "severity": "high",
+                "description": "External advisory test",
+                "source": "test-suite",
+            }
+        ]
+    }
+    advisory_path.write_text(json.dumps(payload), encoding="utf-8")
+    monkeypatch.setattr(settings, "agent_advisories_path", advisory_path)
+    reload_agent_rules(advisory_path)
+
+    inventory = SimpleNamespace(
+        host_identifier="agent-host-1",
+        hostname="agent-host-1",
+        distro="ubuntu",
+        packages=[{"name": "custompkg", "version": "1.0"}],
+        services=[],
+        configs={},
+    )
+    findings = evaluate_inventory(inventory)
+    rule_ids = {f.rule_id for f in findings}
+    assert "AGENT-PKG-EXTERNAL-TEST" in rule_ids
+    assert any(ev for f in findings for ev in f.evidence if ev["data"].get("rule_source") == "test-suite")
+
+
+def test_external_advisory_reload(monkeypatch, tmp_path):
+    advisory_path = Path(tmp_path / "agent_advisories.json")
+    payload = {
+        "package_advisories": [
+            {
+                "rule_id": "AGENT-PKG-RELOAD-TEST",
+                "package": "reloadpkg",
+                "fixed_version": "1.0",
+                "cve_ids": ["CVE-RELOAD-0001"],
+                "severity": "medium",
+                "description": "Initial threshold",
+                "source": "test-suite",
+            }
+        ]
+    }
+    advisory_path.write_text(json.dumps(payload), encoding="utf-8")
+    monkeypatch.setattr(settings, "agent_advisories_path", advisory_path)
+    reload_agent_rules(advisory_path)
+
+    inventory = SimpleNamespace(
+        host_identifier="agent-host-1",
+        hostname="agent-host-1",
+        distro="ubuntu",
+        packages=[{"name": "reloadpkg", "version": "1.5"}],
+        services=[],
+        configs={},
+    )
+    findings = evaluate_inventory(inventory)
+    assert "AGENT-PKG-RELOAD-TEST" not in {f.rule_id for f in findings}
+
+    payload["package_advisories"][0]["fixed_version"] = "2.0"
+    advisory_path.write_text(json.dumps(payload), encoding="utf-8")
+    reload_agent_rules(advisory_path)
+    findings_after = evaluate_inventory(inventory)
+    assert "AGENT-PKG-RELOAD-TEST" in {f.rule_id for f in findings_after}

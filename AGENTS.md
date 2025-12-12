@@ -63,3 +63,11 @@ This applies to frontend and backend edits to ensure the running app reflects th
 ## Additional Docs
 - See `docs/GETTING_STARTED.md` for quick start and seeding an admin.
 - See `docs/AUTH_RBAC.md` for auth/roles details and API examples.
+
+## Core Principles
+
+- Prioritize risk, not raw CVE count
+- Prefer authenticated scanning over unauthenticated when possible
+- Favor low-noise, high-signal findings
+- Always provide remediation context
+- Design for automation and API-first usage

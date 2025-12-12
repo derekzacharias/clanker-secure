@@ -26,9 +26,11 @@ class Settings(BaseSettings):
     fingerprint_timeout_seconds: float = Field(default=3.0)
     fingerprint_http_follow_redirects: bool = Field(default=False)
     rule_gap_path: Path = Field(default=Path("./scan_artifacts/rule_gaps.jsonl"))
+    agent_advisories_path: Path = Field(default=Path("./data/agent_advisories.json"))
 
 
 settings = Settings()
 settings.xml_output_dir.mkdir(parents=True, exist_ok=True)
 settings.nvd_cache_dir.mkdir(parents=True, exist_ok=True)
 settings.rule_gap_path.parent.mkdir(parents=True, exist_ok=True)
+settings.agent_advisories_path.parent.mkdir(parents=True, exist_ok=True)

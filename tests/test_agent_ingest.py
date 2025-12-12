@@ -125,4 +125,16 @@ def test_agent_ingest_creates_findings_from_inventory():
         assert findings, "Expected findings persisted from agent inventory"
         assert any(f.rule_id and f.rule_id.startswith("AGENT-") for f in findings)
         assert any(f.evidence for f in findings)
-
+        sources = []
+        for f in findings:
+            try:
+                ev = json.loads(f.evidence or "[]")
+            except Exception:
+                ev = []
+            for item in ev:
+                if isinstance(item, dict):
+                    data = item.get("data") or {}
+                    src = data.get("rule_source")
+                    if isinstance(src, str):
+                        sources.append(src)
+        assert sources, "Expected rule_source metadata in agent findings evidence"

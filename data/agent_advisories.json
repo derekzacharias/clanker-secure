@@ -1,0 +1,89 @@
+{
+  "package_advisories": [
+    {
+      "rule_id": "AGENT-PKG-OPENSSL-2023-0286",
+      "package": "openssl",
+      "fixed_version": "1.1.1t",
+      "cve_ids": ["CVE-2023-0286"],
+      "severity": "high",
+      "description": "OpenSSL X.509 NameConstraints validation OOB read; upgrade to 1.1.1t or later.",
+      "source": "oval/usn"
+    },
+    {
+      "rule_id": "AGENT-PKG-SUDO-2021-23239",
+      "package": "sudo",
+      "fixed_version": "1.9.5p2",
+      "cve_ids": ["CVE-2021-23239"],
+      "severity": "medium",
+      "description": "Sudo privilege escalation via chown-based race; fixed in 1.9.5p2.",
+      "source": "oval"
+    },
+    {
+      "rule_id": "AGENT-PKG-NGINX-2021-23017",
+      "package": "nginx",
+      "fixed_version": "1.20.2",
+      "cve_ids": ["CVE-2021-23017"],
+      "severity": "medium",
+      "description": "nginx resolver vulnerability prior to 1.20.2; patch to the fixed version.",
+      "source": "oval"
+    },
+    {
+      "rule_id": "AGENT-PKG-ALPINE-BUSYBOX-2022-28391",
+      "package": "busybox",
+      "fixed_version": "1.35.0",
+      "cve_ids": ["CVE-2022-28391"],
+      "severity": "medium",
+      "description": "BusyBox iQoS DoS in tar applet; upgrade to 1.35.0 or later.",
+      "source": "alpine-secdb",
+      "distro_hint": "alpine"
+    },
+    {
+      "rule_id": "AGENT-PKG-OPENSSH-2024-6387",
+      "package": "openssh-server",
+      "fixed_version": "9.7p2",
+      "cve_ids": ["CVE-2024-6387"],
+      "severity": "critical",
+      "description": "OpenSSH regreSSHion RCE in sshd signal handler; upgrade to 9.7p2+ or vendor-patched.",
+      "source": "vendor-advisory"
+    }
+  ],
+  "service_rules": [
+    {
+      "rule_id": "AGENT-SVC-APACHE-2-4-52",
+      "names": ["apache", "apache2", "httpd"],
+      "version_lt": "2.4.52",
+      "cve_ids": ["CVE-2021-44790"],
+      "severity": "high",
+      "description": "Apache HTTP Server mod_lua buffer overflow; patch to 2.4.52 or later.",
+      "cpe_template": "cpe:2.3:a:apache:http_server:{version}:*:*:*:*:*:*:*"
+    },
+    {
+      "rule_id": "AGENT-SVC-POSTGRES-13-4",
+      "names": ["postgres", "postgresql"],
+      "version_lt": "13.4",
+      "cve_ids": ["CVE-2021-3677"],
+      "severity": "medium",
+      "description": "PostgreSQL prior to 13.4: extension script privilege escalation; upgrade to 13.4+.",
+      "cpe_template": "cpe:2.3:a:postgresql:postgresql:{version}:*:*:*:*:*:*:*"
+    },
+    {
+      "rule_id": "AGENT-SVC-REDIS-6-0-16",
+      "names": ["redis", "redis-server"],
+      "version_lt": "6.0.16",
+      "cve_ids": ["CVE-2022-0543"],
+      "severity": "high",
+      "description": "Redis Lua sandbox escape vulnerability; upgrade to 6.0.16/6.2.6 or distro patched build.",
+      "cpe_template": "cpe:2.3:a:redislabs:redis:{version}:*:*:*:*:*:*:*"
+    }
+  ],
+  "kernel_rules": [
+    {
+      "rule_id": "AGENT-KERNEL-2023-32233",
+      "cve_ids": ["CVE-2023-32233"],
+      "severity": "high",
+      "description": "Linux kernel nftables use-after-free; affects kernels 6.3 and earlier before fixes.",
+      "min_version": "5.4.0",
+      "max_version": "6.3.9"
+    }
+  ]
+}
