@@ -1,8 +1,8 @@
-# Traceability
+# Requirement Traceability
 
-- Backlog: `BACKLOG.md` maps features and phases with labels.
-- Principles/Non-goals: `AGENTS.md` captures core principles, capabilities, and heuristics.
-- Requirements → Acceptance: `docs/requirements.md` aligns to `docs/acceptance-criteria.md`.
-- Implementation artifacts: API schema in `src/clanker/main.py`; UI consumption in `frontend/`.
-- Tests: pytest suites under `tests/` mirror core modules and ingest paths.
-
+| Requirement Section | Component          | Status  |
+|---------------------|--------------------|---------|
+| 1. Core Scanning    | Scanner Engine     | Planned |
+| 2. CVE Intelligence | Intelligence Service | Planned |
+| 3. Cloud Security   | Scanner Engine     | Planned |
+| 4. Asset Inventory  | Inventory Service  | Planned |
