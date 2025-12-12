@@ -90,6 +90,14 @@ def _configure_cors_from_env() -> None:
 _configure_cors_from_env()
 queue_logger = logging.getLogger("clanker.queue")
 
+PRESET_CRONS = {
+    "hourly": "0 * * * *",
+    "daily": "0 02 * * *",
+    "nightly": "0 03 * * *",
+    "workday-morning": "0 08 * * 1-5",
+    "sunday-midnight": "0 00 * * 0",
+}
+
 
 @app.get("/health", include_in_schema=False)
 def health() -> Dict[str, str]:
@@ -518,12 +526,64 @@ def _parse_days(raw: Optional[str]) -> List[int]:
                 except Exception:
                     continue
             return days
-    except Exception:
-        pass
+        except Exception:
+            pass
     return []
 
 
+def _cron_field_match(field: str, value: int, min_v: int, max_v: int) -> bool:
+    if field == "*":
+        return True
+    parts = field.split(",")
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+        if part.startswith("*/"):
+            try:
+                step = int(part[2:])
+                if step > 0 and (value - min_v) % step == 0:
+                    return True
+            except Exception:
+                continue
+        elif "-" in part:
+            try:
+                start_s, end_s = part.split("-", 1)
+                start = int(start_s)
+                end = int(end_s)
+                if start <= value <= end:
+                    return True
+            except Exception:
+                continue
+        else:
+            try:
+                if int(part) == value:
+                    return True
+            except Exception:
+                continue
+    return False
+
+
+def _cron_matches(dt: datetime, expr: str) -> bool:
+    parts = expr.split()
+    if len(parts) != 5:
+        return False
+    minute, hour, day, month, weekday = parts
+    return (
+        _cron_field_match(minute, dt.minute, 0, 59)
+        and _cron_field_match(hour, dt.hour, 0, 23)
+        and _cron_field_match(day, dt.day, 1, 31)
+        and _cron_field_match(month, dt.month, 1, 12)
+        and _cron_field_match(weekday, dt.weekday(), 0, 6)
+    )
+
+
 def _should_run(job: ScheduleJob, now: datetime, last_run: Optional[datetime]) -> bool:
+    if job.cron:
+        if last_run and last_run.year == now.year and last_run.month == now.month and last_run.day == now.day:
+            if last_run.hour == now.hour and last_run.minute == now.minute:
+                return False
+        return _cron_matches(now, job.cron)
     days = _parse_days(job.days_of_week) or list(range(7))
     times = _parse_times(job.times) or ["00:00"]
     if now.weekday() not in days:
@@ -730,6 +790,10 @@ def create_schedule(payload: dict, _: object = Depends(require_roles("admin")), 
     profile = payload.get("profile") or "intense"
     asset_group_id = payload.get("asset_group_id")
     asset_ids = list({int(a) for a in (payload.get("asset_ids") or []) if isinstance(a, (int, str)) and str(a).isdigit()})
+    cron = payload.get("cron")
+    preset = payload.get("preset")
+    if preset and not cron:
+        cron = PRESET_CRONS.get(str(preset).lower())
     days = payload.get("days_of_week") or payload.get("days")
     times = payload.get("times")
     days_list: List[int] = []
@@ -766,9 +830,17 @@ def create_schedule(payload: dict, _: object = Depends(require_roles("admin")), 
         times_list = ["00:00"]
     if not days_list:
         days_list = list(range(7))
+    if cron:
+        if not _cron_matches(datetime.utcnow(), cron):
+            from fastapi import HTTPException
+
+            raise HTTPException(status_code=400, detail="cron expression is invalid or unsupported")
+        # Cron overrides day/time matching; clear old fields if provided
+        days_list = days_list or []
+        times_list = times_list or []
     job = ScheduleJob(
         name=name,
-        cron="* * * * *",
+        cron=cron or "",
         profile=profile,
         asset_group_id=int(asset_group_id),
         enabled=bool(payload.get("enabled", True)),
@@ -783,6 +855,7 @@ def create_schedule(payload: dict, _: object = Depends(require_roles("admin")), 
         "profile": job.profile,
         "asset_group_id": job.asset_group_id,
         "asset_ids": asset_ids,
+        "cron": job.cron or None,
         "days_of_week": days_list,
         "times": times_list,
         "enabled": job.enabled,
@@ -803,6 +876,7 @@ def list_schedules(_: object = Depends(require_roles("admin", "operator", "viewe
                     select(AssetGroupMember.asset_id).where(AssetGroupMember.asset_group_id == j.asset_group_id)
                 ).all()
             ),
+            "cron": j.cron or None,
             "days_of_week": _parse_days(j.days_of_week),
             "times": _parse_times(j.times),
             "enabled": j.enabled,
@@ -827,6 +901,16 @@ def update_schedule(
         job.profile = payload["profile"]
     if "enabled" in payload:
         job.enabled = bool(payload.get("enabled", True))
+
+    if "preset" in payload and not payload.get("cron"):
+        cron_val = PRESET_CRONS.get(str(payload.get("preset")).lower()) if payload.get("preset") else None
+        if cron_val:
+            job.cron = cron_val
+    if "cron" in payload and payload.get("cron"):
+        if not _cron_matches(datetime.utcnow(), payload["cron"]):
+            from fastapi import HTTPException
+            raise HTTPException(status_code=400, detail="cron expression is invalid or unsupported")
+        job.cron = payload["cron"]
 
     if "days_of_week" in payload:
         days_list: List[int] = []
@@ -878,6 +962,7 @@ def update_schedule(
                 select(AssetGroupMember.asset_id).where(AssetGroupMember.asset_group_id == job.asset_group_id)
             ).all()
         ],
+        "cron": job.cron or None,
         "days_of_week": _parse_days(job.days_of_week),
         "times": _parse_times(job.times),
         "enabled": job.enabled,
