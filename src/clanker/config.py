@@ -11,6 +11,8 @@ class Settings(BaseSettings):
     rules_path: Path = Field(default=Path(__file__).resolve().parent / "rules" / "basic_rules.json")
     xml_output_dir: Path = Field(default=Path("./scan_artifacts"))
     scan_retry_limit: int = Field(default=1, ge=0, le=5)
+    scan_job_max_attempts: int = Field(default=3, ge=1, le=10)
+    scan_job_dispatch_interval_seconds: float = Field(default=0.5, ge=0.05, le=5.0)
     nvd_cache_dir: Path = Field(default=Path("./data/nvd_cache"))
     nvd_recent_feed_url: str = Field(
         default="https://nvd.nist.gov/feeds/json/cve/1.1/nvdcve-1.1-recent.json.gz"

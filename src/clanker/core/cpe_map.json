@@ -1,30 +1,184 @@
 {
-  "nginx": "cpe:2.3:a:nginx:nginx:{version}:*:*:*:*:*:*:*",
-  "httpd": "cpe:2.3:a:apache:http_server:{version}:*:*:*:*:*:*:*",
-  "apache": "cpe:2.3:a:apache:http_server:{version}:*:*:*:*:*:*:*",
-  "openssh": "cpe:2.3:a:openbsd:openssh:{version}:*:*:*:*:*:*:*",
-  "mysql": "cpe:2.3:a:mysql:mysql:{version}:*:*:*:*:*:*:*",
-  "mariadb": "cpe:2.3:a:mariadb:mariadb:{version}:*:*:*:*:*:*:*",
-  "postgresql": "cpe:2.3:a:postgresql:postgresql:{version}:*:*:*:*:*:*:*",
-  "redis": "cpe:2.3:a:redislabs:redis:{version}:*:*:*:*:*:*:*",
-  "mongodb": "cpe:2.3:a:mongodb:mongodb:{version}:*:*:*:*:*:*:*",
-  "vsftpd": "cpe:2.3:a:vsftpd_project:vsftpd:{version}:*:*:*:*:*:*:*",
-  "proftpd": "cpe:2.3:a:proftpd:proftpd:{version}:*:*:*:*:*:*:*",
-  "opensmtpd": "cpe:2.3:a:openbsd:opensmtpd:{version}:*:*:*:*:*:*:*",
-  "exim": "cpe:2.3:a:exim:exim:{version}:*:*:*:*:*:*:*",
-  "postfix": "cpe:2.3:a:postfix:postfix:{version}:*:*:*:*:*:*:*",
-  "dovecot": "cpe:2.3:a:dovecot:dovecot:{version}:*:*:*:*:*:*:*",
-  "cisco": "cpe:2.3:o:cisco:{product}:{version}:*:*:*:*:*:*:*",
-  "juniper": "cpe:2.3:o:juniper:{product}:{version}:*:*:*:*:*:*:*",
-  "lighttpd": "cpe:2.3:a:lighttpd:lighttpd:{version}:*:*:*:*:*:*:*",
-  "openvpn": "cpe:2.3:a:openvpn:openvpn:{version}:*:*:*:*:*:*:*",
-  "haproxy": "cpe:2.3:a:haproxy:haproxy:{version}:*:*:*:*:*:*:*",
-  "tomcat": "cpe:2.3:a:apache:tomcat:{version}:*:*:*:*:*:*:*",
-  "jetty": "cpe:2.3:a:eclipse:jetty:{version}:*:*:*:*:*:*:*",
-  "elasticsearch": "cpe:2.3:a:elastic:elasticsearch:{version}:*:*:*:*:*:*:*",
-  "kibana": "cpe:2.3:a:elastic:kibana:{version}:*:*:*:*:*:*:*",
-  "grafana": "cpe:2.3:a:grafana:grafana:{version}:*:*:*:*:*:*:*",
-  "jenkins": "cpe:2.3:a:jenkins:jenkins:{version}:*:*:*:*:*:*:*",
-  "gitlab": "cpe:2.3:a:gitlab:gitlab:{version}:*:*:*:*:*:*:*",
-  "minio": "cpe:2.3:a:minio:minio:{version}:*:*:*:*:*:*:*"
+  "services": [
+    {
+      "match": ["nginx"],
+      "cpe": "cpe:2.3:a:nginx:nginx:{version}:*:*:*:*:*:*:*",
+      "confidence": "high",
+      "source": "curated/web"
+    },
+    {
+      "match": ["httpd", "apache"],
+      "cpe": "cpe:2.3:a:apache:http_server:{version}:*:*:*:*:*:*:*",
+      "confidence": "high",
+      "source": "curated/web"
+    },
+    {
+      "match": ["openssh", "ssh"],
+      "cpe": "cpe:2.3:a:openbsd:openssh:{version}:*:*:*:*:*:*:*",
+      "confidence": "high",
+      "source": "curated/ssh",
+      "ports": [22],
+      "protocols": ["tcp"]
+    },
+    {
+      "match": ["dropbear"],
+      "cpe": "cpe:2.3:a:dropbear_ssh_project:dropbear_ssh:{version}:*:*:*:*:*:*:*",
+      "confidence": "medium",
+      "source": "curated/ssh",
+      "ports": [22],
+      "protocols": ["tcp"]
+    },
+    {
+      "match": ["libssh"],
+      "cpe": "cpe:2.3:a:libssh:libssh:{version}:*:*:*:*:*:*:*",
+      "confidence": "medium",
+      "source": "curated/ssh"
+    },
+    {
+      "match": ["mysql"],
+      "cpe": "cpe:2.3:a:mysql:mysql:{version}:*:*:*:*:*:*:*",
+      "confidence": "high",
+      "source": "curated/datastore"
+    },
+    {
+      "match": ["mariadb"],
+      "cpe": "cpe:2.3:a:mariadb:mariadb:{version}:*:*:*:*:*:*:*",
+      "confidence": "high",
+      "source": "curated/datastore"
+    },
+    {
+      "match": ["postgresql", "postgres"],
+      "cpe": "cpe:2.3:a:postgresql:postgresql:{version}:*:*:*:*:*:*:*",
+      "confidence": "high",
+      "source": "curated/datastore"
+    },
+    {
+      "match": ["redis"],
+      "cpe": "cpe:2.3:a:redislabs:redis:{version}:*:*:*:*:*:*:*",
+      "confidence": "high",
+      "source": "curated/datastore"
+    },
+    {
+      "match": ["mongodb"],
+      "cpe": "cpe:2.3:a:mongodb:mongodb:{version}:*:*:*:*:*:*:*",
+      "confidence": "high",
+      "source": "curated/datastore"
+    },
+    {
+      "match": ["vsftpd"],
+      "cpe": "cpe:2.3:a:vsftpd_project:vsftpd:{version}:*:*:*:*:*:*:*",
+      "confidence": "medium",
+      "source": "curated/ftp",
+      "ports": [21]
+    },
+    {
+      "match": ["proftpd"],
+      "cpe": "cpe:2.3:a:proftpd:proftpd:{version}:*:*:*:*:*:*:*",
+      "confidence": "medium",
+      "source": "curated/ftp",
+      "ports": [21]
+    },
+    {
+      "match": ["opensmtpd"],
+      "cpe": "cpe:2.3:a:openbsd:opensmtpd:{version}:*:*:*:*:*:*:*",
+      "confidence": "medium",
+      "source": "curated/mail"
+    },
+    {
+      "match": ["exim"],
+      "cpe": "cpe:2.3:a:exim:exim:{version}:*:*:*:*:*:*:*",
+      "confidence": "medium",
+      "source": "curated/mail"
+    },
+    {
+      "match": ["postfix"],
+      "cpe": "cpe:2.3:a:postfix:postfix:{version}:*:*:*:*:*:*:*",
+      "confidence": "medium",
+      "source": "curated/mail"
+    },
+    {
+      "match": ["dovecot"],
+      "cpe": "cpe:2.3:a:dovecot:dovecot:{version}:*:*:*:*:*:*:*",
+      "confidence": "medium",
+      "source": "curated/mail"
+    },
+    {
+      "match": ["cisco"],
+      "cpe": "cpe:2.3:o:cisco:{product}:{version}:*:*:*:*:*:*:*",
+      "confidence": "medium",
+      "source": "curated/network"
+    },
+    {
+      "match": ["juniper"],
+      "cpe": "cpe:2.3:o:juniper:{product}:{version}:*:*:*:*:*:*:*",
+      "confidence": "medium",
+      "source": "curated/network"
+    },
+    {
+      "match": ["lighttpd"],
+      "cpe": "cpe:2.3:a:lighttpd:lighttpd:{version}:*:*:*:*:*:*:*",
+      "confidence": "high",
+      "source": "curated/web"
+    },
+    {
+      "match": ["openvpn"],
+      "cpe": "cpe:2.3:a:openvpn:openvpn:{version}:*:*:*:*:*:*:*",
+      "confidence": "medium",
+      "source": "curated/vpn"
+    },
+    {
+      "match": ["haproxy"],
+      "cpe": "cpe:2.3:a:haproxy:haproxy:{version}:*:*:*:*:*:*:*",
+      "confidence": "medium",
+      "source": "curated/load-balancer"
+    },
+    {
+      "match": ["tomcat"],
+      "cpe": "cpe:2.3:a:apache:tomcat:{version}:*:*:*:*:*:*:*",
+      "confidence": "medium",
+      "source": "curated/web"
+    },
+    {
+      "match": ["jetty"],
+      "cpe": "cpe:2.3:a:eclipse:jetty:{version}:*:*:*:*:*:*:*",
+      "confidence": "medium",
+      "source": "curated/web"
+    },
+    {
+      "match": ["elasticsearch"],
+      "cpe": "cpe:2.3:a:elastic:elasticsearch:{version}:*:*:*:*:*:*:*",
+      "confidence": "medium",
+      "source": "curated/observability"
+    },
+    {
+      "match": ["kibana"],
+      "cpe": "cpe:2.3:a:elastic:kibana:{version}:*:*:*:*:*:*:*",
+      "confidence": "medium",
+      "source": "curated/observability"
+    },
+    {
+      "match": ["grafana"],
+      "cpe": "cpe:2.3:a:grafana:grafana:{version}:*:*:*:*:*:*:*",
+      "confidence": "medium",
+      "source": "curated/observability"
+    },
+    {
+      "match": ["jenkins"],
+      "cpe": "cpe:2.3:a:jenkins:jenkins:{version}:*:*:*:*:*:*:*",
+      "confidence": "medium",
+      "source": "curated/ci"
+    },
+    {
+      "match": ["gitlab"],
+      "cpe": "cpe:2.3:a:gitlab:gitlab:{version}:*:*:*:*:*:*:*",
+      "confidence": "medium",
+      "source": "curated/ci"
+    },
+    {
+      "match": ["minio"],
+      "cpe": "cpe:2.3:a:minio:minio:{version}:*:*:*:*:*:*:*",
+      "confidence": "medium",
+      "source": "curated/storage"
+    }
+  ]
 }

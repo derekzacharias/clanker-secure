@@ -3,7 +3,6 @@ from __future__ import annotations
 import gzip
 import json
 import logging
-import os
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -14,6 +13,8 @@ import httpx
 from sqlmodel import Session
 
 from clanker.config import settings
+from clanker.core.agent_vuln_logic import service_rule_cpe_templates
+from clanker.core.cpe import CpeGuess, CpeInferenceEngine, get_cpe_engine
 from clanker.core.types import ServiceObservation
 from clanker.db.models import Finding
 
@@ -31,13 +32,6 @@ class NvdCacheEntry:
     source: str = "nvd"
     kev: bool = False
     epss: Optional[float] = None
-
-
-@dataclass
-class CpeGuess:
-    value: str
-    confidence: str
-    source: str = "cpe-inference"
 
 
 class NvdCache:
@@ -117,62 +111,6 @@ class NvdCache:
             kev=bool(data.get("kev")),
             epss=data.get("epss"),
         )
-
-
-def _load_cpe_map(path: Path) -> Dict[str, str]:
-    if not path.exists():
-        return {}
-    try:
-        with path.open() as fh:
-            data = json.load(fh)
-            return {k.lower(): v for k, v in data.items() if isinstance(v, str)}
-    except Exception:
-        return {}
-
-
-def infer_cpe(observation: ServiceObservation, cpe_map: Dict[str, str]) -> Optional[CpeGuess]:
-    name = (observation.service_name or observation.product or "").strip().lower()
-    product = (observation.product or observation.service_name or "").strip().lower()
-    version = (observation.service_version or "").strip().lower() or "*"
-    vendor = (observation.host_vendor or "").strip().lower()
-
-    banner = (observation.banner or "").lower()
-    if banner:
-        # simple vendor hints
-        if "apache" in banner and not vendor:
-            vendor = "apache"
-        elif "microsoft" in banner and not vendor:
-            vendor = "microsoft"
-        elif "openbsd" in banner and not vendor:
-            vendor = "openbsd"
-        elif "openssl" in banner and not vendor:
-            vendor = "openssl"
-
-    if not name and not product:
-        return None
-
-    if name in cpe_map:
-        template = cpe_map[name]
-        try:
-            cpe_val = template.format(version=version or "*", product=product or name)
-        except Exception:
-            cpe_val = template
-        confidence = "high" if version not in ("*", "") else "medium"
-        return CpeGuess(value=cpe_val, confidence=confidence)
-
-    if vendor and product:
-        confidence = "medium" if version not in ("*", "") else "low"
-        return CpeGuess(
-            value=f"cpe:2.3:a:{vendor}:{product}:{version}:*:*:*:*:*:*:*",
-            confidence=confidence,
-        )
-
-    if product:
-        return CpeGuess(
-            value=f"cpe:2.3:a:{product}:{product}:{version}:*:*:*:*:*:*:*",
-            confidence="low",
-        )
-    return None
 
 
 def _respect_min_interval(last_request: List[float], min_interval: float = 0.6) -> None:
@@ -341,6 +279,24 @@ def _deserialize_cve_list(raw: Optional[str]) -> List[str]:
 
 
 def _observation_from_finding(finding: Finding) -> ServiceObservation:
+    fingerprint = None
+    evidence = None
+    version_confidence = None
+    if finding.fingerprint:
+        try:
+            fingerprint = json.loads(finding.fingerprint)
+        except Exception:
+            fingerprint = None
+    if finding.evidence:
+        try:
+            evidence = json.loads(finding.evidence)
+        except Exception:
+            evidence = None
+    if isinstance(fingerprint, dict):
+        try:
+            version_confidence = float(fingerprint.get("version_confidence"))
+        except Exception:
+            version_confidence = None
     return ServiceObservation(
         asset_id=finding.asset_id or 0,
         host_address=finding.host_address,
@@ -354,6 +310,10 @@ def _observation_from_finding(finding: Finding) -> ServiceObservation:
         service_name=finding.service_name,
         service_version=finding.service_version,
         product=finding.service_name,
+        version_confidence=version_confidence,
+        fingerprint=fingerprint,
+        evidence=evidence,
+        evidence_summary=finding.evidence_summary,
     )
 
 
@@ -415,7 +375,7 @@ def enrich_from_feed(
     metrics = _extract_cvss_and_refs_from_feed(feed) if feed else {}
     if metrics:
         _cache_feed_metrics(cache, metrics)
-    cpe_map = _load_cpe_map(settings.cpe_map_path)
+    cpe_engine = get_cpe_engine(settings.cpe_map_path, rule_templates=service_rule_cpe_templates())
     now_iso = datetime.now(timezone.utc).isoformat()
     metrics_entries: Dict[str, NvdCacheEntry] = {}
     for cve_id, data in metrics.items():
@@ -460,64 +420,66 @@ def enrich_from_feed(
         obs = (observations or {}).get(finding.id or -1) if observations else None
         if not obs:
             obs = _observation_from_finding(finding)
-        cpe_guess = infer_cpe(obs, cpe_map) if obs else None
+        cpe_guess = cpe_engine.infer(obs) if obs else None
 
         if best_score is None and not refs_accum and not cpe_guess:
             continue
         refs_json = json.dumps(refs_accum) if refs_accum else None
         session.exec(
-            """
-            INSERT INTO finding_enrichment (finding_id, cpe, cpe_confidence, cvss_v31_base, cvss_vector, references_json, last_enriched_at, source)
-            VALUES (:fid, :cpe, :cpe_conf, :score, :vector, :refs, :updated, :source)
-            ON CONFLICT(finding_id) DO UPDATE SET
-              cpe=excluded.cpe,
-              cpe_confidence=excluded.cpe_confidence,
-              cvss_v31_base=excluded.cvss_v31_base,
-              cvss_vector=excluded.cvss_vector,
-              references_json=excluded.references_json,
-              last_enriched_at=excluded.last_enriched_at,
-              source=excluded.source
-            """,
-            {
-                "fid": finding.id,
-                "cpe": cpe_guess.value if cpe_guess else None,
-                "cpe_conf": cpe_guess.confidence if cpe_guess else None,
-                "score": float(best_score) if best_score is not None else None,
-                "vector": best_vector,
-                "refs": refs_json,
-                "updated": now_iso,
-                "source": source or "nvd",
-            },
+            text(
+                """
+                INSERT INTO finding_enrichment (finding_id, cpe, cpe_confidence, cvss_v31_base, cvss_vector, references_json, last_enriched_at, source)
+                VALUES (:fid, :cpe, :cpe_conf, :score, :vector, :refs, :updated, :source)
+                ON CONFLICT(finding_id) DO UPDATE SET
+                  cpe=excluded.cpe,
+                  cpe_confidence=excluded.cpe_confidence,
+                  cvss_v31_base=excluded.cvss_v31_base,
+                  cvss_vector=excluded.cvss_vector,
+                  references_json=excluded.references_json,
+                  last_enriched_at=excluded.last_enriched_at,
+                  source=excluded.source
+                """
+            ).bindparams(
+                fid=finding.id,
+                cpe=cpe_guess.value if cpe_guess else None,
+                cpe_conf=cpe_guess.confidence if cpe_guess else None,
+                score=float(best_score) if best_score is not None else None,
+                vector=best_vector,
+                refs=refs_json,
+                updated=now_iso,
+                source=source or "nvd",
+            )
         )
 
 
 def enrich_cpe_only(session: Session, findings: Iterable[Finding], observations: Dict[int, ServiceObservation]) -> None:
-    cpe_map = _load_cpe_map(settings.cpe_map_path)
+    cpe_engine = get_cpe_engine(settings.cpe_map_path, rule_templates=service_rule_cpe_templates())
     now_iso = datetime.now(timezone.utc).isoformat()
     for finding in findings:
         obs = observations.get(finding.id or -1)
         if not obs:
             continue
-        cpe_guess = infer_cpe(obs, cpe_map)
+        cpe_guess = cpe_engine.infer(obs)
         if not cpe_guess:
             continue
         session.exec(
-            """
-            INSERT INTO finding_enrichment (finding_id, cpe, cpe_confidence, last_enriched_at, source)
-            VALUES (:fid, :cpe, :conf, :updated, :source)
-            ON CONFLICT(finding_id) DO UPDATE SET
-              cpe=excluded.cpe,
-              cpe_confidence=excluded.cpe_confidence,
-              last_enriched_at=excluded.last_enriched_at,
-              source=excluded.source
-            """,
-            {
-                "fid": finding.id,
-                "cpe": cpe_guess.value,
-                "conf": cpe_guess.confidence,
-                "updated": now_iso,
-                "source": cpe_guess.source,
-            },
+            text(
+                """
+                INSERT INTO finding_enrichment (finding_id, cpe, cpe_confidence, last_enriched_at, source)
+                VALUES (:fid, :cpe, :conf, :updated, :source)
+                ON CONFLICT(finding_id) DO UPDATE SET
+                  cpe=excluded.cpe,
+                  cpe_confidence=excluded.cpe_confidence,
+                  last_enriched_at=excluded.last_enriched_at,
+                  source=excluded.source
+                """
+            ).bindparams(
+                fid=finding.id,
+                cpe=cpe_guess.value,
+                conf=cpe_guess.confidence,
+                updated=now_iso,
+                source=cpe_guess.source,
+            )
         )
 
 
@@ -526,8 +488,9 @@ __all__ = [
     "NvdCacheEntry",
     "enrich_from_feed",
     "enrich_cpe_only",
-    "infer_cpe",
     "fetch_nvd_cve",
     "sync_nvd_cache",
     "CpeGuess",
+    "CpeInferenceEngine",
+    "get_cpe_engine",
 ]

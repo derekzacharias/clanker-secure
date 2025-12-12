@@ -19,6 +19,7 @@ KNOWN_ARCHES = {
 SERVICE_ALIASES = {
     "sshd": "ssh",
     "httpd": "httpd",
+    "apache": "httpd",
     "apache2": "httpd",
     "nginx": "nginx",
     "mysqld": "mysql",
@@ -180,9 +181,32 @@ def parse_listening_services(output: str) -> List[Dict[str, Any]]:
                 "port": _extract_port(local),
                 "protocol": proto,
                 "status": "listening" if state.startswith("listen") else state,
+                # banner/version fields may be added later by callers (e.g., package map enrichment)
             }
         )
     return services
+
+
+def parse_file_stats(output: str) -> List[Dict[str, Any]]:
+    """
+    Parse simple `stat -c '%n %a'` output into structured file permission records.
+    """
+    files: List[Dict[str, Any]] = []
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        path = parts[0]
+        mode_raw = parts[1]
+        try:
+            mode_int = int(mode_raw, 8)
+        except ValueError:
+            continue
+        files.append({"path": path, "mode": mode_int})
+    return files
 
 
 def parse_sshd_config(config_text: str) -> Dict[str, Any]:
@@ -199,7 +223,12 @@ def parse_sshd_config(config_text: str) -> Dict[str, Any]:
         if len(tokens) < 2:
             continue
         key = tokens[0].lower()
-        value = tokens[1].split()[0].lower()
+        value_raw = tokens[1].strip()
+        if key in {"ciphers", "macs", "kexalgorithms"}:
+            algos = re.split(r"[,\s]+", value_raw.lower())
+            settings[key] = [algo for algo in algos if algo]
+            continue
+        value = value_raw.split()[0].lower()
         settings[key] = value
     return {
         "permit_root_login": settings.get("permitrootlogin", "unknown"),
@@ -209,6 +238,9 @@ def parse_sshd_config(config_text: str) -> Dict[str, Any]:
         "port": settings.get("port"),
         "allow_users": settings.get("allowusers"),
         "allow_groups": settings.get("allowgroups"),
+        "ciphers": settings.get("ciphers", []),
+        "macs": settings.get("macs", []),
+        "kex_algorithms": settings.get("kexalgorithms", []),
     }
 
 
@@ -219,6 +251,7 @@ __all__ = [
     "parse_rpm_qa",
     "parse_kernel_release",
     "parse_listening_services",
+    "parse_file_stats",
     "parse_sshd_config",
     "normalize_service_name",
 ]

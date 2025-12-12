@@ -3,7 +3,7 @@
 ## Near-term backlog (prioritized)
 - [x] CVE enrichment Phase 1 (UI chips, CSV/JSON exports, CVSS placeholders) — Labels: frontend, ui, api-change
 - [x] Auth hardening: login rate limiting and auth event audit logging (login success/fail/throttled) — Labels: auth
-- [ ] Background job queue for scans with retries/cancellation hooks — Labels: core, infra
+- [x] Background job queue for scans with retries/cancellation hooks — Labels: core, infra
 - [x] Server-side pagination and filtering for /findings, /scans, /assets — Labels: api, core
 - [x] Structured logs + basic metrics for scanner and API — Labels: infra
 - [x] Scheduled scans (cron/presets) — Labels: core, infra
@@ -11,9 +11,9 @@
 - [x] Credentialed scanning Linux agent MVP (collect distro/kernel/pkg inventory, config) — Labels: core, infra, auth
 - [x] SSE/WebSocket scan progress updates — Labels: frontend, core
 - [x] Reporting: CVSS band aggregation and CSV/PDF/JSON exports — Labels: frontend, api
-- [ ] Service fingerprinting + protocol parsers (HTTP/TLS/SSH/SMB/SQL/SNMP/RDP) with version confidence and structured evidence — Labels: core, nmap-profile
-- [ ] CPE inference library + curated mapping file with confidence scores and source tags — Labels: core, api
-- [ ] Evidence grading, deduping, and “why this finding” traces — Labels: core, ui
+- [x] Service fingerprinting + protocol parsers (HTTP/TLS/SSH/SMB/SQL/SNMP/RDP) with version confidence and structured evidence — Labels: core, nmap-profile
+- [x] CPE inference library + curated mapping file with confidence scores and source tags — Labels: core, api
+- [x] Evidence grading, deduping, and “why this finding” traces — Labels: core, ui
 - [x] Rule coverage audit (unmatched services/banners with suggested rule stubs and fixtures) — Labels: core, tests
 - [ ] Credentialed vuln detection Phase 2: expand package advisories + distro OVAL/OSV feeds, service-version rules, kernel/OS release checks, config-level findings, and CPE inference upgrades for SSH scans — Labels: core, agent, vuln-detection
 

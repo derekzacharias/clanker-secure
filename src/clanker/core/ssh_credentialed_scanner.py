@@ -15,7 +15,7 @@ import socket
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from threading import Lock
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -37,15 +37,14 @@ except ImportError:  # pragma: no cover - optional dependency
     class NoValidConnectionsError(Exception):
         pass
 
-from clanker.core.agent_parsers import parse_sshd_config
-from clanker.core.agent_parsers import (
-    parse_dpkg_list,
-    parse_kernel_release,
-    parse_listening_services,
-    parse_rpm_qa,
-)
+from clanker.core.agent_parsers import parse_file_stats, parse_sshd_config
+from clanker.core.agent_parsers import parse_dpkg_list, parse_kernel_release, parse_listening_services, parse_rpm_qa
 
 Logger = logging.Logger
+
+
+def utc_timestamp() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 @dataclass
@@ -155,12 +154,19 @@ class SSHScanner:
         """
         return [
             {"name": "system.uname", "command": "uname -a"},
+            {"name": "system.kernel_release", "command": "uname -r"},
             {"name": "system.os_release", "command": "cat /etc/os-release || cat /etc/issue"},
             {"name": "system.issue", "command": "cat /etc/issue"},
             {"name": "system.proc_version", "command": "cat /proc/version"},
             {"name": "system.lsb_release", "command": "lsb_release -a"},
-            {"name": "packages.dpkg", "command": "dpkg -l"},
-            {"name": "packages.rpm", "command": "rpm -qa"},
+            {
+                "name": "packages.dpkg",
+                "command": "dpkg-query -W -f='${Package} ${Version} ${Architecture}\\n' || dpkg -l",
+            },
+            {
+                "name": "packages.rpm",
+                "command": "rpm -qa --qf '%{NAME} %{VERSION}-%{RELEASE} %{ARCH}\\n' || rpm -qa",
+            },
             {"name": "network.ss", "command": "ss -tulpn"},
             {"name": "network.netstat", "command": "netstat -tulpn"},
             {
@@ -168,6 +174,12 @@ class SSHScanner:
                 "command": "systemctl list-units --type=service --state=running --no-legend --no-pager",
             },
             {"name": "ssh.config", "command": "cat /etc/ssh/sshd_config"},
+            {"name": "ssh.client_config", "command": "cat /etc/ssh/ssh_config"},
+            {"name": "auth.sudoers", "command": "cat /etc/sudoers"},
+            {
+                "name": "files.perms",
+                "command": "for f in /etc/passwd /etc/shadow /etc/sudoers /etc/ssh/sshd_config /etc/ssh/ssh_config /root/.ssh/id_* /home/*/.ssh/id_*; do [ -e \"$f\" ] && stat -c '%n %a' \"$f\"; done 2>/dev/null",
+            },
         ]
 
     def scan_all(self, hosts: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
@@ -267,7 +279,7 @@ class SSHScanner:
             "error": None,
             "commands": [],
             "ssh_config_hardening": {},
-            "started_at": datetime.utcnow().isoformat() + "Z",
+            "started_at": utc_timestamp(),
             "completed_at": None,
             "attempts": 0,
         }
@@ -275,7 +287,7 @@ class SSHScanner:
         if not _PARAMIKO_AVAILABLE:
             result["status"] = "unavailable"
             result["error"] = "paramiko is not installed; install optional dependency for SSH scans"
-            result["completed_at"] = datetime.utcnow().isoformat() + "Z"
+            result["completed_at"] = utc_timestamp()
             self.logger.warning("Skipping SSH scan for %s: paramiko not installed", host)
             return result
 
@@ -326,7 +338,7 @@ class SSHScanner:
                 result["error"] = f"Unhandled error: {exc}"
                 self.logger.error("Unhandled error while scanning %s: %s", host, exc)
             finally:
-                result["completed_at"] = datetime.utcnow().isoformat() + "Z"
+                result["completed_at"] = utc_timestamp()
                 duration_ms = round((time.perf_counter() - attempt_start) * 1000, 2)
                 self._log_metric(
                     "ssh_scan_host",
@@ -475,6 +487,7 @@ class SSHScanner:
         os_name = None
         os_version = None
         distro = None
+        kernel_version = parse_kernel_release(_stdout("system.kernel_release"))
 
         os_release = _stdout("system.os_release")
         if os_release:
@@ -492,8 +505,9 @@ class SSHScanner:
             if issue:
                 os_name = issue.splitlines()[0].strip()
 
-        uname_out = _stdout("system.uname")
-        kernel_version = parse_kernel_release(uname_out) or parse_kernel_release(_stdout("system.proc_version"))
+        if not kernel_version:
+            uname_out = _stdout("system.uname")
+            kernel_version = parse_kernel_release(uname_out) or parse_kernel_release(_stdout("system.proc_version"))
 
         packages = []
         dpkg_out = _stdout("packages.dpkg")
@@ -519,6 +533,17 @@ class SSHScanner:
         ssh_config = _stdout("ssh.config")
         if ssh_config:
             configs["sshd_config"] = ssh_config
+        client_config = _stdout("ssh.client_config")
+        if client_config:
+            configs["ssh_config"] = client_config
+        sudoers = _stdout("auth.sudoers")
+        if sudoers:
+            configs["sudoers"] = sudoers
+
+        files = []
+        file_stats_out = _stdout("files.perms")
+        if file_stats_out:
+            files.extend(parse_file_stats(file_stats_out))
 
         return {
             "host_identifier": result.get("host") or result.get("hostname"),
@@ -531,6 +556,7 @@ class SSHScanner:
             "services": services,
             "interfaces": [],
             "configs": configs,
+            "files": files,
             "collector_errors": {},
         }
 

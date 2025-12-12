@@ -6,6 +6,7 @@ from typing import Iterable, List
 from sqlmodel import Session
 
 from clanker.core.coverage import record_rule_gap
+from clanker.core.evidence import build_why_trace, dedupe_evidence, grade_evidence
 from clanker.core.rule_engine import Rule, evaluate_rules, load_rules
 from clanker.core.types import ServiceObservation
 from clanker.db.models import Finding
@@ -24,7 +25,17 @@ def build_findings(
     for observation in observations:
         matches = evaluate_rules(observation, rules)
         fingerprint_json = json.dumps(observation.fingerprint) if observation.fingerprint is not None else None
-        evidence_json = json.dumps(observation.evidence) if observation.evidence else None
+        evidence_list = observation.evidence if observation.evidence else []
+        deduped_evidence = dedupe_evidence(evidence_list if isinstance(evidence_list, list) else [])
+        evidence_json = json.dumps(deduped_evidence) if deduped_evidence else None
+        evidence_grade = grade_evidence(deduped_evidence) if deduped_evidence else None
+        context = {
+            "port": observation.port,
+            "protocol": observation.protocol,
+            "service_name": observation.service_name,
+            "service_version": observation.service_version,
+            "version_confidence": observation.version_confidence,
+        }
         if matches:
             for rule in matches:
                 finding = Finding(
@@ -43,6 +54,8 @@ def build_findings(
                     fingerprint=fingerprint_json,
                     evidence=evidence_json,
                     evidence_summary=observation.evidence_summary,
+                    evidence_grade=evidence_grade,
+                    why_trace=build_why_trace(rule.id, observation.evidence_summary, source="rule_engine", context=context),
                     rule_id=rule.id,
                     severity=rule.severity,
                     cve_ids=json.dumps(rule.cve),
@@ -63,13 +76,20 @@ def build_findings(
                 port=observation.port,
                 protocol=observation.protocol,
                 service_name=observation.service_name,
-                service_version=observation.service_version,
-                fingerprint=fingerprint_json,
-                evidence=evidence_json,
-                evidence_summary=observation.evidence_summary,
-                severity="informational",
-                description="Open service detected without matching CVE rule",
-            )
+                    service_version=observation.service_version,
+                    fingerprint=fingerprint_json,
+                    evidence=evidence_json,
+                    evidence_summary=observation.evidence_summary,
+                    evidence_grade=evidence_grade,
+                    why_trace=build_why_trace(
+                        None,
+                        observation.evidence_summary or "No rule matched; coverage gap logged",
+                        source="no_rule_match",
+                        context=context,
+                    ),
+                    severity="informational",
+                    description="Open service detected without matching CVE rule",
+                )
             session.add(finding)
             persisted.append((finding, observation))
             record_rule_gap(observation, reason="no_rule_match")

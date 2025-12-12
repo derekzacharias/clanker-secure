@@ -26,6 +26,7 @@ Roles
 Local Dev (backend)
 - `poetry install --with dev`
 - `poetry run uvicorn clanker.main:app --host 0.0.0.0 --port 8000`
+- Start the scan worker for queued jobs: `poetry run python -m clanker.worker`
 
 Local Dev (frontend)
 - `cd frontend && npm install && npm run dev`
@@ -34,3 +35,6 @@ Local Dev (frontend)
 Rebuild/Restart
 - Always run `scripts/rebuild.sh` after changes to ensure the container reflects the latest code.
 
+Scan Queue
+- Scans are queued on creation; a background worker pulls from the queue and runs `run_scan_job`.
+- To re-enqueue a scan without resetting findings, call `POST /scans/{scan_id}/enqueue` (admin/operator).

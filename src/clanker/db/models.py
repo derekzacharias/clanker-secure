@@ -1,8 +1,12 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 from sqlalchemy import Column, String, Text
 from sqlmodel import Field, Relationship, SQLModel
+
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 class ScanTarget(SQLModel, table=True):
@@ -31,7 +35,7 @@ class AssetBase(SQLModel):
 
 class Asset(AssetBase, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
-    created_at: datetime = Field(default_factory=datetime.utcnow, nullable=False)
+    created_at: datetime = Field(default_factory=utc_now, nullable=False)
 
     scans: List["Scan"] = Relationship(back_populates="assets", link_model=ScanTarget)
 
@@ -71,7 +75,7 @@ class ScanBase(SQLModel):
 
 class Scan(ScanBase, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=utc_now)
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
 
@@ -100,7 +104,7 @@ class ScanDetail(ScanRead):
 
 class SSHScan(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=utc_now)
     created_by_user_id: Optional[int] = Field(default=None, foreign_key="user.id")
     status: str = Field(default="queued", max_length=32)
     notes: Optional[str] = None
@@ -177,7 +181,7 @@ class ScanAssetStatusRead(SQLModel):
 class ScanEvent(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     scan_id: int = Field(foreign_key="scan.id")
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=utc_now)
     message: str
     correlation_id: Optional[str] = Field(default=None, max_length=64, index=True)
 
@@ -189,6 +193,19 @@ class ScanEventRead(SQLModel):
     created_at: datetime
     message: str
     correlation_id: Optional[str]
+
+
+class ScanJob(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    scan_id: int = Field(foreign_key="scan.id", unique=True)
+    status: str = Field(default="queued", max_length=32)
+    attempts: int = Field(default=0)
+    max_attempts: int = Field(default=3)
+    last_error: Optional[str] = None
+    enqueued_at: datetime = Field(default_factory=utc_now)
+    started_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+    updated_at: datetime = Field(default_factory=utc_now)
 
 
 class FindingBase(SQLModel):
@@ -205,6 +222,8 @@ class FindingBase(SQLModel):
     fingerprint: Optional[str] = Field(default=None, sa_column=Column("fingerprint", Text))
     evidence: Optional[str] = Field(default=None, sa_column=Column("evidence", Text))
     evidence_summary: Optional[str] = Field(default=None, max_length=500)
+    evidence_grade: Optional[str] = Field(default=None, max_length=32)
+    why_trace: Optional[str] = Field(default=None, sa_column=Column("why_trace", Text))
     rule_id: Optional[str] = None
     severity: str = Field(default="informational")
     cve_ids: Optional[str] = Field(default=None, description="JSON array stored as string")
@@ -219,7 +238,7 @@ class Finding(FindingBase, table=True):
     scan_id: Optional[int] = Field(default=None, foreign_key="scan.id")
     asset_id: Optional[int] = Field(default=None, foreign_key="asset.id")
     assigned_user_id: Optional[int] = Field(default=None, foreign_key="user.id")
-    detected_at: datetime = Field(default_factory=datetime.utcnow)
+    detected_at: datetime = Field(default_factory=utc_now)
     sla_due_at: Optional[datetime] = Field(default=None)
     closed_at: Optional[datetime] = Field(default=None)
 
@@ -251,7 +270,7 @@ class FindingComment(SQLModel, table=True):
     finding_id: int = Field(foreign_key="finding.id", index=True)
     user_id: int = Field(foreign_key="user.id")
     message: str = Field(max_length=2000)
-    created_at: datetime = Field(default_factory=datetime.utcnow, nullable=False)
+    created_at: datetime = Field(default_factory=utc_now, nullable=False)
 
 
 class FindingCommentRead(SQLModel):
@@ -264,7 +283,7 @@ class FindingCommentRead(SQLModel):
 
 class User(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
-    created_at: datetime = Field(default_factory=datetime.utcnow, nullable=False)
+    created_at: datetime = Field(default_factory=utc_now, nullable=False)
 
     email: str = Field(index=True, unique=True, max_length=255)
     name: Optional[str] = Field(default=None, max_length=255)
@@ -275,7 +294,7 @@ class User(SQLModel, table=True):
 
 class SessionToken(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=utc_now)
 
     user_id: int = Field(foreign_key="user.id")
     token: str = Field(index=True, unique=True)
@@ -295,7 +314,7 @@ class UserRead(SQLModel):
 
 class LoginAttempt(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=utc_now)
     email: str = Field(index=True, max_length=255)
     ip: Optional[str] = Field(default=None, max_length=48)
     success: bool = Field(default=False)
@@ -303,7 +322,7 @@ class LoginAttempt(SQLModel, table=True):
 
 class AuditLog(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=utc_now)
     actor_user_id: Optional[int] = Field(default=None, foreign_key="user.id")
     action: str = Field(max_length=64)
     target: Optional[str] = Field(default=None, max_length=128)
@@ -313,7 +332,7 @@ class AuditLog(SQLModel, table=True):
 
 class InviteToken(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=utc_now)
 
     email: str = Field(index=True, max_length=255)
     role: str = Field(default="operator", max_length=32)
@@ -325,7 +344,7 @@ class InviteToken(SQLModel, table=True):
 
 class Schedule(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
-    created_at: datetime = Field(default_factory=datetime.utcnow, nullable=False)
+    created_at: datetime = Field(default_factory=utc_now, nullable=False)
     name: str = Field(max_length=200)
     profile: str = Field(default="basic", max_length=50)
     asset_ids_json: str = Field(default="[]")
@@ -337,7 +356,7 @@ class Schedule(SQLModel, table=True):
 
 class AgentIngest(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
-    created_at: datetime = Field(default_factory=datetime.utcnow, nullable=False)
+    created_at: datetime = Field(default_factory=utc_now, nullable=False)
 
     asset_id: Optional[int] = Field(default=None, foreign_key="asset.id")
     agent_id: Optional[str] = Field(default=None, max_length=255)

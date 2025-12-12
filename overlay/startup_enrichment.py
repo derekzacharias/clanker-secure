@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from clanker.main import app
+from clanker.main import app, register_startup_hook
 from sqlalchemy import text
 from clanker.db.session import engine
 
 
-@app.on_event("startup")
+@register_startup_hook
 def _ensure_enrichment_table() -> None:
     # Create separate enrichment table to avoid altering core models
     ddl = (

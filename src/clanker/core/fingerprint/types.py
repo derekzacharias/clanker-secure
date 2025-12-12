@@ -21,6 +21,7 @@ class FingerprintResult:
     vendor: Optional[str] = None
     product: Optional[str] = None
     version: Optional[str] = None
+    version_confidence: float = 0.0
     confidence: float = 0.0
     source: str = "unknown"
     attributes: Dict[str, Any] = field(default_factory=dict)

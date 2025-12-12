@@ -84,11 +84,32 @@ def apply_migrations(engine: Engine) -> None:
     add_column_if_missing(engine, "finding", "fingerprint", "TEXT")
     add_column_if_missing(engine, "finding", "evidence", "TEXT")
     add_column_if_missing(engine, "finding", "evidence_summary", "TEXT")
+    add_column_if_missing(engine, "finding", "evidence_grade", "TEXT")
+    add_column_if_missing(engine, "finding", "why_trace", "TEXT")
     add_column_if_missing(engine, "finding", "assigned_user_id", "INTEGER")
     add_column_if_missing(engine, "finding", "sla_due_at", "TEXT")
     add_column_if_missing(engine, "finding", "closed_at", "TEXT")
     add_column_if_missing(engine, "agentingest", "interface_count", "INTEGER DEFAULT 0")
     add_column_if_missing(engine, "agentingest", "config_count", "INTEGER DEFAULT 0")
+    if not _table_exists(engine, "scanjob"):
+        ddl = (
+            "CREATE TABLE scanjob ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "scan_id INTEGER NOT NULL UNIQUE,"
+            "status TEXT NOT NULL DEFAULT 'queued',"
+            "attempts INTEGER NOT NULL DEFAULT 0,"
+            "max_attempts INTEGER NOT NULL DEFAULT 3,"
+            "last_error TEXT,"
+            "enqueued_at TEXT NOT NULL DEFAULT (datetime('now')),"
+            "started_at TEXT,"
+            "completed_at TEXT,"
+            "updated_at TEXT NOT NULL DEFAULT (datetime('now')),"
+            "FOREIGN KEY(scan_id) REFERENCES scan(id)"
+            ")"
+        )
+        with engine.connect() as connection:
+            connection.execute(text(ddl))
+            connection.commit()
     if not _table_exists(engine, "schedule"):
         ddl = (
             "CREATE TABLE schedule ("

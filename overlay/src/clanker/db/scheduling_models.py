@@ -1,16 +1,20 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 from sqlmodel import Field, SQLModel
+
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 class AssetGroup(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     name: str = Field(max_length=120, index=True)
     description: Optional[str] = None
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=utc_now)
 
 
 class AssetGroupMember(SQLModel, table=True):

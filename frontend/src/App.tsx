@@ -106,6 +106,10 @@ interface Finding {
   cvss_vector?: string | null;
   references?: string[] | null;
   rule_source?: string | null;
+  evidence_grade?: string | null;
+  why_trace?: string | null;
+  version_confidence?: number | null;
+  evidence_types?: string[];
 }
 
 interface FindingEnrichment {
@@ -2378,6 +2382,7 @@ const handleLogout = async (): Promise<void> => {
                         { label: 'Recent', value: 'recent' },
                         { label: 'Severity', value: 'severity' },
                         { label: 'Port', value: 'port' },
+                        { label: 'Evidence', value: 'evidence' },
                       ]}
                     />
                     <TextInput placeholder="Search service, host, text" value={findingSearch} onChange={(e) => setFindingSearch(e.currentTarget.value)} style={{ minWidth: rem(180), flex: 1 }} />
@@ -2424,6 +2429,10 @@ const handleLogout = async (): Promise<void> => {
                               if (findingSort === 'severity') {
                                 const order: Record<string, number> = { critical: 4, high: 3, medium: 2, low: 1, informational: 0 };
                                 return (order[(b.severity || '').toLowerCase()] ?? 0) - (order[(a.severity || '').toLowerCase()] ?? 0);
+                              }
+                              if (findingSort === 'evidence') {
+                                const gradeOrder: Record<string, number> = { high: 3, medium: 2, low: 1 };
+                                return (gradeOrder[(b.evidence_grade || '').toLowerCase()] ?? 0) - (gradeOrder[(a.evidence_grade || '').toLowerCase()] ?? 0);
                               }
                               // recent
                               return new Date(b.detected_at).getTime() - new Date(a.detected_at).getTime();
@@ -2595,6 +2604,11 @@ const handleLogout = async (): Promise<void> => {
             {selectedFinding.rule_source && (
               <Badge color="gray" variant="light">Rule source: {selectedFinding.rule_source}</Badge>
             )}
+            {selectedFinding.evidence_grade && (
+              <Badge color={selectedFinding.evidence_grade === 'high' ? 'red' : selectedFinding.evidence_grade === 'medium' ? 'orange' : 'gray'} variant="outline">
+                Evidence grade: {selectedFinding.evidence_grade}
+              </Badge>
+            )}
             {selectedFinding.description && (
               <Paper p="sm" withBorder>
                 <Text size="sm">{selectedFinding.description}</Text>
@@ -2685,6 +2699,12 @@ const handleLogout = async (): Promise<void> => {
                     {findingGroupIndex.get(selectedFinding.id)?.hostReport}
                   </Text>
                 </ScrollArea>
+              </Paper>
+            )}
+            {selectedFinding.why_trace && (
+              <Paper p="sm" withBorder>
+                <Text fw={600} size="sm">Why this finding</Text>
+                <Text size="sm" c="dimmed">{selectedFinding.why_trace}</Text>
               </Paper>
             )}
           </Stack>

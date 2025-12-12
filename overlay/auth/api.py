@@ -8,8 +8,7 @@ from fastapi import Depends, HTTPException, Request
 from pydantic import BaseModel
 from sqlmodel import Session, select, func
 
-from clanker.main import app
-from clanker.main import session_dep
+from clanker.main import app, register_startup_hook, session_dep
 from .models import SessionToken, User, UserRead, LoginAttempt, AuditLog, InviteToken
 from .security import (
     create_session_token,
@@ -228,7 +227,7 @@ def _seed_admin_if_configured(session: Session) -> None:
 from clanker.db.session import get_session
 
 
-@app.on_event("startup")
+@register_startup_hook
 def _seed_admin_on_startup() -> None:
     try:
         with get_session() as s:
@@ -495,7 +494,7 @@ from sqlmodel import SQLModel
 from clanker.db.session import engine
 
 
-@app.on_event("startup")
+@register_startup_hook
 def _ensure_auth_tables() -> None:
     # Ensure auth tables exist for rate limiting and audit logging
     SQLModel.metadata.create_all(engine)

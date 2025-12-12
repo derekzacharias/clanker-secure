@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 import socket
 import ssl
-from typing import List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence
 import struct
 
 import httpx
@@ -18,6 +18,8 @@ DEFAULT_TIMEOUT = settings.fingerprint_timeout_seconds
 class Detector:
     name: str = "base"
     protocols: Sequence[str] = ("tcp",)
+    priority: int = 50
+    evidence_kinds: Sequence[str] = ()
 
     def applies(self, observation: ServiceObservation) -> bool:  # pragma: no cover - interface
         raise NotImplementedError
@@ -25,10 +27,18 @@ class Detector:
     def detect(self, host: str, observation: ServiceObservation) -> Optional[FingerprintResult]:  # pragma: no cover
         raise NotImplementedError
 
+    def parse_artifacts(self, host: str, observation: ServiceObservation, artifacts: Dict[str, object]) -> Optional[FingerprintResult]:
+        """
+        Parse captured artifacts for this protocol.
+        """
+        raise NotImplementedError
+
 
 class HttpDetector(Detector):
     name = "http-basic"
     protocols = ("tcp",)
+    priority = 5
+    evidence_kinds = ("http_response",)
     http_ports = {80, 8000, 8080, 8088, 8081, 8888}
     https_ports = {443, 8443, 9443, 4443, 10443}
 
@@ -58,56 +68,32 @@ class HttpDetector(Detector):
         scheme = self._choose_scheme(observation)
         url = f"{scheme}://{host}:{observation.port or 80}/"
         try:
-            with httpx.Client(verify=False, timeout=DEFAULT_TIMEOUT, follow_redirects=settings.fingerprint_http_follow_redirects) as client:
+            with httpx.Client(
+                verify=False, timeout=DEFAULT_TIMEOUT, follow_redirects=settings.fingerprint_http_follow_redirects
+            ) as client:
                 resp = client.get(url, headers={"User-Agent": "clanker-fp/0.1"})
         except Exception:
             return None
-        server_header = resp.headers.get("server")
-        powered_by = resp.headers.get("x-powered-by")
-        title = _extract_title(resp.text or "")
-        body_hash = _short_hash(resp.text or "")
-        evidence = [
-            FingerprintEvidence(
-                type="http_response",
-                summary=f"{resp.status_code} {resp.reason_phrase}",
-                data={
-                    "url": url,
-                    "status_code": resp.status_code,
-                    "reason": resp.reason_phrase,
-                    "headers": dict(resp.headers),
-                    "title": title,
-                    "body_preview_hash": body_hash,
-                },
-            )
-        ]
-        summary_bits: List[str] = [f"{resp.status_code}"]
-        if title:
-            summary_bits.append(title[:80])
-        if server_header:
-            summary_bits.append(server_header)
-        summary = " | ".join(summary_bits)
-        product = server_header or powered_by
-        confidence = 0.55 if product else 0.4
-        return FingerprintResult(
-            protocol="http",
-            port=observation.port or 80,
-            vendor=None,
-            product=product,
-            version=None,
-            confidence=confidence,
-            source="http_probe",
-            attributes={
-                "powered_by": powered_by,
-                "title": title,
-                "redirect_chain": [str(h.url) for h in resp.history] if resp.history else [],
-            },
-            evidence_summary=summary,
-            evidence=evidence,
-        )
+        artifacts = {
+            "url": url,
+            "status_code": resp.status_code,
+            "reason": resp.reason_phrase,
+            "headers": dict(resp.headers),
+            "body": resp.text or "",
+            "history": [str(h.url) for h in resp.history] if resp.history else [],
+        }
+        return self.parse_artifacts(host, observation, artifacts)
+
+    def parse_artifacts(
+        self, host: str, observation: ServiceObservation, artifacts: Dict[str, object]
+    ) -> Optional[FingerprintResult]:
+        return _fingerprint_http_from_artifacts(artifacts, observation.port or 80)
 
 
 class TlsDetector(Detector):
     name = "tls-handshake"
+    priority = 10
+    evidence_kinds = ("tls_certificate", "tls_session")
     tls_ports = {443, 8443, 9443, 993, 995, 587, 465, 10443, 4443}
 
     def applies(self, observation: ServiceObservation) -> bool:
@@ -130,47 +116,19 @@ class TlsDetector(Detector):
                     version = tls_sock.version()
         except Exception:
             return None
-        subject = _flatten_name(cert.get("subject", []))
-        issuer = _flatten_name(cert.get("issuer", []))
-        san = cert.get("subjectAltName", [])
-        san_values = [entry[1] for entry in san if len(entry) >= 2]
-        evidence = [
-            FingerprintEvidence(
-                type="tls_certificate",
-                summary=f"{subject or 'unknown'} issued by {issuer or 'unknown'}",
-                data={
-                    "subject": subject,
-                    "issuer": issuer,
-                    "sans": san_values,
-                    "not_before": cert.get("notBefore"),
-                    "not_after": cert.get("notAfter"),
-                    "serial_number": cert.get("serialNumber"),
-                    "version": cert.get("version"),
-                },
-            ),
-            FingerprintEvidence(
-                type="tls_session",
-                summary=f"{version or 'TLS'} {cipher[0] if cipher else 'unknown'}",
-                data={"cipher": cipher, "protocol_version": version},
-            ),
-        ]
-        summary = f"{subject or 'unknown'} via {version or 'TLS'}"
-        return FingerprintResult(
-            protocol="tls",
-            port=port,
-            vendor=None,
-            product=None,
-            version=version,
-            confidence=0.6,
-            source="tls_handshake",
-            attributes={"issuer": issuer, "subject": subject, "sans": san_values, "cipher": cipher},
-            evidence_summary=summary,
-            evidence=evidence,
-        )
+        artifacts = {"cert": cert, "cipher": cipher, "version": version, "port": port}
+        return self.parse_artifacts(host, observation, artifacts)
+
+    def parse_artifacts(
+        self, host: str, observation: ServiceObservation, artifacts: Dict[str, object]
+    ) -> Optional[FingerprintResult]:
+        return _fingerprint_tls_from_artifacts(artifacts)
 
 
 class SshDetector(Detector):
     name = "ssh-banner"
+    priority = 15
+    evidence_kinds = ("ssh_banner",)
 
     def applies(self, observation: ServiceObservation) -> bool:
         if observation.protocol != "tcp":
@@ -187,31 +145,21 @@ class SshDetector(Detector):
             return None
         if not banner:
             return None
-        version, product = _parse_ssh_banner(banner)
-        evidence = [
-            FingerprintEvidence(
-                type="ssh_banner",
-                summary=banner[:120],
-                data={"banner": banner, "parsed_version": version, "parsed_product": product},
-            )
-        ]
-        summary = banner[:140]
-        return FingerprintResult(
-            protocol="ssh",
-            port=port,
-            vendor=None,
-            product=product,
-            version=version,
-            confidence=0.65 if product else 0.45,
-            source="ssh_banner",
-            attributes={},
-            evidence_summary=summary,
-            evidence=evidence,
-        )
+        artifacts = {"banner": banner, "port": port}
+        return self.parse_artifacts(host, observation, artifacts)
+
+    def parse_artifacts(
+        self, host: str, observation: ServiceObservation, artifacts: Dict[str, object]
+    ) -> Optional[FingerprintResult]:
+        banner = str(artifacts.get("banner") or "")
+        port = int(artifacts.get("port") or observation.port or 22)
+        return _fingerprint_ssh_from_banner(banner, port)
 
 
 class MysqlDetector(Detector):
     name = "mysql-handshake"
+    priority = 20
+    evidence_kinds = ("mysql_handshake",)
 
     def applies(self, observation: ServiceObservation) -> bool:
         return observation.protocol == "tcp" and observation.port in {3306, 3307}
@@ -223,35 +171,27 @@ class MysqlDetector(Detector):
                 packet = sock.recv(512)
         except Exception:
             return None
-        parsed = _parse_mysql_handshake(packet)
-        if not parsed:
+        return self.parse_artifacts(host, observation, {"packet": packet, "port": port})
+
+    def parse_artifacts(
+        self, host: str, observation: ServiceObservation, artifacts: Dict[str, object]
+    ) -> Optional[FingerprintResult]:
+        packet = artifacts.get("packet")
+        port = int(artifacts.get("port") or observation.port or 3306)
+        if not isinstance(packet, (bytes, bytearray)):
             return None
-        evidence = [
-            FingerprintEvidence(
-                type="mysql_handshake",
-                summary=f"MySQL protocol {parsed.get('protocol_version')} {parsed.get('server_version')}",
-                data=parsed,
-            )
-        ]
-        return FingerprintResult(
-            protocol="mysql",
-            port=port,
-            vendor="Oracle" if "mysql" in (parsed.get("server_version") or "").lower() else None,
-            product=parsed.get("server_version"),
-            version=parsed.get("server_version"),
-            confidence=0.7,
-            source="mysql_handshake",
-            attributes=parsed,
-            evidence_summary=evidence[0].summary,
-            evidence=evidence,
-        )
+        return _fingerprint_mysql_from_packet(bytes(packet), port)
 
 
 class RdpDetector(Detector):
     name = "rdp-probe"
+    priority = 30
+    evidence_kinds = ("rdp_negotiation",)
 
     def applies(self, observation: ServiceObservation) -> bool:
-        return observation.protocol == "tcp" and (observation.port == 3389 or "ms-wbt" in (observation.service_name or ""))
+        return observation.protocol == "tcp" and (
+            observation.port == 3389 or "ms-wbt" in (observation.service_name or "")
+        )
 
     def detect(self, host: str, observation: ServiceObservation) -> Optional[FingerprintResult]:
         port = observation.port or 3389
@@ -263,90 +203,68 @@ class RdpDetector(Detector):
                 resp = sock.recv(256)
         except Exception:
             resp = b""
-        if not resp:
-            summary = "RDP port reachable"
-        else:
-            summary = f"RDP response {len(resp)} bytes"
-        evidence = [
-            FingerprintEvidence(
-                type="rdp_negotiation",
-                summary=summary,
-                data={"response_len": len(resp), "response_hex": resp.hex() if resp else None},
-            )
-        ]
-        return FingerprintResult(
-            protocol="rdp",
-            port=port,
-            vendor=None,
-            product="RDP",
-            version=None,
-            confidence=0.45,
-            source="rdp_probe",
-            attributes={},
-            evidence_summary=summary,
-            evidence=evidence,
-        )
+        return self.parse_artifacts(host, observation, {"response": resp, "port": port})
+
+    def parse_artifacts(
+        self, host: str, observation: ServiceObservation, artifacts: Dict[str, object]
+    ) -> Optional[FingerprintResult]:
+        resp = artifacts.get("response")
+        port = int(artifacts.get("port") or observation.port or 3389)
+        if resp is None:
+            resp = b""
+        return _fingerprint_rdp_from_response(bytes(resp), port)
 
 
 class SmbDetector(Detector):
     name = "smb-probe"
+    priority = 40
+    evidence_kinds = ("smb_banner",)
 
     def applies(self, observation: ServiceObservation) -> bool:
-        return observation.protocol == "tcp" and (observation.port in {139, 445} or "smb" in (observation.service_name or ""))
+        return observation.protocol == "tcp" and (
+            observation.port in {139, 445} or "smb" in (observation.service_name or "")
+        )
 
     def detect(self, host: str, observation: ServiceObservation) -> Optional[FingerprintResult]:
-        port = observation.port or 445
-        # SMB requires client greeting; we only check reachability and reuse nmap banner if present.
-        summary = f"SMB service detected on {port}"
-        evidence = [
-            FingerprintEvidence(
-                type="smb_banner",
-                summary=summary,
-                data={"service_name": observation.service_name, "service_version": observation.service_version},
-            )
-        ]
-        return FingerprintResult(
-            protocol="smb",
-            port=port,
-            vendor=None,
-            product=observation.service_name or "smb",
-            version=observation.service_version,
-            confidence=0.35,
-            source="nmap_banner",
-            attributes={},
-            evidence_summary=summary,
-            evidence=evidence,
+        return self.parse_artifacts(
+            host,
+            observation,
+            {"service_name": observation.service_name, "service_version": observation.service_version},
         )
+
+    def parse_artifacts(
+        self, host: str, observation: ServiceObservation, artifacts: Dict[str, object]
+    ) -> Optional[FingerprintResult]:
+        name = artifacts.get("service_name") or observation.service_name or "smb"
+        version = artifacts.get("service_version") or observation.service_version
+        port = observation.port or 445
+        return _fingerprint_smb_from_banner(str(name), version, port)
 
 
 class SnmpDetector(Detector):
     name = "snmp-udp"
     protocols = ("udp", "tcp")
+    priority = 45
+    evidence_kinds = ("snmp_probe",)
 
     def applies(self, observation: ServiceObservation) -> bool:
-        return (observation.protocol in self.protocols) and (observation.port in {161, 162} or "snmp" in (observation.service_name or ""))
+        return (observation.protocol in self.protocols) and (
+            observation.port in {161, 162} or "snmp" in (observation.service_name or "")
+        )
 
     def detect(self, host: str, observation: ServiceObservation) -> Optional[FingerprintResult]:
-        summary = "SNMP endpoint discovered"
-        evidence = [
-            FingerprintEvidence(
-                type="snmp_probe",
-                summary=summary,
-                data={"service_name": observation.service_name, "service_version": observation.service_version},
-            )
-        ]
-        return FingerprintResult(
-            protocol="snmp",
-            port=observation.port or 161,
-            vendor=None,
-            product="snmp",
-            version=observation.service_version,
-            confidence=0.3,
-            source="nmap_banner",
-            attributes={},
-            evidence_summary=summary,
-            evidence=evidence,
+        return self.parse_artifacts(
+            host,
+            observation,
+            {"service_name": observation.service_name or "snmp", "service_version": observation.service_version},
         )
+
+    def parse_artifacts(
+        self, host: str, observation: ServiceObservation, artifacts: Dict[str, object]
+    ) -> Optional[FingerprintResult]:
+        name = str(artifacts.get("service_name") or "snmp")
+        version = artifacts.get("service_version") or observation.service_version
+        return _fingerprint_snmp_from_banner(name, version, observation.port or 161)
 
 
 def _extract_title(body: str) -> Optional[str]:
@@ -373,19 +291,153 @@ def _flatten_name(pairs: Sequence[Sequence[tuple]]) -> Optional[str]:
     return ", ".join(flattened) if flattened else None
 
 
+def _extract_product_version(header: Optional[str]) -> Optional[str]:
+    if not header:
+        return None
+    match = re.search(r"/([0-9][A-Za-z0-9._-]*)", header)
+    if match:
+        return match.group(1)
+    return None
+
+
+def _fingerprint_http_from_artifacts(artifacts: Dict[str, object], port: int) -> Optional[FingerprintResult]:
+    url = str(artifacts.get("url") or f"http://unknown:{port}/")
+    status_code = int(artifacts.get("status_code") or 0)
+    reason = str(artifacts.get("reason") or "")
+    headers_raw = artifacts.get("headers") or {}
+    headers = dict(headers_raw) if isinstance(headers_raw, dict) else {}
+    # normalize header keys for predictability
+    normalized_headers = {str(k).lower(): v for k, v in headers.items()}
+    powered_by = normalized_headers.get("x-powered-by")
+    server_header = normalized_headers.get("server")
+    body = str(artifacts.get("body") or "")
+    history = artifacts.get("history") or []
+    title = _extract_title(body)
+    body_hash = _short_hash(body)
+    product = server_header or powered_by
+    version = _extract_product_version(server_header) or _extract_product_version(powered_by)
+    version_confidence = 0.7 if version else 0.35
+    confidence = 0.65 if product else 0.4
+    evidence = [
+        FingerprintEvidence(
+            type="http_response",
+            summary=f"{status_code} {reason}".strip(),
+            data={
+                "url": url,
+                "status_code": status_code,
+                "reason": reason,
+                "headers": normalized_headers,
+                "title": title,
+                "body_preview_hash": body_hash,
+                "history": history,
+            },
+        )
+    ]
+    summary_bits: List[str] = [f"{status_code}"]
+    if title:
+        summary_bits.append(title[:80])
+    if server_header:
+        summary_bits.append(server_header)
+    summary = " | ".join(summary_bits)
+    return FingerprintResult(
+        protocol="http",
+        port=port,
+        vendor=None,
+        product=product,
+        version=version,
+        version_confidence=version_confidence,
+        confidence=confidence,
+        source="http_probe",
+        attributes={
+            "powered_by": powered_by,
+            "title": title,
+            "redirect_chain": list(history),
+            "status_code": status_code,
+        },
+        evidence_summary=summary,
+        evidence=evidence,
+    )
+
+
+def _fingerprint_tls_from_artifacts(artifacts: Dict[str, object]) -> Optional[FingerprintResult]:
+    cert = artifacts.get("cert") or {}
+    cipher = artifacts.get("cipher")
+    version = artifacts.get("version")
+    port = int(artifacts.get("port") or 443)
+    subject = _flatten_name(cert.get("subject", [])) if isinstance(cert, dict) else None
+    issuer = _flatten_name(cert.get("issuer", [])) if isinstance(cert, dict) else None
+    san = cert.get("subjectAltName", []) if isinstance(cert, dict) else []
+    san_values = [entry[1] for entry in san if isinstance(entry, (list, tuple)) and len(entry) >= 2]
+    evidence = [
+        FingerprintEvidence(
+            type="tls_certificate",
+            summary=f"{subject or 'unknown'} issued by {issuer or 'unknown'}",
+            data={
+                "subject": subject,
+                "issuer": issuer,
+                "sans": san_values,
+                "not_before": cert.get("notBefore") if isinstance(cert, dict) else None,
+                "not_after": cert.get("notAfter") if isinstance(cert, dict) else None,
+                "serial_number": cert.get("serialNumber") if isinstance(cert, dict) else None,
+                "version": cert.get("version") if isinstance(cert, dict) else None,
+            },
+        ),
+        FingerprintEvidence(
+            type="tls_session",
+            summary=f"{version or 'TLS'} {cipher[0] if cipher else 'unknown'}",
+            data={"cipher": cipher, "protocol_version": version},
+        ),
+    ]
+    summary = f"{subject or 'unknown'} via {version or 'TLS'}"
+    return FingerprintResult(
+        protocol="tls",
+        port=port,
+        vendor=None,
+        product=None,
+        version=version if version else None,
+        version_confidence=0.5 if version else 0.25,
+        confidence=0.6,
+        source="tls_handshake",
+        attributes={"issuer": issuer, "subject": subject, "sans": san_values, "cipher": cipher},
+        evidence_summary=summary,
+        evidence=evidence,
+    )
+
+
+def _fingerprint_ssh_from_banner(banner: str, port: int) -> Optional[FingerprintResult]:
+    version, product = _parse_ssh_banner(banner)
+    evidence = [
+        FingerprintEvidence(
+            type="ssh_banner",
+            summary=banner[:120],
+            data={"banner": banner, "parsed_version": version, "parsed_product": product},
+        )
+    ]
+    summary = banner[:140]
+    return FingerprintResult(
+        protocol="ssh",
+        port=port,
+        vendor=None,
+        product=product,
+        version=version,
+        version_confidence=0.65 if version else 0.3,
+        confidence=0.65 if product else 0.45,
+        source="ssh_banner",
+        attributes={},
+        evidence_summary=summary,
+        evidence=evidence,
+    )
+
+
 def _parse_ssh_banner(banner: str) -> tuple[Optional[str], Optional[str]]:
-    parts = banner.split()
-    if not parts:
+    match = re.match(r"SSH-(?P<proto>[0-9.]+)-(?P<software>[^\s]+)", banner)
+    if not match:
         return None, None
-    proto = parts[0]
-    version = None
-    product = None
-    if "-" in proto:
-        tokens = proto.split("-")
-        if len(tokens) >= 2:
-            version = tokens[1]
-        if len(tokens) >= 3:
-            product = tokens[2]
+    proto = match.group("proto")
+    software = match.group("software")
+    version_match = re.search(r"([0-9][0-9.p_]*)", software)
+    version = version_match.group(1) if version_match else proto
+    product = software.replace("_", " ")
     return version, product
 
 
@@ -396,6 +448,7 @@ def _parse_mysql_handshake(packet: bytes) -> Optional[dict]:
     if len(packet) < 5:
         return None
     protocol_version = packet[4]
+    server_version_end = 5
     try:
         server_version_end = packet.index(0, 5)
         server_version = packet[5:server_version_end].decode(errors="ignore")
@@ -411,4 +464,119 @@ def _parse_mysql_handshake(packet: bytes) -> Optional[dict]:
     }
 
 
-DETECTORS: List[Detector] = [HttpDetector(), TlsDetector(), SshDetector(), MysqlDetector(), RdpDetector(), SmbDetector(), SnmpDetector()]
+def _fingerprint_mysql_from_packet(packet: bytes, port: int) -> Optional[FingerprintResult]:
+    parsed = _parse_mysql_handshake(packet)
+    if not parsed:
+        return None
+    evidence = [
+        FingerprintEvidence(
+            type="mysql_handshake",
+            summary=f"MySQL protocol {parsed.get('protocol_version')} {parsed.get('server_version')}",
+            data=parsed,
+        )
+    ]
+    server_version = parsed.get("server_version")
+    vendor_guess = "Oracle" if isinstance(server_version, str) and "mysql" in server_version.lower() else None
+    return FingerprintResult(
+        protocol="mysql",
+        port=port,
+        vendor=vendor_guess,
+        product=server_version,
+        version=server_version,
+        version_confidence=0.75 if server_version else 0.4,
+        confidence=0.7,
+        source="mysql_handshake",
+        attributes=parsed,
+        evidence_summary=evidence[0].summary,
+        evidence=evidence,
+    )
+
+
+def _fingerprint_rdp_from_response(response: bytes, port: int) -> FingerprintResult:
+    summary = "RDP port reachable" if not response else f"RDP response {len(response)} bytes"
+    evidence = [
+        FingerprintEvidence(
+            type="rdp_negotiation",
+            summary=summary,
+            data={"response_len": len(response), "response_hex": response.hex() if response else None},
+        )
+    ]
+    return FingerprintResult(
+        protocol="rdp",
+        port=port,
+        vendor=None,
+        product="RDP",
+        version=None,
+        version_confidence=0.0,
+        confidence=0.45,
+        source="rdp_probe",
+        attributes={},
+        evidence_summary=summary,
+        evidence=evidence,
+    )
+
+
+def _fingerprint_smb_from_banner(service_name: str, service_version: Optional[str], port: int) -> FingerprintResult:
+    summary = f"SMB service detected on {port}"
+    evidence = [
+        FingerprintEvidence(
+            type="smb_banner",
+            summary=summary,
+            data={"service_name": service_name, "service_version": service_version},
+        )
+    ]
+    return FingerprintResult(
+        protocol="smb",
+        port=port,
+        vendor=None,
+        product=service_name or "smb",
+        version=service_version,
+        version_confidence=0.4 if service_version else 0.2,
+        confidence=0.35 if service_version else 0.25,
+        source="nmap_banner",
+        attributes={"service_version": service_version},
+        evidence_summary=summary,
+        evidence=evidence,
+    )
+
+
+def _fingerprint_snmp_from_banner(service_name: str, service_version: Optional[str], port: int) -> FingerprintResult:
+    summary = "SNMP endpoint discovered"
+    evidence = [
+        FingerprintEvidence(
+            type="snmp_probe",
+            summary=summary,
+            data={"service_name": service_name, "service_version": service_version},
+        )
+    ]
+    return FingerprintResult(
+        protocol="snmp",
+        port=port,
+        vendor=None,
+        product=service_name or "snmp",
+        version=service_version,
+        version_confidence=0.25 if service_version else 0.1,
+        confidence=0.3,
+        source="nmap_banner",
+        attributes={"service_version": service_version},
+        evidence_summary=summary,
+        evidence=evidence,
+    )
+
+
+DETECTORS: List[Detector] = sorted(
+    [HttpDetector(), TlsDetector(), SshDetector(), MysqlDetector(), RdpDetector(), SmbDetector(), SnmpDetector()],
+    key=lambda det: det.priority,
+)
+
+
+def parser_inventory() -> List[Dict[str, object]]:
+    return [
+        {
+            "name": det.name,
+            "protocols": det.protocols,
+            "priority": det.priority,
+            "evidence": det.evidence_kinds,
+        }
+        for det in DETECTORS
+    ]

@@ -125,6 +125,8 @@ def test_agent_ingest_creates_findings_from_inventory():
         assert findings, "Expected findings persisted from agent inventory"
         assert any(f.rule_id and f.rule_id.startswith("AGENT-") for f in findings)
         assert any(f.evidence for f in findings)
+        assert all(f.evidence_grade for f in findings if f.evidence)
+        assert all(f.why_trace for f in findings if f.rule_id)
         sources = []
         for f in findings:
             try:

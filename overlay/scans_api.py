@@ -1,12 +1,11 @@
 from __future__ import annotations
 
 from fastapi import Depends, HTTPException
-from clanker.main import app, session_dep
+from clanker.main import app, now_utc, session_dep
 from sqlmodel import Session, select
 from overlay.auth.security import require_roles
 from clanker.db.models import Scan, ScanAssetStatus
 from clanker.db.session import get_session
-from datetime import datetime
 
 
 @app.post("/scans/{scan_id}/cancel")
@@ -19,11 +18,11 @@ def cancel_scan(scan_id: int, _: object = Depends(require_roles("admin", "operat
     for row in rows:
         if row.status in ("pending", "running"):
             row.status = "cancelled"
-            row.completed_at = row.completed_at or datetime.utcnow()
+            row.completed_at = row.completed_at or now_utc()
             session.add(row)
     # Mark scan
     scan.status = "cancelled"
-    scan.completed_at = scan.completed_at or datetime.utcnow()
+    scan.completed_at = scan.completed_at or now_utc()
     if not (scan.notes or "").startswith("cancelled"):
         scan.notes = (scan.notes + "\n" if scan.notes else "") + "cancelled by user"
     session.add(scan)
@@ -33,4 +32,3 @@ def cancel_scan(scan_id: int, _: object = Depends(require_roles("admin", "operat
     _record_scan_event(session, scan_id, "Scan cancelled by user")
     session.commit()
     return {"status": "cancelled"}
-

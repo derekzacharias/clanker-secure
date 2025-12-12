@@ -13,7 +13,11 @@ Lightweight vulnerability scanning MVP built with FastAPI, SQLModel, and nmap.
    ```bash
    .venv/bin/poetry run uvicorn clanker.main:app --host 0.0.0.0 --port 8000
    ```
-3. Visit `http://<host>:8000` for the HTML dashboard or `http://<host>:8000/docs` for OpenAPI docs.
+3. Start the background scan worker (handles queued scan execution and retries):
+   ```bash
+   .venv/bin/poetry run python -m clanker.worker
+   ```
+4. Visit `http://<host>:8000` for the HTML dashboard or `http://<host>:8000/docs` for OpenAPI docs.
 
 ## Configuration
 The app uses environment variables (read via `.env` if present):
@@ -25,10 +29,45 @@ The app uses environment variables (read via `.env` if present):
 | `RULES_PATH` | `src/clanker/rules/basic_rules.json` | Rule-set for banner → CVE mapping. |
 | `XML_OUTPUT_DIR` | `./scan_artifacts` | Where raw XML outputs are stored. |
 | `SCAN_RETRY_LIMIT` | `1` | How many times to retry an asset after a failure. |
+| `SCAN_JOB_MAX_ATTEMPTS` | `3` | Max attempts per scan job (worker retries are derived from this). |
+| `SCAN_JOB_DISPATCH_INTERVAL_SECONDS` | `0.5` | How often the worker polls for queued scans. |
+| `AGENT_ADVISORIES_PATH` | `./data/agent_advisories.json` | File or directory for agent advisory feeds. |
 
 ## Key Components
 - **Assets API** – Full CRUD plus metadata (`environment`, `owner`) using a single `target` field for host/IP/CIDR (e.g., `10.0.0.10`, `10.0.0.0/24`, `web01.corp.local`).
 - **Scans API** – Queue scans, inspect per-asset progress, fetch events, and review severity summaries.
+- **Scan Job Queue** – Dedicated worker (`python -m clanker.worker`) dispatches queued scans with persistence, cancellation, and retries; re-enqueue via `POST /scans/{scan_id}/enqueue`.
+- **Agent Advisory Feeds** – Distro-aware package advisories loaded from JSON (single file or directory). Supports `package_advisories`, `osv_records`, and `oval_definitions` with optional `distro_hint` and `backport_fixed_version` for vendor backports.
+
+Example feed payload:
+```json
+{
+  "osv_records": [
+    {
+      "rule_id": "OSV-PKG-LIBSSL-BACKPORT",
+      "package": "libssl3",
+      "fixed_version": "3.0.0",
+      "backport_fixed_version": "1.1.1n-0ubuntu2.10",
+      "cve_ids": ["CVE-2024-0001"],
+      "severity": "critical",
+      "description": "Upstream fix backported by distro",
+      "distro_hint": "ubuntu"
+    }
+  ],
+  "oval_definitions": [
+    {
+      "definition_id": "oval:com.ubuntu.jammy:def:20230778",
+      "package": "openssl",
+      "fixed_version": "1.1.1n-1ubuntu2.2",
+      "backport_fixed_version": "1.1.1n-1ubuntu2.1",
+      "cve_ids": ["CVE-2024-0002"],
+      "severity": "high",
+      "description": "Vendor OVAL backport",
+      "distro_hint": "ubuntu"
+    }
+  ]
+}
+```
 - **Scan Engine** – Runs `nmap -sV` with profile-based port lists, parses XML, and maps services to CVEs via JSON rules.
 - **Findings API** – Filterable list plus status/owner updates to track remediation work.
 - **UI** – Minimal dashboard for adding assets, starting scans, and reviewing activity without extra tooling.

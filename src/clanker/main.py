@@ -3,16 +3,18 @@ from __future__ import annotations
 import asyncio
 import base64
 import csv
+import inspect
 import io
 import json
 import logging
 import os
 import threading
 import time
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional
 from uuid import uuid4
 
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, Request, Response, Header
@@ -21,8 +23,9 @@ from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, Stre
 from fastapi.security.http import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import bindparam, text
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import selectinload
 from sqlmodel import Session, func, select, delete
 
@@ -59,6 +62,7 @@ from clanker.db.models import (
     Scan,
     ScanAssetStatus,
     ScanAssetStatusRead,
+    ScanJob,
     ScanCreate,
     ScanDetail,
     ScanEvent,
@@ -77,13 +81,47 @@ from clanker.db.session import get_session, init_db
 configure_logging()
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Clanker Vulnerability Scanner", version="0.2.0")
+startup_hooks: list[Callable[[], Awaitable[None] | None]] = []
+shutdown_hooks: list[Callable[[], Awaitable[None] | None]] = []
+nvd_sync_task: Optional[asyncio.Task] = None
+
+
+def register_startup_hook(fn: Callable[[], Awaitable[None] | None]) -> Callable[[], Awaitable[None] | None]:
+    startup_hooks.append(fn)
+    return fn
+
+
+def register_shutdown_hook(fn: Callable[[], Awaitable[None] | None]) -> Callable[[], Awaitable[None] | None]:
+    shutdown_hooks.append(fn)
+    return fn
+
+
+async def _run_hooks(hooks: list[Callable[[], Awaitable[None] | None]]) -> None:
+    for hook in hooks:
+        result = hook()
+        if isinstance(result, asyncio.Task):
+            continue
+        if inspect.isawaitable(result):
+            await result
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    await _run_hooks(startup_hooks)
+    try:
+        yield
+    finally:
+        await _run_hooks(list(reversed(shutdown_hooks)))
+
+
+app = FastAPI(title="Clanker Vulnerability Scanner", version="0.2.0", lifespan=lifespan)
 SCAN_PROFILE_CHOICES = list_scan_profiles()
 SCAN_PROFILE_KEYS = {profile.key for profile in SCAN_PROFILE_CHOICES}
 BASE_DIR = Path(__file__).resolve().parents[2]
 FRONTEND_DIST = BASE_DIR / "frontend" / "dist"
 VALID_FINDING_STATUSES = {"open", "in_progress", "resolved", "ignored"}
 scan_job_queue: Optional[ScanJobQueue] = None
+scan_job_dispatcher: Optional[threading.Thread] = None
 SSH_TIMEOUT_LIMIT = 60
 SSH_COMMAND_TIMEOUT_LIMIT = 180
 SSH_MAX_WORKERS_LIMIT = 16
@@ -103,6 +141,64 @@ class FrontendStaticFiles(StaticFiles):
         return response
 
 
+def _get_scan_job(session: Session, scan_id: int) -> Optional[ScanJob]:
+    return session.exec(select(ScanJob).where(ScanJob.scan_id == scan_id)).first()
+
+
+def _persist_scan_job(session: Session, scan_id: int, *, force: bool = False) -> ScanJob:
+    now = now_utc()
+    job = _get_scan_job(session, scan_id)
+    if job is None:
+        job = ScanJob(
+            scan_id=scan_id,
+            status="queued",
+            attempts=0,
+            max_attempts=settings.scan_job_max_attempts,
+            enqueued_at=now,
+            updated_at=now,
+        )
+    if force:
+        job.attempts = 0
+        job.last_error = None
+        job.started_at = None
+        job.completed_at = None
+    job.status = "queued"
+    job.enqueued_at = now
+    job.updated_at = now
+    job.max_attempts = settings.scan_job_max_attempts
+    session.add(job)
+    session.flush()
+    return job
+
+
+def _update_scan_job_status(
+    scan_id: int, status: str, *, attempts: Optional[int] = None, error: Optional[str] = None
+) -> None:
+    from clanker.db.session import get_session as session_factory
+
+    try:
+        with session_factory() as session:
+            job = _get_scan_job(session, scan_id)
+            if not job:
+                return
+            now = now_utc()
+            job.status = status
+            job.updated_at = now
+            if status == "queued":
+                job.enqueued_at = now
+            if attempts is not None:
+                job.attempts = attempts
+            if error is not None:
+                job.last_error = error
+            if status == "running" and job.started_at is None:
+                job.started_at = now
+            if status in {"completed", "completed_with_errors", "failed", "cancelled"}:
+                job.completed_at = job.completed_at or now
+            session.add(job)
+    except Exception:
+        logger.exception("Failed to update scan job %s status to %s", scan_id, status)
+
+
 def _build_scan_queue_hooks() -> QueueHooks:
     from clanker.db.session import get_session as session_factory
 
@@ -113,15 +209,21 @@ def _build_scan_queue_hooks() -> QueueHooks:
                 _record_scan_event(session, scan_id, message)
 
     return QueueHooks(
-        on_start=lambda scan_id, attempt: _record_if_exists(
-            scan_id, f"Dequeued for processing (attempt {attempt})"
+        on_start=lambda scan_id, attempt: (
+            _update_scan_job_status(scan_id, "running", attempts=attempt),
+            _record_if_exists(scan_id, f"Dequeued for processing (attempt {attempt})"),
         ),
-        on_retry=lambda scan_id, attempt: _record_if_exists(
-            scan_id, f"Retrying scan job (attempt {attempt + 1})"
+        on_retry=lambda scan_id, attempt: (
+            _update_scan_job_status(scan_id, "queued", attempts=attempt),
+            _record_if_exists(scan_id, f"Retrying scan job (attempt {attempt + 1})"),
         ),
-        on_cancel=lambda scan_id: _record_if_exists(scan_id, "Scan cancelled before worker start"),
-        on_fail=lambda scan_id, attempts, error: _record_if_exists(
-            scan_id, f"Scan job failed after {attempts} attempt(s): {error}"
+        on_cancel=lambda scan_id: (
+            _update_scan_job_status(scan_id, "cancelled"),
+            _record_if_exists(scan_id, "Scan cancelled before worker start"),
+        ),
+        on_fail=lambda scan_id, attempts, error: (
+            _update_scan_job_status(scan_id, "failed", attempts=attempts, error=error),
+            _record_if_exists(scan_id, f"Scan job failed after {attempts} attempt(s): {error}"),
         ),
     )
 
@@ -129,14 +231,102 @@ def _build_scan_queue_hooks() -> QueueHooks:
 def _ensure_scan_queue() -> ScanJobQueue:
     global scan_job_queue
     if scan_job_queue is None:
-        scan_job_queue = ScanJobQueue(worker=run_scan_job, hooks=_build_scan_queue_hooks())
+        scan_job_queue = ScanJobQueue(
+            worker=run_scan_job,
+            hooks=_build_scan_queue_hooks(),
+            max_retries=max(0, settings.scan_job_max_attempts - 1),
+        )
     scan_job_queue.start()
     return scan_job_queue
 
 
-def _enqueue_scan_job(scan_id: int, *, force: bool = False) -> None:
+def _claim_next_scan_job() -> Optional[int]:
+    """Atomically claim the next queued job to avoid duplicate dispatch across workers."""
+    from clanker.db.session import get_session as session_factory
+
+    try:
+        init_db()
+        with session_factory() as session:
+            candidate = session.exec(
+                select(ScanJob.id).where(ScanJob.status == "queued").order_by(ScanJob.enqueued_at).limit(1)
+            ).first()
+            if not candidate:
+                return None
+            if isinstance(candidate, tuple):
+                job_id = candidate[0]
+            elif hasattr(candidate, "id"):
+                job_id = candidate.id  # type: ignore[attr-defined]
+            else:
+                job_id = candidate
+            result = session.exec(
+                text(
+                    "UPDATE scanjob SET status='dispatching', updated_at=:now "
+                    "WHERE id=:job_id AND status='queued'"
+                ).bindparams(now=now_utc().isoformat(), job_id=job_id)
+            )
+            session.commit()
+            if result.rowcount == 0:
+                return None
+            job = session.get(ScanJob, job_id)
+            if job:
+                job.status = "dispatching"
+                job.updated_at = now_utc()
+                session.add(job)
+                session.commit()
+                return job.scan_id
+            return None
+    except OperationalError:
+        init_db(force=True)
+        return None
+    except Exception:
+        logger.exception("Failed to claim next scan job")
+        return None
+
+
+def _dispatch_scan_jobs_forever(poll_interval: float = 0.5) -> None:
     queue = _ensure_scan_queue()
-    queue.enqueue(scan_id, force=force)
+    while True:
+        try:
+            job_scan_id = _claim_next_scan_job()
+            if job_scan_id:
+                queue.enqueue(job_scan_id)
+        except Exception:
+            logger.exception("scan_job_dispatch_loop_error")
+        time.sleep(poll_interval)
+
+
+def _start_scan_job_worker() -> None:
+    global scan_job_dispatcher
+    init_db()
+    queue = _ensure_scan_queue()
+    queue.start()
+    if scan_job_dispatcher and scan_job_dispatcher.is_alive():
+        return
+    scan_job_dispatcher = threading.Thread(
+        target=_dispatch_scan_jobs_forever,
+        kwargs={"poll_interval": settings.scan_job_dispatch_interval_seconds},
+        daemon=True,
+        name="scan-job-dispatcher",
+    )
+    scan_job_dispatcher.start()
+
+
+def _enqueue_scan_job(scan_id: int, *, force: bool = False, session: Optional[Session] = None) -> ScanJob:
+    if session is not None:
+        job = _persist_scan_job(session, scan_id, force=force)
+        session.commit()
+        _start_scan_job_worker()
+        return job
+
+    with get_session() as local_session:
+        job = _persist_scan_job(local_session, scan_id, force=force)
+        _start_scan_job_worker()
+        return job
+
+
+def _scan_job_status_counts(session: Session) -> Dict[str, int]:
+    rows = session.exec(select(ScanJob.status, func.count()).group_by(ScanJob.status)).all()
+    return {status: count for status, count in rows}
 
 
 app.add_middleware(
@@ -190,11 +380,11 @@ if FRONTEND_DIST.exists():
         return RedirectResponse(url="/app/")
 
 
-@app.on_event("startup")
+@register_startup_hook
 def on_startup() -> None:
     init_db()
     global ssh_scan_job_queue
-    _ensure_scan_queue()
+    _start_scan_job_worker()
     if ssh_scan_job_queue is None:
         ssh_scan_job_queue = ScanJobQueue(worker=run_ssh_scan_job)
     ssh_scan_job_queue.start()
@@ -221,9 +411,24 @@ async def _start_nvd_sync_loop() -> None:
             break
 
 
-@app.on_event("startup")
-async def on_startup_async() -> None:
-    asyncio.create_task(_start_nvd_sync_loop())
+@register_startup_hook
+def on_startup_async() -> None:
+    global nvd_sync_task
+    if nvd_sync_task and not nvd_sync_task.done():
+        return
+    loop = asyncio.get_event_loop()
+    nvd_sync_task = loop.create_task(_start_nvd_sync_loop())
+
+
+@register_shutdown_hook
+async def _stop_nvd_sync_task() -> None:
+    global nvd_sync_task
+    if nvd_sync_task is None:
+        return
+    nvd_sync_task.cancel()
+    with suppress(asyncio.CancelledError):
+        await nvd_sync_task
+    nvd_sync_task = None
 
 
 # Dependency
@@ -260,6 +465,24 @@ def _build_observation_index(findings: List[Finding]) -> Dict[int, ServiceObserv
     for finding in findings:
         if finding.id is None:
             continue
+        fingerprint = None
+        evidence = None
+        version_confidence = None
+        if finding.fingerprint:
+            try:
+                fingerprint = json.loads(finding.fingerprint)
+            except Exception:
+                fingerprint = None
+        if finding.evidence:
+            try:
+                evidence = json.loads(finding.evidence)
+            except Exception:
+                evidence = None
+        if isinstance(fingerprint, dict):
+            try:
+                version_confidence = float(fingerprint.get("version_confidence"))
+            except Exception:
+                version_confidence = None
         observations[finding.id] = ServiceObservation(
             asset_id=finding.asset_id or 0,
             host_address=finding.host_address,
@@ -273,6 +496,10 @@ def _build_observation_index(findings: List[Finding]) -> Dict[int, ServiceObserv
             service_name=finding.service_name,
             service_version=finding.service_version,
             product=finding.service_name,
+            version_confidence=version_confidence,
+            fingerprint=fingerprint,
+            evidence=evidence,
+            evidence_summary=finding.evidence_summary,
         )
     return observations
 
@@ -334,8 +561,8 @@ def _serialize_ssh_host(row: SSHScanHost) -> SSHScanHostResult:
         auth_method=row.auth_method,
         status=row.status,
         error=row.error or (raw.get("error") if isinstance(raw, dict) else None),
-        started_at=row.started_at.isoformat() + "Z" if row.started_at else None,
-        completed_at=row.completed_at.isoformat() + "Z" if row.completed_at else None,
+        started_at=isoformat_utc(row.started_at) if row.started_at else None,
+        completed_at=isoformat_utc(row.completed_at) if row.completed_at else None,
         attempts=attempts,
         commands=[SSHCommandResult(**cmd) if isinstance(cmd, dict) else cmd for cmd in commands],
         ssh_config_hardening=hardening,
@@ -454,6 +681,26 @@ def _extract_rule_source(finding: Finding) -> Optional[str]:
     return None
 
 
+def _fingerprint_metadata(finding: Finding) -> tuple[Optional[float], List[str]]:
+    fingerprint = _safe_json(finding.fingerprint)
+    evidence = _safe_json(finding.evidence)
+    evidence_types: List[str] = []
+    if isinstance(evidence, list):
+        for item in evidence:
+            if isinstance(item, dict):
+                ev_type = item.get("type")
+                if isinstance(ev_type, str) and ev_type:
+                    evidence_types.append(ev_type)
+    evidence_types = list(dict.fromkeys(evidence_types))
+    version_confidence: Optional[float] = None
+    if isinstance(fingerprint, dict):
+        try:
+            version_confidence = float(fingerprint.get("version_confidence"))
+        except Exception:
+            version_confidence = None
+    return version_confidence, evidence_types
+
+
 def _cvss_band(score: Optional[float]) -> str:
     if score is None:
         return "unscored"
@@ -499,6 +746,7 @@ def _serialize_finding_export(finding: Finding, enrichment: Dict[str, Any]) -> D
         except Exception:
             references = []
     cves = _parse_cve_ids(finding.cve_ids)
+    version_confidence, evidence_types = _fingerprint_metadata(finding)
     return {
         "id": finding.id,
         "scan_id": finding.scan_id,
@@ -514,6 +762,8 @@ def _serialize_finding_export(finding: Finding, enrichment: Dict[str, Any]) -> D
         "fingerprint": _safe_json(finding.fingerprint),
         "evidence": _safe_json(finding.evidence),
         "evidence_summary": finding.evidence_summary,
+        "evidence_grade": finding.evidence_grade,
+        "why_trace": finding.why_trace,
         "host_address": finding.host_address,
         "port": finding.port,
         "protocol": finding.protocol,
@@ -526,6 +776,9 @@ def _serialize_finding_export(finding: Finding, enrichment: Dict[str, Any]) -> D
         "cvss_band": _cvss_band(score if isinstance(score, (float, int)) else None),
         "references": references,
         "rule_source": _extract_rule_source(finding),
+        "version_confidence": version_confidence,
+        "evidence_types": evidence_types,
+        "why_trace": finding.why_trace,
     }
 
 
@@ -615,7 +868,7 @@ def _record_scan_event(session: Session, scan_id: int, message: str) -> None:
     payload = {
         "scan_id": scan_id,
         "message": message,
-        "ts": datetime.utcnow().isoformat(),
+        "ts": now_utc().isoformat(),
     }
     if correlation_id:
         payload["correlation_id"] = correlation_id
@@ -685,7 +938,7 @@ def _cancel_scan_in_db(session: Session, scan_id: int, reason: str) -> Optional[
     scan = session.get(Scan, scan_id)
     if not scan:
         return None
-    now = datetime.utcnow()
+    now = now_utc()
     scan.status = "cancelled"
     scan.completed_at = scan.completed_at or now
     scan.notes = reason
@@ -698,6 +951,7 @@ def _cancel_scan_in_db(session: Session, scan_id: int, reason: str) -> Optional[
     session.add(scan)
     session.commit()
     _record_scan_event(session, scan_id, reason)
+    _update_scan_job_status(scan_id, "cancelled")
     return scan
 
 
@@ -778,6 +1032,10 @@ def _new_token_value() -> str:
 
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def isoformat_utc(dt: Optional[datetime] = None) -> str:
+    return (dt or now_utc()).isoformat().replace("+00:00", "Z")
 
 
 def create_session_token(session: Session, user_id: int, token_type: str, lifetime: timedelta) -> SessionToken:
@@ -1126,6 +1384,20 @@ class ScheduleRead(BaseModel):
     last_run_at: Optional[str]
 
 
+class ScanJobRead(BaseModel):
+    id: int
+    scan_id: int
+    status: str
+    attempts: int
+    max_attempts: int
+    last_error: Optional[str]
+    enqueued_at: datetime
+    started_at: Optional[datetime]
+    completed_at: Optional[datetime]
+
+    model_config = ConfigDict(from_attributes=True)
+
+
 class RuleGapExample(BaseModel):
     host: Optional[str] = None
     service_version: Optional[str] = None
@@ -1166,6 +1438,8 @@ class RuleGapRawResponse(BaseModel):
 
 class FindingReadWithSource(FindingRead):
     rule_source: Optional[str] = None
+    version_confidence: Optional[float] = None
+    evidence_types: List[str] = Field(default_factory=list)
 
 
 def _load_rule_gap_entries() -> List[Dict[str, Any]]:
@@ -1519,7 +1793,7 @@ def _seed_admin_if_configured(session: Session) -> None:
         session.delete(attempt)
 
 
-@app.on_event("startup")
+@register_startup_hook
 def _seed_admin_on_startup() -> None:
     try:
         with get_session() as s:
@@ -1668,14 +1942,49 @@ def create_scan(
 
     scan = _create_scan_record(session, [a.id for a in assets if a.id is not None], profile_key)
     session.commit()
-    _enqueue_scan_job(scan.id)
+    _enqueue_scan_job(scan.id, session=session)
     return scan
 
 
 @app.get("/queues/scan")
 def scan_queue_status(_: object = Depends(require_roles("admin", "operator"))) -> Dict[str, object]:
     queue = _ensure_scan_queue()
-    return queue.snapshot()
+    with get_session() as session:
+        job_counts = _scan_job_status_counts(session)
+    snapshot = queue.snapshot()
+    snapshot["jobs"] = job_counts
+    return snapshot
+
+
+@app.get("/scans/{scan_id}/job", response_model=ScanJobRead)
+def get_scan_job_metadata(
+    scan_id: int, _: object = Depends(require_roles("viewer", "operator", "admin")), session: Session = Depends(session_dep)
+) -> ScanJob:
+    job = session.exec(select(ScanJob).where(ScanJob.scan_id == scan_id)).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Scan job not found")
+    return job
+
+
+@app.post("/scans/{scan_id}/enqueue", response_model=ScanJobRead)
+def enqueue_scan_job(
+    scan_id: int,
+    force: bool = Query(default=False, description="Force re-enqueue even if a job exists"),
+    _: object = Depends(require_roles("admin", "operator")),
+    session: Session = Depends(session_dep),
+) -> ScanJob:
+    scan = session.get(Scan, scan_id)
+    if not scan:
+        raise HTTPException(status_code=404, detail="Scan not found")
+    if scan.status == "running":
+        raise HTTPException(status_code=400, detail="Scan is currently running")
+    if scan.status not in {"queued"} and not force:
+        raise HTTPException(
+            status_code=400, detail="Scan is not queued. Use /scans/{scan_id}/retry or set force=true to requeue."
+        )
+    job = _enqueue_scan_job(scan.id, force=force, session=session)
+    session.refresh(job)
+    return job
 
 
 def _create_scan_record(session: Session, asset_ids: List[int], profile_key: str) -> Scan:
@@ -1721,7 +2030,11 @@ def list_scans(
 def get_queue_metrics() -> Dict[str, int]:
     if scan_job_queue is None:
         return {"status": "queue_not_initialized"}
-    return scan_job_queue.stats()
+    with get_session() as session:
+        job_counts = _scan_job_status_counts(session)
+    base = scan_job_queue.stats()
+    base.update({f"jobs_{k}": v for k, v in job_counts.items()})
+    return base
 
 
 def _validate_schedule_payload(payload: SchedulePayload, session: Session) -> None:
@@ -1804,10 +2117,10 @@ def run_schedule_now(schedule_id: int, background_tasks: BackgroundTasks, _: obj
         raise HTTPException(status_code=400, detail="Schedule has no assets")
     profile_key = row.profile or DEFAULT_PROFILE_KEY
     scan = _create_scan_record(session, asset_ids, profile_key)
-    row.last_run_at = datetime.utcnow()
+    row.last_run_at = now_utc()
     session.add(row)
     session.commit()
-    _enqueue_scan_job(scan.id)
+    _enqueue_scan_job(scan.id, session=session)
     return {"status": "queued", "scan_id": scan.id}
 
 
@@ -2033,9 +2346,9 @@ def get_ssh_scan_detail(ssh_scan_id: int, session: Session = Depends(session_dep
     return SSHScanDetail(
         id=scan.id or 0,
         status=scan.status,
-        created_at=scan.created_at.isoformat() + "Z",
-        started_at=scan.started_at.isoformat() + "Z" if scan.started_at else None,
-        completed_at=scan.completed_at.isoformat() + "Z" if scan.completed_at else None,
+        created_at=isoformat_utc(scan.created_at),
+        started_at=isoformat_utc(scan.started_at) if scan.started_at else None,
+        completed_at=isoformat_utc(scan.completed_at) if scan.completed_at else None,
         hosts=[_serialize_ssh_host(h) for h in hosts],
     )
 
@@ -2123,7 +2436,7 @@ def retry_scan(
     session.add(scan)
     session.commit()
     _record_scan_event(session, scan_id, "Scan re-queued for retry")
-    _enqueue_scan_job(scan.id, force=True)
+    _enqueue_scan_job(scan.id, force=True, session=session)
     return scan
 
 
@@ -2248,10 +2561,18 @@ def list_findings(
     rows, total = _paginate_query(session, query.order_by(Finding.detected_at.desc()), limit, offset)
     response.headers["X-Total-Count"] = str(total)
     response.headers["X-CVSS-Bands"] = json.dumps(_aggregate_cvss_bands(session, where_sql, params))
-    return [
-        FindingReadWithSource(**row.model_dump(), rule_source=_extract_rule_source(row))
-        for row in rows
-    ]
+    serialized: List[FindingReadWithSource] = []
+    for row in rows:
+        version_confidence, evidence_types = _fingerprint_metadata(row)
+        serialized.append(
+            FindingReadWithSource(
+                **row.model_dump(),
+                rule_source=_extract_rule_source(row),
+                version_confidence=version_confidence,
+                evidence_types=evidence_types,
+            )
+        )
+    return serialized
 
 
 @app.get("/reports/findings/export")
@@ -2281,7 +2602,7 @@ def export_findings_report(
     enrichment = _load_enrichment(session, [r.id for r in rows if r.id is not None])
     export_rows = [_serialize_finding_export(f, enrichment.get(f.id or -1, {})) for f in rows]
     band_summary = _aggregate_cvss_bands(session, where_sql, params)
-    timestamp = datetime.utcnow().isoformat() + "Z"
+    timestamp = isoformat_utc()
 
     response.headers["X-Total-Count"] = str(total_count)
     response.headers["X-CVSS-Bands"] = json.dumps(band_summary)
@@ -2305,6 +2626,8 @@ def export_findings_report(
             "protocol",
             "description",
             "evidence_summary",
+            "evidence_grade",
+            "why_trace",
             "evidence",
             "fingerprint",
             "cvss_v31_base",
@@ -2333,7 +2656,7 @@ def export_findings_report(
                     "cve_ids": ";".join(row.get("cve_ids") or []),
                 }
             )
-        filename = f"findings_export_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.csv"
+        filename = f"findings_export_{now_utc().strftime('%Y%m%d_%H%M%S')}.csv"
         headers = {
             "Content-Disposition": f'attachment; filename="{filename}"',
             "X-Total-Count": str(total_count),
@@ -2370,7 +2693,7 @@ def update_finding(finding_id: int, payload: FindingUpdate, session: Session = D
         if status_val is not None and status_val not in VALID_FINDING_STATUSES:
             raise HTTPException(status_code=400, detail=f"Invalid status. Allowed: {', '.join(sorted(VALID_FINDING_STATUSES))}")
         if status_val in {"resolved", "ignored"}:
-            update_data.setdefault("closed_at", datetime.utcnow())
+            update_data.setdefault("closed_at", now_utc())
         elif status_val == "open":
             update_data["closed_at"] = None
     assignee_id = update_data.get("assigned_user_id")
@@ -2563,7 +2886,7 @@ def run_ssh_scan_job(ssh_scan_id: int) -> None:
                 metrics_status = "failed"
                 return
             scan.status = "running"
-            scan.started_at = datetime.utcnow()
+            scan.started_at = now_utc()
             session.add(scan)
             session.commit()
             log_event(
@@ -2583,7 +2906,7 @@ def run_ssh_scan_job(ssh_scan_id: int) -> None:
             if not hosts:
                 scan.status = "failed"
                 scan.notes = "No SSH hosts to scan"
-                scan.completed_at = datetime.utcnow()
+                scan.completed_at = now_utc()
                 session.add(scan)
                 session.commit()
                 _pop_ssh_retry(ssh_scan_id)
@@ -2609,11 +2932,11 @@ def run_ssh_scan_job(ssh_scan_id: int) -> None:
                 ):
                     host_row.status = "failed"
                     host_row.error = "Credentials missing for host"
-                    host_row.completed_at = datetime.utcnow()
+                    host_row.completed_at = now_utc()
                     session.add(host_row)
                     continue
                 host_row.status = "running"
-                host_row.started_at = datetime.utcnow()
+                host_row.started_at = now_utc()
                 session.add(host_row)
                 log_event(
                     logger,
@@ -2644,7 +2967,7 @@ def run_ssh_scan_job(ssh_scan_id: int) -> None:
                 if scan:
                     scan.status = "failed"
                     scan.notes = "No hosts with valid credentials to scan"
-                    scan.completed_at = datetime.utcnow()
+                    scan.completed_at = now_utc()
                     session.add(scan)
                     session.commit()
             _pop_ssh_retry(ssh_scan_id)
@@ -2664,7 +2987,7 @@ def run_ssh_scan_job(ssh_scan_id: int) -> None:
                 res = result_map.get(host_row.id) or {}
                 host_row.error = host_row.error or res.get("error")
                 host_row.status = "success" if res.get("status") == "success" else "failed"
-                host_row.completed_at = datetime.utcnow()
+                host_row.completed_at = now_utc()
                 if res:
                     host_row.raw_output = json.dumps(res)
                     host_row.ssh_config_hardening = json.dumps(res.get("ssh_config_hardening") or {})
@@ -2704,7 +3027,7 @@ def run_ssh_scan_job(ssh_scan_id: int) -> None:
                     error=host_row.error,
                 )
 
-            scan.completed_at = datetime.utcnow()
+            scan.completed_at = now_utc()
             scan.status = "completed_with_errors" if errors else "completed"
             metrics_status = scan.status
             session.add(scan)
@@ -2732,7 +3055,7 @@ def run_ssh_scan_job(ssh_scan_id: int) -> None:
             scan = session.get(SSHScan, ssh_scan_id)
             if scan:
                 scan.status = "failed"
-                scan.completed_at = scan.completed_at or datetime.utcnow()
+                scan.completed_at = scan.completed_at or now_utc()
                 scan.notes = scan.notes or f"SSH scan worker error: {exc}"
                 session.add(scan)
                 session.commit()
@@ -2748,20 +3071,23 @@ def run_scan_job(scan_id: int) -> None:
     metrics.record_scan_started("network")
     started = time.perf_counter()
     metrics_status = "failed"
+    _update_scan_job_status(scan_id, "running")
     try:
         with session_factory() as session:
             scan = session.get(Scan, scan_id)
             if not scan:
                 logger.error("Scan %s vanished before start", scan_id)
+                _update_scan_job_status(scan_id, "failed", error="Scan record missing")
                 metrics_status = "failed"
                 return
             corr_id = scan.correlation_id
             if scan.status == "cancelled":
                 _record_scan_event(session, scan_id, "Scan cancelled before start")
+                _update_scan_job_status(scan_id, "cancelled")
                 metrics_status = "cancelled"
                 return
             scan.status = "running"
-            scan.started_at = datetime.utcnow()
+            scan.started_at = now_utc()
             session.add(scan)
             _record_scan_event(session, scan_id, "Scan started")
             session.commit()
@@ -2789,6 +3115,7 @@ def run_scan_job(scan_id: int) -> None:
                 _record_scan_event(session, scan_id, "No assets to scan")
                 session.add(scan)
                 session.commit()
+                _update_scan_job_status(scan_id, "failed", error="No assets linked to scan")
                 metrics_status = "failed"
                 return
 
@@ -2798,16 +3125,17 @@ def run_scan_job(scan_id: int) -> None:
                 session.refresh(scan)
                 if scan.status == "cancelled":
                     _record_scan_event(session, scan_id, "Scan cancelled while running")
-                    scan.completed_at = scan.completed_at or datetime.utcnow()
+                    scan.completed_at = scan.completed_at or now_utc()
                     session.add(scan)
                     session.commit()
+                    _update_scan_job_status(scan_id, "cancelled")
                     metrics_status = "cancelled"
                     return
                 retrying = True
                 while retrying:
                     status_row = _ensure_asset_status(session, scan_id, asset.id or 0)
                     status_row.status = "running"
-                    status_row.started_at = status_row.started_at or datetime.utcnow()
+                    status_row.started_at = status_row.started_at or now_utc()
                     status_row.attempts += 1
                     session.add(status_row)
                     session.commit()
@@ -2827,7 +3155,7 @@ def run_scan_job(scan_id: int) -> None:
 
                     if _is_scan_cancelled(session, scan_id):
                         status_row.status = "cancelled"
-                        status_row.completed_at = status_row.completed_at or datetime.utcnow()
+                        status_row.completed_at = status_row.completed_at or now_utc()
                         session.add(status_row)
                         session.commit()
                         _record_scan_event(session, scan_id, "Scan cancelled mid-run")
@@ -2853,7 +3181,7 @@ def run_scan_job(scan_id: int) -> None:
                             session.rollback()
                             logger.exception("Enrichment failed for scan %s asset %s: %s", scan_id, asset.target, exc)
                         status_row.status = "completed"
-                        status_row.completed_at = datetime.utcnow()
+                        status_row.completed_at = now_utc()
                         status_row.last_error = None
                         session.add(status_row)
                         session.commit()
@@ -2875,16 +3203,17 @@ def run_scan_job(scan_id: int) -> None:
                         scan.notes = "nmap binary not found on host"
                         status_row.status = "failed"
                         status_row.last_error = "nmap missing"
-                        status_row.completed_at = datetime.utcnow()
+                        status_row.completed_at = now_utc()
                         session.add_all([scan, status_row])
                         session.commit()
                         _record_scan_event(session, scan_id, "nmap binary missing. Aborting scan.")
+                        _update_scan_job_status(scan_id, "failed", error="nmap binary not found")
                         return
                     except Exception as exc:  # pylint: disable=broad-except
                         logger.exception("Scan %s failed for asset %s: %s", scan_id, asset.target, exc)
                         status_row.status = "failed"
                         status_row.last_error = str(exc)
-                        status_row.completed_at = datetime.utcnow()
+                        status_row.completed_at = now_utc()
                         session.add(status_row)
                         session.commit()
                         _record_scan_event(session, scan_id, f"Failed {asset.target}: {exc}")
@@ -2913,7 +3242,7 @@ def run_scan_job(scan_id: int) -> None:
                         retrying = False
                         break
 
-            scan.completed_at = datetime.utcnow()
+            scan.completed_at = now_utc()
             if asset_errors:
                 scan.status = "completed_with_errors"
                 scan.notes = "One or more assets failed to scan"
@@ -2933,6 +3262,7 @@ def run_scan_job(scan_id: int) -> None:
                 correlation_id=corr_id,
             )
             session.commit()
+            _update_scan_job_status(scan_id, scan.status)
             _schedule_reenrich_scan(scan_id)
     except Exception as exc:  # pylint: disable=broad-except
         logger.exception("Scan %s crashed unexpectedly: %s", scan_id, exc)
@@ -2940,13 +3270,14 @@ def run_scan_job(scan_id: int) -> None:
             scan = session.get(Scan, scan_id)
             if scan:
                 scan.status = "failed"
-                scan.completed_at = scan.completed_at or datetime.utcnow()
+                scan.completed_at = scan.completed_at or now_utc()
                 scan.notes = scan.notes or f"Scan crashed: {exc}"
                 session.add(scan)
                 try:
                     _record_scan_event(session, scan_id, f"Scan worker error: {exc}")
                 except Exception:
                     session.commit()
+        _update_scan_job_status(scan_id, "failed", error=str(exc))
         metrics_status = "failed"
     finally:
         metrics.record_scan_finished("network", metrics_status, time.perf_counter() - started)

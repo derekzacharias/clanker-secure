@@ -6,6 +6,7 @@ from clanker.core.agent_parsers import (
     normalize_package_name,
     normalize_version,
     parse_dpkg_list,
+    parse_file_stats,
     parse_kernel_release,
     parse_listening_services,
     parse_rpm_qa,
@@ -70,3 +71,21 @@ def test_parse_sshd_config_hardening():
     assert settings["challenge_response_auth"] == "no"
     assert settings["max_auth_tries"] == "3"
     assert settings["allow_users"] == "deploy"
+
+
+def test_parse_sshd_config_algorithms():
+    config = load_fixture("sshd_config_weak.txt")
+    settings = parse_sshd_config(config)
+    assert "aes128-cbc" in settings["ciphers"]
+    assert "hmac-md5" in settings["macs"]
+    assert "diffie-hellman-group1-sha1" in settings["kex_algorithms"]
+
+
+def test_parse_file_stats_produces_mode_ints():
+    output = load_fixture("stat_output.txt")
+    files = parse_file_stats(output)
+    paths = {f["path"]: f for f in files}
+    assert paths["/etc/passwd"]["mode"] == 0o644
+    assert paths["/root/.ssh/id_rsa"]["mode"] == 0o600
+    # ensure only valid lines are included
+    assert len(files) == 3

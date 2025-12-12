@@ -19,6 +19,7 @@ def record_rule_gap(observation: ServiceObservation, reason: str, path: Optional
         "service_name": observation.service_name,
         "service_version": observation.service_version,
         "fingerprint": observation.fingerprint,
+        "version_confidence": observation.version_confidence,
         "evidence_summary": observation.evidence_summary,
         "reason": reason,
     }

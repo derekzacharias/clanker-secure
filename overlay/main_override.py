@@ -3,11 +3,11 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-from typing import Any, Dict, List, Optional
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 import logging
+from typing import Any, Dict, List, Optional
 
 from fastapi import Depends, HTTPException, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -16,7 +16,7 @@ from pydantic import ConfigDict
 from sqlalchemy import bindparam, text
 from sqlmodel import Session, select, func
 
-from clanker.main import app as app  # reuse existing app
+from clanker.main import app as app, register_startup_hook  # reuse existing app
 from clanker.main import session_dep
 from clanker.db.models import (
     Asset,
@@ -64,6 +64,10 @@ def _parse_csv_env(name: str, default: list[str]) -> list[str]:
     if raw is None:
         return default
     return [part.strip() for part in raw.split(",") if part.strip()]
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 def _configure_cors_from_env() -> None:
@@ -326,7 +330,7 @@ def cancel_scan(scan_id: int, _: object = Depends(require_roles("admin", "operat
         return scan
     cm._record_scan_event(session, scan_id, "Scan cancellation requested")  # type: ignore[attr-defined]
     # Mark pending assets as cancelled
-    now = datetime.utcnow()
+    now = _utc_now()
     statuses = session.exec(
         select(ScanAssetStatus).where(
             ScanAssetStatus.scan_id == scan_id,
@@ -366,7 +370,7 @@ def run_scan_job(scan_id: int) -> None:  # noqa: C901
                 session.commit()
                 return
             scan.status = "running"
-            scan.started_at = datetime.utcnow()
+            scan.started_at = _utc_now()
             session.add(scan)
             cm._record_scan_event(session, scan_id, "Scan started")  # type: ignore[attr-defined]
             session.commit()
@@ -399,7 +403,7 @@ def run_scan_job(scan_id: int) -> None:  # noqa: C901
                 while retrying:
                     status_row = cm._ensure_asset_status(session, scan_id, asset.id or 0)  # type: ignore[attr-defined]
                     status_row.status = "running"
-                    status_row.started_at = status_row.started_at or datetime.utcnow()
+                    status_row.started_at = status_row.started_at or _utc_now()
                     status_row.attempts += 1
                     session.add(status_row)
                     session.commit()
@@ -412,7 +416,7 @@ def run_scan_job(scan_id: int) -> None:  # noqa: C901
                         observations = parse_nmap_xml(xml_path, asset)
                         build_findings(session, scan_id=scan_id, asset_id=asset.id or 0, observations=observations)
                         status_row.status = "completed"
-                        status_row.completed_at = datetime.utcnow()
+                        status_row.completed_at = _utc_now()
                         status_row.last_error = None
                         session.add(status_row)
                         session.commit()
@@ -425,7 +429,7 @@ def run_scan_job(scan_id: int) -> None:  # noqa: C901
                         scan.notes = "nmap binary not found on host"
                         status_row.status = "failed"
                         status_row.last_error = "nmap missing"
-                        status_row.completed_at = datetime.utcnow()
+                        status_row.completed_at = _utc_now()
                         session.add_all([scan, status_row])
                         session.commit()
                         cm._record_scan_event(session, scan_id, "nmap binary missing. Aborting scan.")  # type: ignore[attr-defined]
@@ -434,7 +438,7 @@ def run_scan_job(scan_id: int) -> None:  # noqa: C901
                         cm.logger.exception("Scan %s failed for asset %s: %s", scan_id, asset.target, exc)
                         status_row.status = "failed"
                         status_row.last_error = str(exc)
-                        status_row.completed_at = datetime.utcnow()
+                        status_row.completed_at = _utc_now()
                         session.add(status_row)
                         session.commit()
                         cm._record_scan_event(session, scan_id, f"Failed {asset.target}: {exc}")  # type: ignore[attr-defined]
@@ -455,7 +459,7 @@ def run_scan_job(scan_id: int) -> None:  # noqa: C901
 
             scan = session.get(Scan, scan_id)
             if scan and scan.status != "cancelled":
-                scan.completed_at = datetime.utcnow()
+                scan.completed_at = _utc_now()
                 if asset_errors:
                     scan.status = "completed_with_errors"
                     scan.notes = "One or more assets failed to scan"
@@ -471,7 +475,7 @@ def run_scan_job(scan_id: int) -> None:  # noqa: C901
             scan = session.get(Scan, scan_id)
             if scan:
                 scan.status = "failed"
-                scan.completed_at = scan.completed_at or datetime.utcnow()
+                scan.completed_at = scan.completed_at or _utc_now()
                 scan.notes = scan.notes or f"Scan crashed: {exc}"
                 session.add(scan)
                 try:
@@ -604,7 +608,7 @@ def _scheduler_ticker() -> None:
     while True:
         try:
             with session_factory() as session:
-                now = datetime.utcnow()
+                now = _utc_now()
                 jobs = session.exec(select(ScheduleJob).where(ScheduleJob.enabled == True)).all()  # noqa: E712
                 for job in jobs:
                     if not _should_run(job, now, job.last_run_at):
@@ -652,7 +656,7 @@ def _scheduler_ticker() -> None:
         time.sleep(30)
 
 
-@app.on_event("startup")
+@register_startup_hook
 def _start_scheduler() -> None:
     if not SCHEDULER_ENABLED:
         queue_logger.info(
@@ -703,7 +707,7 @@ def _scan_queue_worker() -> None:
             time.sleep(5)
 
 
-@app.on_event("startup")
+@register_startup_hook
 def _start_scan_queue() -> None:
     if not QUEUE_WORKER_ENABLED:
         queue_logger.info(
@@ -845,7 +849,7 @@ def create_schedule(payload: dict, _: object = Depends(require_roles("admin")), 
     if not days_list:
         days_list = list(range(7))
     if cron:
-        if not _cron_matches(datetime.utcnow(), cron):
+        if not _cron_matches(_utc_now(), cron):
             from fastapi import HTTPException
 
             raise HTTPException(status_code=400, detail="cron expression is invalid or unsupported")
@@ -921,7 +925,7 @@ def update_schedule(
         if cron_val:
             job.cron = cron_val
     if "cron" in payload and payload.get("cron"):
-        if not _cron_matches(datetime.utcnow(), payload["cron"]):
+        if not _cron_matches(_utc_now(), payload["cron"]):
             from fastapi import HTTPException
             raise HTTPException(status_code=400, detail="cron expression is invalid or unsupported")
         job.cron = payload["cron"]

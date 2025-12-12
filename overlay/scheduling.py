@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from contextlib import suppress
 from datetime import datetime, timezone
 from typing import List, Optional
 
@@ -9,7 +10,7 @@ from fastapi import Depends, HTTPException
 from pydantic import BaseModel
 from sqlmodel import Field, Session, SQLModel, select
 
-from clanker.main import app, session_dep
+from clanker.main import app, register_shutdown_hook, register_startup_hook, session_dep
 from overlay.auth.security import require_roles
 from clanker.db.models import Asset, Scan, ScanAssetStatus, ScanTarget
 from clanker.db.session import get_session
@@ -58,7 +59,10 @@ def _cron_matches(dt: datetime, expr: str) -> bool:
     return _ok(minute, dt.minute) and _ok(hour, dt.hour) and _ok(day, dt.day) and _ok(month, dt.month) and _ok(weekday, dt.weekday())
 
 
-@app.on_event("startup")
+scheduler_task: Optional[asyncio.Task] = None
+
+
+@register_startup_hook
 def _ensure_schedule_table() -> None:
     # Create table if missing (idempotent)
     with get_session() as s:
@@ -124,10 +128,24 @@ async def _scheduler_loop() -> None:
             break
 
 
-@app.on_event("startup")
-async def _start_scheduler() -> None:
+@register_startup_hook
+def _start_scheduler() -> None:
+    global scheduler_task
     loop = asyncio.get_event_loop()
-    loop.create_task(_scheduler_loop())
+    if scheduler_task and not scheduler_task.done():
+        return
+    scheduler_task = loop.create_task(_scheduler_loop())
+
+
+@register_shutdown_hook
+async def _stop_scheduler() -> None:
+    global scheduler_task
+    if scheduler_task is None:
+        return
+    scheduler_task.cancel()
+    with suppress(asyncio.CancelledError):
+        await scheduler_task
+    scheduler_task = None
 
 
 @app.get("/schedules", response_model=list[Schedule])

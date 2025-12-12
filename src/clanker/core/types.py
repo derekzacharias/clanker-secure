@@ -16,6 +16,7 @@ class ServiceObservation:
     service_name: Optional[str]
     service_version: Optional[str]
     product: Optional[str]
+    version_confidence: Optional[float] = field(default=None)
     fingerprint: Optional[Dict[str, object]] = field(default=None)
     evidence: Optional[List[Dict[str, object]]] = field(default=None)
     evidence_summary: Optional[str] = field(default=None)
