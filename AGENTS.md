@@ -87,3 +87,12 @@ The scanner must support:
 - We do not aim to replicate full exploit frameworks
 - We do not prioritize unauthenticated scans when credentials are available
 - We do not optimize for raw scan speed at the expense of accuracy
+
+## Decision Heuristics
+
+When choosing between implementations:
+
+- Choose accuracy over coverage
+- Choose explainability over opaque scoring
+- Choose extensibility over short-term speed
+- Prefer standards-based data models
