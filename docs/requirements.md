@@ -14,13 +14,17 @@ The system SHALL support:
 - Open port detection
 - Service identification
 - Protocol weakness detection
+- External enumeration tooling (nmap NSE, Nikto, WhatWeb, Masscan, OpenSSL/TestSSL.sh) to deepen coverage while prioritizing accuracy and authenticated contexts when available
+- Curated CPE inference for SSH/agent observations with service/version normalization
 
 ### 1.3 Host and OS Scanning
 - CVE mapping for Linux, Windows, and macOS
+- Credentialed host hardening checks (e.g., Lynis) when authenticated/local access is provided
 
 ### 1.4 Web and API Scanning
 - OWASP Top 10 coverage
 - REST and GraphQL API scanning
+- HTTP/HTTPS fingerprinting and vuln enumeration via Nikto/WhatWeb/TestSSL.sh integrated into scan flow
 
 ### 1.5 Configuration and Compliance
 - CIS Benchmark checks
@@ -35,6 +39,7 @@ The system SHALL support:
 The system SHALL support:
 
 - Automated CVE ingestion from NVD and vendor advisories
+- Distro-aware OSV/OVAL ingestion (backport-aware) for credentialed scans
 - Exploitability awareness
 - Known Exploited Vulnerabilities support
 - EPSS scoring
@@ -72,6 +77,7 @@ The system SHALL support:
 The system SHALL support:
 
 - Automated asset discovery via network scanning and cloud APIs
+- DNS/IP/domain enumeration (e.g., Amass, Subfinder) to surface related assets and subdomains
 - Asset classification by criticality and environment
 - Continuous inventory tracking
 - Support for ephemeral assets including containers and auto-scaling workloads
@@ -113,6 +119,7 @@ The system SHALL support:
 - Compliance-ready audit reports
 - Export formats including JSON, CSV, PDF
 - Full reporting via API
+- Evidence grading and traceability (why-trace) exposed via API/UI with filtering, sorting, and exports
 
 ---
 
@@ -123,6 +130,7 @@ The system SHALL support:
 - Distributed scanning architecture
 - Horizontal scaling
 - Scan throttling and scheduling
+- Background job queue observability (metrics/logging), configurable concurrency, and compatibility path for Redis/RQ-style backends
 - Agent-based and agentless scanning
 - Low-impact scanning modes
 

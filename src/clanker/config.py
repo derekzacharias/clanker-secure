@@ -12,7 +12,11 @@ class Settings(BaseSettings):
     xml_output_dir: Path = Field(default=Path("./scan_artifacts"))
     scan_retry_limit: int = Field(default=1, ge=0, le=5)
     scan_job_max_attempts: int = Field(default=3, ge=1, le=10)
+    scan_job_max_concurrency: int = Field(default=1, ge=1, le=16)
+    scan_job_queue_backend: str = Field(default="memory", description="memory or rq-compatible backend")
+    scan_job_queue_redis_url: str = Field(default="redis://localhost:6379/0")
     scan_job_dispatch_interval_seconds: float = Field(default=0.5, ge=0.05, le=5.0)
+    scan_job_dispatch_enabled: bool = Field(default=True, description="auto-start dispatcher thread inside API")
     nvd_cache_dir: Path = Field(default=Path("./data/nvd_cache"))
     nvd_recent_feed_url: str = Field(
         default="https://nvd.nist.gov/feeds/json/cve/1.1/nvdcve-1.1-recent.json.gz"
@@ -29,6 +33,19 @@ class Settings(BaseSettings):
     fingerprint_http_follow_redirects: bool = Field(default=False)
     rule_gap_path: Path = Field(default=Path("./scan_artifacts/rule_gaps.jsonl"))
     agent_advisories_path: Path = Field(default=Path("./data/agent_advisories.json"))
+    enum_tool_output_dir: Path = Field(default=Path("./scan_artifacts/enum"))
+    enum_tools_enabled: str = Field(
+        default="nikto,whatweb,testssl,openssl,amass,subfinder,masscan,lynis",
+        description="Comma-separated external enumeration tools to run when binaries exist.",
+    )
+    enum_tool_timeout_seconds: int = Field(default=120, ge=10, le=600)
+    enum_masscan_rate: int = Field(default=5000, ge=100, le=500000)
+    enum_allow_remote_lynis: bool = Field(
+        default=False, description="Run Lynis only when scanning localhost unless explicitly enabled."
+    )
+    searchsploit_enabled: bool = Field(default=True)
+    searchsploit_timeout_seconds: int = Field(default=5, ge=1, le=30)
+    searchsploit_max_results: int = Field(default=3, ge=1, le=10)
 
 
 settings = Settings()
@@ -36,3 +53,4 @@ settings.xml_output_dir.mkdir(parents=True, exist_ok=True)
 settings.nvd_cache_dir.mkdir(parents=True, exist_ok=True)
 settings.rule_gap_path.parent.mkdir(parents=True, exist_ok=True)
 settings.agent_advisories_path.parent.mkdir(parents=True, exist_ok=True)
+settings.enum_tool_output_dir.mkdir(parents=True, exist_ok=True)

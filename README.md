@@ -32,16 +32,22 @@ The app uses environment variables (read via `.env` if present):
 | `SCAN_JOB_MAX_ATTEMPTS` | `3` | Max attempts per scan job (worker retries are derived from this). |
 | `SCAN_JOB_DISPATCH_INTERVAL_SECONDS` | `0.5` | How often the worker polls for queued scans. |
 | `AGENT_ADVISORIES_PATH` | `./data/agent_advisories.json` | File or directory for agent advisory feeds. |
+| `ENUM_TOOLS_ENABLED` | `nikto,whatweb,testssl,openssl,amass,subfinder,masscan,lynis` | Comma-separated external enum tools to run when binaries are present. |
+| `ENUM_TOOL_TIMEOUT_SECONDS` | `120` | Per-tool timeout for external enumeration helpers. |
+| `ENUM_TOOL_OUTPUT_DIR` | `./scan_artifacts/enum` | Where raw outputs from external enumeration are stored. |
+| `ENUM_MASSCAN_RATE` | `5000` | Packet rate for masscan (when enabled). |
+| `ENUM_ALLOW_REMOTE_LYNIS` | `false` | Allow Lynis to run against non-local targets (defaults to local-only). |
 
 ## Key Components
 - **Assets API** – Full CRUD plus metadata (`environment`, `owner`) using a single `target` field for host/IP/CIDR (e.g., `10.0.0.10`, `10.0.0.0/24`, `web01.corp.local`).
 - **Scans API** – Queue scans, inspect per-asset progress, fetch events, and review severity summaries.
 - **Scan Job Queue** – Dedicated worker (`python -m clanker.worker`) dispatches queued scans with persistence, cancellation, and retries; re-enqueue via `POST /scans/{scan_id}/enqueue`.
-- **Agent Advisory Feeds** – Distro-aware package advisories loaded from JSON (single file or directory). Supports `package_advisories`, `osv_records`, and `oval_definitions` with optional `distro_hint` and `backport_fixed_version` for vendor backports.
+- **Agent Advisory Feeds** – Distro-aware package advisories loaded from JSON (single file or directory, recursive). Supports `package_advisories`, `osv_records`, and `oval_definitions` with optional `distro_hint` and `backport_fixed_version` for vendor backports. Bundled feeds can also use `distro_feeds`/`vendor_feeds` to scope OVAL/OSV/vendor rules to a distro and inherit feed-level sources.
 
 Example feed payload:
 ```json
 {
+  "source": "ubuntu-security",
   "osv_records": [
     {
       "rule_id": "OSV-PKG-LIBSSL-BACKPORT",
@@ -65,10 +71,28 @@ Example feed payload:
       "description": "Vendor OVAL backport",
       "distro_hint": "ubuntu"
     }
+  ],
+  "distro_feeds": [
+    {
+      "distro": "ubuntu",
+      "source": "ubuntu-oval/osv",
+      "oval_definitions": [
+        {
+          "definition_id": "oval:com.ubuntu.jammy:def:20230779",
+          "package": "curl",
+          "fixed_version": "7.81.0-1ubuntu1.16",
+          "backport_fixed_version": "7.81.0-1ubuntu1.15",
+          "cve_ids": ["CVE-2023-38545"],
+          "severity": "high",
+          "description": "Ubuntu OVAL feed with a distro-specific backport"
+        }
+      ]
+    }
   ]
 }
 ```
 - **Scan Engine** – Runs `nmap -sV` with profile-based port lists, parses XML, and maps services to CVEs via JSON rules.
+- **External Enumeration** – Optional passes with Nikto/WhatWeb/TestSSL.sh/OpenSSL for HTTP(S), Amass/Subfinder for domains, Masscan for fast port sweeps (opt-in), and Lynis for local credentialed hardening checks; outputs saved under `scan_artifacts/enum` and logged as scan events when binaries exist.
 - **Findings API** – Filterable list plus status/owner updates to track remediation work.
 - **UI** – Minimal dashboard for adding assets, starting scans, and reviewing activity without extra tooling.
 

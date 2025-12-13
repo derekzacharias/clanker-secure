@@ -14,6 +14,7 @@ Agents MUST NOT invent features or remove scope without updating requirements.md
 - Optimize for low noise and high signal
 - Provide remediation context for all findings
 - Design API-first and automation-first
+- Leverage the MITRE ATT&CK matrix to align findings and coverage where applicable
 
 ## Guardrails
 - Do not implement features that are not traceable to requirements.md

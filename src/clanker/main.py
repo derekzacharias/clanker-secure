@@ -8,8 +8,10 @@ import io
 import json
 import logging
 import os
+import atexit
 import threading
 import time
+import hashlib
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -24,7 +26,7 @@ from fastapi.security.http import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import bindparam, text
+from sqlalchemy import bindparam, case, text
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import selectinload
 from sqlmodel import Session, func, select, delete
@@ -32,10 +34,12 @@ from sqlmodel import Session, func, select, delete
 from clanker.config import settings
 from clanker.core.agent_vuln_logic import agent_rule_counts, persist_agent_findings, reload_agent_rules
 from clanker.core.coverage import load_rule_gaps, summarize_rule_gaps, stub_rule_from_gap
+from clanker.core.evidence import dedupe_evidence, grade_evidence
 from clanker.core.enrichment import enrich_from_feed, sync_nvd_cache
 from clanker.core.findings import build_findings
-from clanker.core.job_queue import QueueHooks, ScanJobQueue
+from clanker.core.job_queue import QueueHooks, ScanJobQueue, build_scan_job_queue
 from clanker.core.observability import configure_logging, log_event, metrics, render_prometheus_metrics
+from clanker.core.enum_tools import run_enum_tools
 from clanker.core.scanner import (
     DEFAULT_PROFILE_KEY,
     execute_nmap,
@@ -70,6 +74,7 @@ from clanker.db.models import (
     ScanRead,
     ScanTarget,
     Schedule,
+    ReportJob,
     SessionToken,
     User,
     UserRead,
@@ -122,6 +127,7 @@ FRONTEND_DIST = BASE_DIR / "frontend" / "dist"
 VALID_FINDING_STATUSES = {"open", "in_progress", "resolved", "ignored"}
 scan_job_queue: Optional[ScanJobQueue] = None
 scan_job_dispatcher: Optional[threading.Thread] = None
+scan_job_dispatcher_stop = threading.Event()
 SSH_TIMEOUT_LIMIT = 60
 SSH_COMMAND_TIMEOUT_LIMIT = 180
 SSH_MAX_WORKERS_LIMIT = 16
@@ -130,6 +136,8 @@ ssh_scan_job_queue: Optional[ScanJobQueue] = None
 _ssh_secret_cache: Dict[int, Dict[str, Any]] = {}
 _ssh_retry_overrides: Dict[int, int] = {}
 _ssh_secret_lock = threading.Lock()
+REPORT_OUTPUT_DIR = settings.xml_output_dir / "reports"
+REPORT_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
 class FrontendStaticFiles(StaticFiles):
@@ -143,6 +151,17 @@ class FrontendStaticFiles(StaticFiles):
 
 def _get_scan_job(session: Session, scan_id: int) -> Optional[ScanJob]:
     return session.exec(select(ScanJob).where(ScanJob.scan_id == scan_id)).first()
+
+
+def _coerce_datetime(value: object) -> datetime:
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value)
+        except Exception:
+            pass
+    return now_utc()
 
 
 def _persist_scan_job(session: Session, scan_id: int, *, force: bool = False) -> ScanJob:
@@ -231,13 +250,58 @@ def _build_scan_queue_hooks() -> QueueHooks:
 def _ensure_scan_queue() -> ScanJobQueue:
     global scan_job_queue
     if scan_job_queue is None:
-        scan_job_queue = ScanJobQueue(
+        scan_job_queue = build_scan_job_queue(
             worker=run_scan_job,
             hooks=_build_scan_queue_hooks(),
             max_retries=max(0, settings.scan_job_max_attempts - 1),
+            backend=settings.scan_job_queue_backend,
+            max_concurrency=settings.scan_job_max_concurrency,
+            name="network",
+            redis_url=settings.scan_job_queue_redis_url,
         )
     scan_job_queue.start()
     return scan_job_queue
+
+
+def _queue_status_snapshot(session: Session) -> Dict[str, Any]:
+    stats = scan_job_queue.stats() if scan_job_queue else {}
+    jobs = session.exec(select(ScanJob).order_by(ScanJob.updated_at.desc()).limit(50)).all()
+    job_rows = [
+        {
+            "id": row.id,
+            "scan_id": row.scan_id,
+            "status": row.status,
+            "attempts": row.attempts,
+            "max_attempts": row.max_attempts,
+            "last_error": row.last_error,
+            "enqueued_at": row.enqueued_at.isoformat() if row.enqueued_at else None,
+            "started_at": row.started_at.isoformat() if row.started_at else None,
+            "completed_at": row.completed_at.isoformat() if row.completed_at else None,
+            "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+        }
+        for row in jobs
+    ]
+    return {"queue_stats": stats, "jobs": job_rows}
+
+
+def _queue_job_detail(scan_id: int, session: Session) -> Dict[str, Any]:
+    db_job = _get_scan_job(session, scan_id)
+    job_payload = None
+    if db_job:
+        job_payload = {
+            "id": db_job.id,
+            "scan_id": db_job.scan_id,
+            "status": db_job.status,
+            "attempts": db_job.attempts,
+            "max_attempts": db_job.max_attempts,
+            "last_error": db_job.last_error,
+            "enqueued_at": db_job.enqueued_at.isoformat() if db_job.enqueued_at else None,
+            "started_at": db_job.started_at.isoformat() if db_job.started_at else None,
+            "completed_at": db_job.completed_at.isoformat() if db_job.completed_at else None,
+            "updated_at": db_job.updated_at.isoformat() if db_job.updated_at else None,
+        }
+    queue_detail = scan_job_queue.job_detail(scan_id) if scan_job_queue else {}
+    return {"job": job_payload, "queue": queue_detail}
 
 
 def _claim_next_scan_job() -> Optional[int]:
@@ -285,7 +349,7 @@ def _claim_next_scan_job() -> Optional[int]:
 
 def _dispatch_scan_jobs_forever(poll_interval: float = 0.5) -> None:
     queue = _ensure_scan_queue()
-    while True:
+    while not scan_job_dispatcher_stop.is_set():
         try:
             job_scan_id = _claim_next_scan_job()
             if job_scan_id:
@@ -297,11 +361,14 @@ def _dispatch_scan_jobs_forever(poll_interval: float = 0.5) -> None:
 
 def _start_scan_job_worker() -> None:
     global scan_job_dispatcher
+    if not settings.scan_job_dispatch_enabled:
+        return
     init_db()
     queue = _ensure_scan_queue()
     queue.start()
     if scan_job_dispatcher and scan_job_dispatcher.is_alive():
         return
+    scan_job_dispatcher_stop.clear()
     scan_job_dispatcher = threading.Thread(
         target=_dispatch_scan_jobs_forever,
         kwargs={"poll_interval": settings.scan_job_dispatch_interval_seconds},
@@ -309,6 +376,13 @@ def _start_scan_job_worker() -> None:
         name="scan-job-dispatcher",
     )
     scan_job_dispatcher.start()
+
+
+def _stop_scan_job_worker() -> None:
+    scan_job_dispatcher_stop.set()
+
+
+atexit.register(_stop_scan_job_worker)
 
 
 def _enqueue_scan_job(scan_id: int, *, force: bool = False, session: Optional[Session] = None) -> ScanJob:
@@ -386,7 +460,14 @@ def on_startup() -> None:
     global ssh_scan_job_queue
     _start_scan_job_worker()
     if ssh_scan_job_queue is None:
-        ssh_scan_job_queue = ScanJobQueue(worker=run_ssh_scan_job)
+        ssh_scan_job_queue = build_scan_job_queue(
+            worker=run_ssh_scan_job,
+            backend=settings.scan_job_queue_backend,
+            max_concurrency=settings.scan_job_max_concurrency,
+            name="ssh",
+            redis_url=settings.scan_job_queue_redis_url,
+            max_retries=max(0, settings.scan_job_max_attempts - 1),
+        )
     ssh_scan_job_queue.start()
 
 
@@ -559,6 +640,9 @@ def _serialize_ssh_host(row: SSHScanHost) -> SSHScanHostResult:
         port=row.port,
         username=row.username,
         auth_method=row.auth_method,
+        use_sudo=row.use_sudo,
+        sudo_path=row.sudo_path,
+        latency_ms=row.latency_ms or (raw.get("latency_ms") if isinstance(raw, dict) else None),
         status=row.status,
         error=row.error or (raw.get("error") if isinstance(raw, dict) else None),
         started_at=isoformat_utc(row.started_at) if row.started_at else None,
@@ -575,11 +659,15 @@ def _build_finding_filters(
     severity: Optional[str],
     status_filter: Optional[str],
     asset_id: Optional[int],
+    evidence_grade: Optional[str],
+    why_trace_filter: Optional[str],
     search: Optional[str],
 ):
     query = select(Finding)
     clauses = []
     params: Dict[str, Any] = {}
+    grade_value = _unwrap_param(evidence_grade)
+    why_value = _unwrap_param(why_trace_filter)
 
     if scan_id is not None:
         query = query.where(Finding.scan_id == scan_id)
@@ -597,20 +685,69 @@ def _build_finding_filters(
         query = query.where(Finding.asset_id == asset_id)
         clauses.append("f.asset_id = :asset_id")
         params["asset_id"] = asset_id
+    if isinstance(grade_value, str):
+        query = query.where(func.lower(Finding.evidence_grade) == grade_value.lower())
+        clauses.append("lower(f.evidence_grade) = :evidence_grade")
+        params["evidence_grade"] = grade_value.lower()
+    if isinstance(why_value, str):
+        col = func.coalesce(func.length(func.trim(Finding.why_trace)), 0)
+        if why_value == "present":
+            query = query.where(col > 0)
+            clauses.append("coalesce(length(trim(f.why_trace)), 0) > 0")
+        elif why_value == "missing":
+            query = query.where((Finding.why_trace.is_(None)) | (col == 0))
+            clauses.append("(f.why_trace IS NULL OR coalesce(length(trim(f.why_trace)), 0) = 0)")
+        params["why_trace_filter"] = why_value
     if search:
         pattern = f"%{search.lower()}%"
         query = query.where(
             func.lower(Finding.service_name).like(pattern)
             | func.lower(Finding.host_address).like(pattern)
             | func.lower(Finding.description).like(pattern)
+            | func.lower(Finding.evidence_summary).like(pattern)
+            | func.lower(Finding.why_trace).like(pattern)
         )
         clauses.append(
-            "(lower(f.service_name) LIKE :q OR lower(f.host_address) LIKE :q OR lower(f.description) LIKE :q)"
+            "("
+            "lower(f.service_name) LIKE :q OR "
+            "lower(f.host_address) LIKE :q OR "
+            "lower(f.description) LIKE :q OR "
+            "lower(f.evidence_summary) LIKE :q OR "
+            "lower(f.why_trace) LIKE :q"
+            ")"
         )
         params["q"] = pattern
 
     where_sql = " AND ".join(clauses) if clauses else "1=1"
     return query, where_sql, params
+
+
+def _finding_order_by(sort: str):
+    sort_value = _unwrap_param(sort)
+    sort_key = (sort_value or "recent").lower()
+    severity_rank = case(
+        (func.lower(Finding.severity) == "critical", 5),
+        (func.lower(Finding.severity) == "high", 4),
+        (func.lower(Finding.severity) == "medium", 3),
+        (func.lower(Finding.severity) == "low", 2),
+        else_=1,
+    )
+    evidence_rank = case(
+        (func.lower(Finding.evidence_grade) == "high", 3),
+        (func.lower(Finding.evidence_grade) == "medium", 2),
+        (func.lower(Finding.evidence_grade) == "low", 1),
+        else_=0,
+    )
+    why_rank = case((func.coalesce(func.length(func.trim(Finding.why_trace)), 0) > 0, 1), else_=0)
+    if sort_key == "severity":
+        return [severity_rank.desc(), Finding.detected_at.desc()]
+    if sort_key == "port":
+        return [case((Finding.port.is_(None), 1), else_=0), Finding.port.asc(), Finding.detected_at.desc()]
+    if sort_key in {"evidence", "evidence_grade"}:
+        return [evidence_rank.desc(), Finding.detected_at.desc()]
+    if sort_key in {"why", "why_trace"}:
+        return [why_rank.desc(), Finding.why_trace.desc().nulls_last(), Finding.detected_at.desc()]
+    return [Finding.detected_at.desc()]
 
 
 def _load_enrichment(session: Session, finding_ids: List[int]) -> Dict[int, Dict[str, Any]]:
@@ -667,9 +804,27 @@ def _safe_json(raw: Optional[str]):
     return raw
 
 
+def _unwrap_param(value: Any) -> Any:
+    return value.default if hasattr(value, "default") else value
+
+
+def _normalize_evidence(finding: Finding) -> tuple[Optional[list[dict[str, Any]]], Optional[str]]:
+    """
+    Parse and deduplicate evidence payloads for consistent grading/export.
+    Returns (evidence_list_or_none, grade_or_none).
+    """
+    parsed = _safe_json(finding.evidence)
+    if not isinstance(parsed, list):
+        return None, None
+    deduped = dedupe_evidence(parsed)
+    if not deduped:
+        return [], None
+    return deduped, grade_evidence(deduped)
+
+
 def _extract_rule_source(finding: Finding) -> Optional[str]:
-    evidence = _safe_json(finding.evidence)
-    if isinstance(evidence, list):
+    evidence, _ = _normalize_evidence(finding)
+    if evidence is not None:
         for item in evidence:
             if not isinstance(item, dict):
                 continue
@@ -683,7 +838,7 @@ def _extract_rule_source(finding: Finding) -> Optional[str]:
 
 def _fingerprint_metadata(finding: Finding) -> tuple[Optional[float], List[str]]:
     fingerprint = _safe_json(finding.fingerprint)
-    evidence = _safe_json(finding.evidence)
+    evidence, _ = _normalize_evidence(finding)
     evidence_types: List[str] = []
     if isinstance(evidence, list):
         for item in evidence:
@@ -746,12 +901,17 @@ def _serialize_finding_export(finding: Finding, enrichment: Dict[str, Any]) -> D
         except Exception:
             references = []
     cves = _parse_cve_ids(finding.cve_ids)
+    evidence, computed_grade = _normalize_evidence(finding)
     version_confidence, evidence_types = _fingerprint_metadata(finding)
+    evidence_payload = evidence if evidence is not None else _safe_json(finding.evidence)
+    evidence_grade = computed_grade or finding.evidence_grade
     return {
         "id": finding.id,
         "scan_id": finding.scan_id,
         "asset_id": finding.asset_id,
         "assigned_user_id": finding.assigned_user_id,
+        "owner": finding.owner,
+        "rule_id": finding.rule_id,
         "detected_at": finding.detected_at.isoformat() if finding.detected_at else None,
         "sla_due_at": finding.sla_due_at.isoformat() if finding.sla_due_at else None,
         "closed_at": finding.closed_at.isoformat() if finding.closed_at else None,
@@ -760,9 +920,9 @@ def _serialize_finding_export(finding: Finding, enrichment: Dict[str, Any]) -> D
         "service_name": finding.service_name,
         "service_version": finding.service_version,
         "fingerprint": _safe_json(finding.fingerprint),
-        "evidence": _safe_json(finding.evidence),
+        "evidence": evidence_payload,
         "evidence_summary": finding.evidence_summary,
-        "evidence_grade": finding.evidence_grade,
+        "evidence_grade": finding.evidence_grade or evidence_grade,
         "why_trace": finding.why_trace,
         "host_address": finding.host_address,
         "port": finding.port,
@@ -778,8 +938,33 @@ def _serialize_finding_export(finding: Finding, enrichment: Dict[str, Any]) -> D
         "rule_source": _extract_rule_source(finding),
         "version_confidence": version_confidence,
         "evidence_types": evidence_types,
-        "why_trace": finding.why_trace,
     }
+
+
+def _collect_finding_exports(
+    session: Session,
+    *,
+    scan_id: Optional[int],
+    severity: Optional[str],
+    status_filter: Optional[str],
+    asset_id: Optional[int],
+    evidence_grade: Optional[str],
+    why_trace: Optional[str],
+    search: Optional[str],
+    sort: str,
+    limit: int,
+    offset: int,
+) -> tuple[list[Dict[str, Any]], int, Dict[str, int]]:
+    base_query, where_sql, params = _build_finding_filters(
+        scan_id, severity, status_filter, asset_id, evidence_grade, why_trace, search
+    )
+    total = session.exec(select(func.count()).select_from(base_query.subquery())).one()
+    total_count = int(total or 0)
+    rows = session.exec(base_query.order_by(*_finding_order_by(sort)).limit(limit).offset(offset)).all()
+    enrichment = _load_enrichment(session, [r.id for r in rows if r.id is not None])
+    export_rows = [_serialize_finding_export(f, enrichment.get(f.id or -1, {})) for f in rows]
+    band_summary = _aggregate_cvss_bands(session, where_sql, params)
+    return export_rows, total_count, band_summary
 
 
 def _serialize_asset_status(rows: List[ScanAssetStatus]) -> List[Dict[str, Any]]:
@@ -1091,6 +1276,16 @@ def require_roles(*roles: str):
     return dep
 
 
+@app.get("/ops/queues/scan", dependencies=[Depends(require_roles("admin"))])
+def scan_queue_status(session: Session = Depends(session_dep)) -> Dict[str, Any]:
+    return _queue_status_snapshot(session)
+
+
+@app.get("/ops/queues/scan/{scan_id}", dependencies=[Depends(require_roles("admin"))])
+def scan_queue_detail(scan_id: int, session: Session = Depends(session_dep)) -> Dict[str, Any]:
+    return _queue_job_detail(scan_id, session)
+
+
 def _extract_bearer_token(token_param: Optional[str], authorization: Optional[str]) -> Optional[str]:
     if token_param:
         return token_param
@@ -1193,6 +1388,8 @@ class SSHHostConfig(BaseModel):
     passphrase: Optional[str] = Field(default=None, exclude=True)
     allow_agent: bool = False
     look_for_keys: bool = False
+    use_sudo: bool = False
+    sudo_path: Optional[str] = None
 
 
 class SSHScanRequest(BaseModel):
@@ -1225,6 +1422,9 @@ class SSHScanHostResult(BaseModel):
     port: Optional[int]
     username: Optional[str]
     auth_method: str
+    use_sudo: bool = False
+    sudo_path: Optional[str] = None
+    latency_ms: Optional[float] = None
     status: str
     error: Optional[str]
     started_at: Optional[str]
@@ -1396,6 +1596,19 @@ class ScanJobRead(BaseModel):
     completed_at: Optional[datetime]
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class ScanJobErrorRead(BaseModel):
+    attempt: int
+    error: str
+    ts: datetime
+
+
+class ScanJobDetailRead(BaseModel):
+    job: ScanJobRead
+    queue_attempt: int
+    cancelled: bool
+    errors: List[ScanJobErrorRead] = Field(default_factory=list)
 
 
 class RuleGapExample(BaseModel):
@@ -1966,6 +2179,40 @@ def get_scan_job_metadata(
     return job
 
 
+@app.get("/scans/{scan_id}/job/detail", response_model=ScanJobDetailRead)
+def get_scan_job_detail(
+    scan_id: int, _: object = Depends(require_roles("viewer", "operator", "admin")), session: Session = Depends(session_dep)
+) -> ScanJobDetailRead:
+    job = session.exec(select(ScanJob).where(ScanJob.scan_id == scan_id)).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Scan job not found")
+    queue = _ensure_scan_queue()
+    detail = queue.job_detail(scan_id) if queue else {}
+    queue_attempt = int(detail.get("attempt") or job.attempts or 0) if isinstance(detail, dict) else job.attempts
+    cancelled = bool((isinstance(detail, dict) and detail.get("cancelled")) or job.status == "cancelled")
+
+    errors: List[ScanJobErrorRead] = []
+    if isinstance(detail, dict):
+        for entry in detail.get("errors", []):
+            errors.append(
+                ScanJobErrorRead(
+                    attempt=int(entry.get("attempt") or job.attempts or 0),
+                    error=str(entry.get("error") or job.last_error or ""),
+                    ts=_coerce_datetime(entry.get("ts")),
+                )
+            )
+    if not errors and job.last_error:
+        errors.append(
+            ScanJobErrorRead(
+                attempt=job.attempts,
+                error=job.last_error,
+                ts=_coerce_datetime(job.completed_at or job.updated_at or job.enqueued_at),
+            )
+        )
+
+    return ScanJobDetailRead(job=job, queue_attempt=queue_attempt, cancelled=cancelled, errors=errors)
+
+
 @app.post("/scans/{scan_id}/enqueue", response_model=ScanJobRead)
 def enqueue_scan_job(
     scan_id: int,
@@ -2181,6 +2428,8 @@ def queue_ssh_scan(
                 "passphrase": host_cfg.passphrase,
                 "allow_agent": host_cfg.allow_agent,
                 "look_for_keys": host_cfg.look_for_keys,
+                "use_sudo": host_cfg.use_sudo or False,
+                "sudo_path": host_cfg.sudo_path,
             }
         )
 
@@ -2205,22 +2454,26 @@ def queue_ssh_scan(
             port=host_cfg.get("port") or default_port,
             username=host_cfg.get("username"),
             auth_method="key" if host_cfg.get("key_path") else "password" if host_cfg.get("password") else "unspecified",
+            use_sudo=bool(host_cfg.get("use_sudo")),
+            sudo_path=host_cfg.get("sudo_path"),
             status="queued",
         )
         session.add(host_row)
         session.flush()
         if host_row.id:
-            _cache_ssh_credentials(
-                host_row.id,
-                {
-                    "password": host_cfg.get("password"),
-                    "key_path": host_cfg.get("key_path"),
-                    "passphrase": host_cfg.get("passphrase"),
-                    "allow_agent": host_cfg.get("allow_agent", False),
-                    "look_for_keys": host_cfg.get("look_for_keys", False),
-                    "username": host_cfg.get("username"),
-                },
-            )
+                    _cache_ssh_credentials(
+                        host_row.id,
+                        {
+                            "password": host_cfg.get("password"),
+                            "key_path": host_cfg.get("key_path"),
+                            "passphrase": host_cfg.get("passphrase"),
+                            "allow_agent": host_cfg.get("allow_agent", False),
+                            "look_for_keys": host_cfg.get("look_for_keys", False),
+                            "username": host_cfg.get("username"),
+                            "sudo": bool(host_cfg.get("use_sudo")),
+                            "sudo_path": host_cfg.get("sudo_path"),
+                        },
+                    )
 
     session.add(
         AuditLog(
@@ -2273,6 +2526,8 @@ def queue_asset_ssh_scan(
     has_password = auth_method == "password" and bool(asset.ssh_password)
     has_key = auth_method == "key" and bool(asset.ssh_key_path)
     has_agent = auth_method == "agent" and (asset.ssh_allow_agent or asset.ssh_look_for_keys)
+    use_sudo = bool(asset.ssh_use_sudo) if hasattr(asset, "ssh_use_sudo") else False
+    sudo_path = getattr(asset, "ssh_sudo_path", None)
     if not (has_password or has_key or has_agent):
         raise HTTPException(status_code=400, detail="Missing SSH credential for this asset")
 
@@ -2296,6 +2551,8 @@ def queue_asset_ssh_scan(
         port=port,
         username=asset.ssh_username,
         auth_method=auth_method,
+        use_sudo=use_sudo,
+        sudo_path=sudo_path,
         status="queued",
     )
     session.add(host_row)
@@ -2310,6 +2567,8 @@ def queue_asset_ssh_scan(
                 "allow_agent": bool(asset.ssh_allow_agent),
                 "look_for_keys": bool(asset.ssh_look_for_keys),
                 "username": asset.ssh_username,
+                "sudo": use_sudo,
+                "sudo_path": sudo_path,
             },
         )
 
@@ -2551,22 +2810,30 @@ def list_findings(
     severity: Optional[str] = Query(default=None),
     status_filter: Optional[str] = Query(default=None, alias="status"),
     asset_id: Optional[int] = Query(default=None),
+    evidence_grade: Optional[str] = Query(default=None, pattern="^(low|medium|high)$"),
+    why_trace: Optional[str] = Query(default=None, pattern="^(present|missing)$"),
     search: Optional[str] = Query(default=None, alias="q"),
+    sort: str = Query(default="recent", pattern="^(recent|severity|port|evidence|why)$"),
     limit: int = Query(default=100, ge=1, le=1000),
     offset: int = Query(default=0, ge=0),
     _: object = Depends(require_roles("viewer", "operator", "admin")),
     session: Session = Depends(session_dep),
 ) -> List[Finding]:
-    query, where_sql, params = _build_finding_filters(scan_id, severity, status_filter, asset_id, search)
-    rows, total = _paginate_query(session, query.order_by(Finding.detected_at.desc()), limit, offset)
+    query, where_sql, params = _build_finding_filters(
+        scan_id, severity, status_filter, asset_id, evidence_grade, why_trace, search
+    )
+    rows, total = _paginate_query(session, query.order_by(*_finding_order_by(sort)), limit, offset)
     response.headers["X-Total-Count"] = str(total)
     response.headers["X-CVSS-Bands"] = json.dumps(_aggregate_cvss_bands(session, where_sql, params))
     serialized: List[FindingReadWithSource] = []
     for row in rows:
         version_confidence, evidence_types = _fingerprint_metadata(row)
+        _, computed_grade = _normalize_evidence(row)
+        payload = row.model_dump()
+        payload["evidence_grade"] = payload.get("evidence_grade") or computed_grade
         serialized.append(
             FindingReadWithSource(
-                **row.model_dump(),
+                **payload,
                 rule_source=_extract_rule_source(row),
                 version_confidence=version_confidence,
                 evidence_types=evidence_types,
@@ -2583,7 +2850,10 @@ def export_findings_report(
     severity: Optional[str] = Query(default=None),
     status_filter: Optional[str] = Query(default=None, alias="status"),
     asset_id: Optional[int] = Query(default=None),
+    evidence_grade: Optional[str] = Query(default=None, pattern="^(low|medium|high)$"),
+    why_trace: Optional[str] = Query(default=None, pattern="^(present|missing)$"),
     search: Optional[str] = Query(default=None, alias="q"),
+    sort: str = Query(default="recent", pattern="^(recent|severity|port|evidence|why)$"),
     limit: int = Query(default=5000, ge=1, le=20000),
     offset: int = Query(default=0, ge=0),
     _: object = Depends(require_roles("viewer", "operator", "admin")),
@@ -2593,15 +2863,19 @@ def export_findings_report(
     if fmt not in {"json", "csv"}:
         raise HTTPException(status_code=400, detail="Unsupported export format")
 
-    base_query, where_sql, params = _build_finding_filters(scan_id, severity, status_filter, asset_id, search)
-    total = session.exec(select(func.count()).select_from(base_query.subquery())).one()
-    total_count = int(total or 0)
-    rows = session.exec(
-        base_query.order_by(Finding.detected_at.desc()).limit(limit).offset(offset)
-    ).all()
-    enrichment = _load_enrichment(session, [r.id for r in rows if r.id is not None])
-    export_rows = [_serialize_finding_export(f, enrichment.get(f.id or -1, {})) for f in rows]
-    band_summary = _aggregate_cvss_bands(session, where_sql, params)
+    export_rows, total_count, band_summary = _collect_finding_exports(
+        session,
+        scan_id=scan_id,
+        severity=severity,
+        status_filter=status_filter,
+        asset_id=asset_id,
+        evidence_grade=evidence_grade,
+        why_trace=why_trace,
+        search=search,
+        sort=sort,
+        limit=limit,
+        offset=offset,
+    )
     timestamp = isoformat_utc()
 
     response.headers["X-Total-Count"] = str(total_count)
@@ -2671,7 +2945,10 @@ def export_findings_report(
             "severity": severity,
             "status": status_filter,
             "asset_id": asset_id,
+            "evidence_grade": evidence_grade,
+            "why_trace": why_trace,
             "search": search,
+            "sort": sort,
             "limit": limit,
             "offset": offset,
         },
@@ -2681,6 +2958,292 @@ def export_findings_report(
         "rows": export_rows,
     }
 
+
+class ReportJobRequest(BaseModel):
+    type: str = Field(default="technical", pattern="^(executive|technical|delta)$")
+    format: str = Field(default="csv", pattern="^(csv|json|pdf)$")
+    scan_id: Optional[int] = None
+    severity: Optional[str] = None
+    status: Optional[str] = None
+    asset_id: Optional[int] = None
+    evidence_grade: Optional[str] = Field(default=None, pattern="^(low|medium|high)$")
+    why_trace: Optional[str] = Field(default=None, pattern="^(present|missing)$")
+    search: Optional[str] = None
+    sort: str = Field(default="recent", pattern="^(recent|severity|port|evidence|why)$")
+    limit: int = Field(default=5000, ge=1, le=20000)
+    offset: int = Field(default=0, ge=0)
+    include_deltas: bool = Field(default=False)
+    timeframe_from: Optional[datetime] = None
+    timeframe_to: Optional[datetime] = None
+
+
+class ReportJobRead(BaseModel):
+    id: int
+    type: str
+    format: str
+    status: str
+    total_count: Optional[int]
+    created_at: datetime
+    completed_at: Optional[datetime]
+    download_url: Optional[str] = None
+    error: Optional[str] = None
+
+
+def _delta_summary(rows: List[Dict[str, Any]], timeframe_from: Optional[datetime], timeframe_to: Optional[datetime]) -> Dict[str, Any]:
+    if not timeframe_from and not timeframe_to:
+        return {"new": 0, "resolved": 0, "reopened": 0, "severity_changes": [], "cvss_changes": []}
+    def _parse(dt: Any) -> Optional[datetime]:
+        if isinstance(dt, datetime):
+            return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+        if isinstance(dt, str):
+            with suppress(Exception):
+                parsed = datetime.fromisoformat(dt.replace("Z", "+00:00"))
+                return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+        return None
+    start = _parse(timeframe_from)
+    end = _parse(timeframe_to)
+    new_count = 0
+    resolved = 0
+    for row in rows:
+        detected = _parse(row.get("detected_at"))
+        closed = _parse(row.get("closed_at"))
+        if start and detected and detected >= start and (not end or detected <= end):
+            new_count += 1
+        if start and closed and closed >= start and (not end or closed <= end):
+            resolved += 1
+    return {"new": new_count, "resolved": resolved, "reopened": 0, "severity_changes": [], "cvss_changes": []}
+
+
+def _write_report_file(
+    fmt: str,
+    report_type: str,
+    rows: List[Dict[str, Any]],
+    summary: Dict[str, Any],
+) -> tuple[Path, str]:
+    REPORT_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    timestamp = now_utc().strftime("%Y%m%d_%H%M%S")
+    filename = f"{report_type}_report_{timestamp}.{fmt}"
+    path = REPORT_OUTPUT_DIR / filename
+    if fmt == "csv":
+        output = io.StringIO()
+        fieldnames = [
+            "id",
+            "scan_id",
+            "asset_id",
+            "assigned_user_id",
+            "detected_at",
+            "sla_due_at",
+            "closed_at",
+            "severity",
+            "status",
+            "owner",
+            "rule_id",
+            "service_name",
+            "service_version",
+            "host_address",
+            "port",
+            "protocol",
+            "description",
+            "evidence_summary",
+            "evidence_grade",
+            "why_trace",
+            "cvss_v31_base",
+            "cvss_vector",
+            "cvss_band",
+            "cve_ids",
+            "references",
+            "rule_source",
+        ]
+        writer = csv.DictWriter(output, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            normalized = dict(row)
+            normalized["owner"] = row.get("owner")
+            normalized["references"] = ";".join(row.get("references") or [])
+            normalized["cve_ids"] = ";".join(row.get("cve_ids") or [])
+            writer.writerow({key: normalized.get(key) for key in fieldnames})
+        path.write_text(output.getvalue(), encoding="utf-8")
+    elif fmt == "json":
+        payload = {"generated_at": isoformat_utc(), "summary": summary, "rows": rows}
+        path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+    else:  # pdf
+        try:
+            from reportlab.lib import colors
+            from reportlab.lib.pagesizes import letter
+            from reportlab.lib.styles import getSampleStyleSheet
+            from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+        except Exception as exc:  # pragma: no cover - dependency issues
+            path.write_text(f"PDF generation unavailable: {exc}", encoding="utf-8")
+            checksum = hashlib.sha256(path.read_bytes()).hexdigest()
+            return path, checksum
+
+        doc = SimpleDocTemplate(str(path), pagesize=letter, title=f"{report_type.title()} Report")
+        styles = getSampleStyleSheet()
+        story = [
+            Paragraph(f"{report_type.title()} Report", styles["Title"]),
+            Paragraph(f"Generated at: {isoformat_utc()}", styles["Normal"]),
+            Spacer(1, 12),
+        ]
+        cvss_bands = summary.get("cvss_bands", {}) or {}
+        band_text = ", ".join(f"{k}: {v}" for k, v in cvss_bands.items()) or "None"
+        story.append(Paragraph(f"Total findings: {summary.get('total', 0)}", styles["Heading3"]))
+        story.append(Paragraph(f"CVSS distribution: {band_text}", styles["Normal"]))
+        delta = summary.get("delta") or {}
+        if delta:
+            story.append(Paragraph("Delta summary", styles["Heading3"]))
+            story.append(
+                Paragraph(
+                    f"New: {delta.get('new', 0)} | Resolved: {delta.get('resolved', 0)} | Reopened: {delta.get('reopened', 0)}",
+                    styles["Normal"],
+                )
+            )
+        story.append(Spacer(1, 12))
+
+        table_data = [
+            ["Severity", "Status", "Rule", "Service", "Host", "Summary", "CVSS"],
+        ]
+        for row in rows[:50]:
+            table_data.append(
+                [
+                    row.get("severity") or "",
+                    row.get("status") or "",
+                    row.get("rule_id") or "",
+                    row.get("service_name") or "",
+                    row.get("host_address") or "",
+                    row.get("evidence_summary") or row.get("description") or "",
+                    row.get("cvss_v31_base") or "",
+                ]
+            )
+        table = Table(table_data, repeatRows=1)
+        table.setStyle(
+            TableStyle(
+                [
+                    ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
+                    ("TEXTCOLOR", (0, 0), (-1, 0), colors.black),
+                    ("ALIGN", (0, 0), (-1, -1), "LEFT"),
+                    ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
+                    ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                    ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.whitesmoke, colors.lightyellow]),
+                ]
+            )
+        )
+        story.append(table)
+        doc.build(story)
+    checksum = hashlib.sha256(path.read_bytes()).hexdigest()
+    return path, checksum
+
+
+def _serialize_report_job(job: ReportJob) -> Dict[str, Any]:
+    return {
+        "id": job.id,
+        "type": job.report_type,
+        "format": job.format,
+        "status": job.status,
+        "total_count": job.total_count,
+        "created_at": job.created_at,
+        "completed_at": job.completed_at,
+        "download_url": f"/reports/{job.id}/download" if job.file_path and job.status == "completed" else None,
+        "error": job.error,
+    }
+
+
+def _process_report_job(session: Session, payload: ReportJobRequest) -> ReportJob:
+    job = ReportJob(
+        kind="findings",
+        report_type=payload.type,
+        format=payload.format.lower(),
+        status="processing",
+        scope_json=json.dumps(
+            {
+                "scan_id": payload.scan_id,
+                "severity": payload.severity,
+                "status": payload.status,
+                "asset_id": payload.asset_id,
+                "search": payload.search,
+            },
+            default=str,
+        ),
+        include_json=json.dumps({"include_deltas": payload.include_deltas}, default=str),
+        timeframe_from=payload.timeframe_from,
+        timeframe_to=payload.timeframe_to,
+    )
+    session.add(job)
+    session.flush()
+
+    try:
+        rows, total_count, band_summary = _collect_finding_exports(
+            session,
+            scan_id=payload.scan_id,
+            severity=payload.severity,
+            status_filter=payload.status,
+            asset_id=payload.asset_id,
+            evidence_grade=payload.evidence_grade,
+            why_trace=payload.why_trace,
+            search=payload.search,
+            sort=payload.sort,
+            limit=payload.limit,
+            offset=payload.offset,
+        )
+        delta = _delta_summary(rows, payload.timeframe_from, payload.timeframe_to) if payload.include_deltas else {}
+        summary = {"total": total_count, "cvss_bands": band_summary, "delta": delta}
+        path, checksum = _write_report_file(payload.format.lower(), payload.type, rows, summary)
+        job.status = "completed"
+        job.file_path = str(path)
+        job.checksum = checksum
+        job.total_count = total_count
+        job.completed_at = now_utc()
+    except Exception as exc:  # pragma: no cover - defensive
+        job.status = "failed"
+        job.error = str(exc)
+    session.add(job)
+    session.flush()
+    session.refresh(job)
+    return job
+
+
+@app.post("/reports", response_model=ReportJobRead, status_code=201)
+def create_report_job(
+    payload: ReportJobRequest,
+    _: object = Depends(require_roles("viewer", "operator", "admin")),
+    session: Session = Depends(session_dep),
+) -> Dict[str, Any]:
+    job = _process_report_job(session, payload)
+    return ReportJobRead(**_serialize_report_job(job))
+
+
+@app.get("/reports/{job_id}", response_model=ReportJobRead)
+def get_report_job(
+    job_id: int,
+    _: object = Depends(require_roles("viewer", "operator", "admin")),
+    session: Session = Depends(session_dep),
+) -> Dict[str, Any]:
+    job = session.get(ReportJob, job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Report job not found")
+    return ReportJobRead(**_serialize_report_job(job))
+
+
+@app.get("/reports/{job_id}/download")
+def download_report_job(
+    job_id: int,
+    _: object = Depends(require_roles("viewer", "operator", "admin")),
+    session: Session = Depends(session_dep),
+) -> Response:
+    job = session.get(ReportJob, job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Report job not found")
+    if job.status != "completed" or not job.file_path:
+        raise HTTPException(status_code=400, detail="Report is not ready")
+    path = Path(job.file_path)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Report file missing")
+    media_type = "application/json"
+    if job.format == "csv":
+        media_type = "text/csv"
+    elif job.format == "pdf":
+        media_type = "application/pdf"
+    headers = {"Content-Disposition": f'attachment; filename="{path.name}"'}
+    return StreamingResponse(path.open("rb"), media_type=media_type, headers=headers)
 
 @app.patch("/findings/{finding_id}", response_model=FindingRead)
 def update_finding(finding_id: int, payload: FindingUpdate, session: Session = Depends(session_dep)) -> Finding:
@@ -2956,6 +3519,8 @@ def run_ssh_scan_job(ssh_scan_id: int) -> None:
                         "passphrase": creds.get("passphrase"),
                         "allow_agent": creds.get("allow_agent"),
                         "look_for_keys": creds.get("look_for_keys"),
+                        "sudo": creds.get("sudo") if creds.get("sudo") is not None else host_row.use_sudo,
+                        "sudo_path": creds.get("sudo_path") or host_row.sudo_path,
                         "host_id": host_row.id,
                     }
                 )
@@ -2988,6 +3553,7 @@ def run_ssh_scan_job(ssh_scan_id: int) -> None:
                 host_row.error = host_row.error or res.get("error")
                 host_row.status = "success" if res.get("status") == "success" else "failed"
                 host_row.completed_at = now_utc()
+                host_row.latency_ms = res.get("latency_ms")
                 if res:
                     host_row.raw_output = json.dumps(res)
                     host_row.ssh_config_hardening = json.dumps(res.get("ssh_config_hardening") or {})
@@ -3180,6 +3746,16 @@ def run_scan_job(scan_id: int) -> None:
                         except Exception as exc:  # pylint: disable=broad-except
                             session.rollback()
                             logger.exception("Enrichment failed for scan %s asset %s: %s", scan_id, asset.target, exc)
+                        try:
+                            enum_statuses = run_enum_tools(asset, observations, scan_id)
+                            for enum_status in enum_statuses:
+                                _record_scan_event(session, scan_id, f"[enum] {enum_status}")
+                            session.commit()
+                        except Exception as exc:  # pylint: disable=broad-except
+                            session.rollback()
+                            logger.exception("External enumeration failed for scan %s asset %s: %s", scan_id, asset.target, exc)
+                            _record_scan_event(session, scan_id, f"[enum] failed for {asset.target}: {exc}")
+                            session.commit()
                         status_row.status = "completed"
                         status_row.completed_at = now_utc()
                         status_row.last_error = None
@@ -3362,6 +3938,8 @@ def get_finding_ext(finding_id: int, session: Session = Depends(session_dep)) ->
             ext["references"] = json.loads(ext["references_json"])
         except Exception:
             ext["references"] = []
+    elif ext and ext.get("references_json") is None:
+        ext["references"] = []
     if ext:
         ext.setdefault("references", [])
     return JSONResponse({"finding": base, "enrichment": ext})
