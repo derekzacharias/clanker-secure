@@ -30,5 +30,40 @@
     "cve": ["CVE-2011-3368"],
     "severity": "medium",
     "description": "Old Apache 2.2 builds allow reverse-proxy bypass."
+  },
+  {
+    "id": "RULE-REDIS-UNAUTH",
+    "match": { "port": 6379, "service_name": "redis" },
+    "cve": [],
+    "severity": "medium",
+    "description": "Redis instance appears accessible without authentication; restrict access or enable ACLs."
+  },
+  {
+    "id": "RULE-MEMCACHED-OPEN",
+    "match": { "port": 11211, "service_name": "memcached" },
+    "cve": [],
+    "severity": "medium",
+    "description": "Memcached is accessible on the network; restrict to localhost or trusted networks to avoid amplification/abuse."
+  },
+  {
+    "id": "RULE-MSSQL-UNENCRYPTED",
+    "match": { "port": 1433, "service_name": "mssql" },
+    "cve": [],
+    "severity": "medium",
+    "description": "SQL Server endpoint reachable without enforced encryption; enable TLS and restrict exposure."
+  },
+  {
+    "id": "RULE-LDAP-EXPOSED",
+    "match": { "service_name": "ldap" },
+    "cve": [],
+    "severity": "medium",
+    "description": "LDAP endpoint exposed; ensure LDAPS and authenticated binds are enforced to avoid info leakage."
+  },
+  {
+    "id": "RULE-MQTT-OPEN",
+    "match": { "service_name": "mqtt" },
+    "cve": [],
+    "severity": "medium",
+    "description": "MQTT broker reachable unauthenticated; require TLS and authentication to prevent unauthorized publish/subscribe."
   }
 ]

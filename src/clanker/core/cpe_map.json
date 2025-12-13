@@ -41,6 +41,24 @@
       "source": "curated/datastore"
     },
     {
+      "match": ["aurora-mysql", "aws-aurora-mysql"],
+      "cpe": "cpe:2.3:a:mysql:mysql:{version}:*:*:*:*:*:*:*",
+      "confidence": "medium",
+      "source": "curated/managed-db"
+    },
+    {
+      "match": ["cloudsql-mysql", "cloud-sql-mysql"],
+      "cpe": "cpe:2.3:a:mysql:mysql:{version}:*:*:*:*:*:*:*",
+      "confidence": "medium",
+      "source": "curated/managed-db"
+    },
+    {
+      "match": ["rds-mysql", "aws-rds-mysql"],
+      "cpe": "cpe:2.3:a:mysql:mysql:{version}:*:*:*:*:*:*:*",
+      "confidence": "medium",
+      "source": "curated/managed-db"
+    },
+    {
       "match": ["mariadb"],
       "cpe": "cpe:2.3:a:mariadb:mariadb:{version}:*:*:*:*:*:*:*",
       "confidence": "high",
@@ -53,10 +71,66 @@
       "source": "curated/datastore"
     },
     {
+      "match": ["aurora-postgresql", "aurora-postgres", "aws-aurora-postgresql", "aws-aurora-postgres"],
+      "cpe": "cpe:2.3:a:postgresql:postgresql:{version}:*:*:*:*:*:*:*",
+      "confidence": "medium",
+      "source": "curated/managed-db"
+    },
+    {
+      "match": ["cloudsql-postgresql", "cloudsql-postgres", "cloud-sql-postgres", "cloud-sql-postgresql"],
+      "cpe": "cpe:2.3:a:postgresql:postgresql:{version}:*:*:*:*:*:*:*",
+      "confidence": "medium",
+      "source": "curated/managed-db"
+    },
+    {
+      "match": ["rds-postgresql", "rds-postgres", "aws-rds-postgresql", "aws-rds-postgres"],
+      "cpe": "cpe:2.3:a:postgresql:postgresql:{version}:*:*:*:*:*:*:*",
+      "confidence": "medium",
+      "source": "curated/managed-db"
+    },
+    {
+      "match": ["mssql", "sqlserver", "microsoft-sql-server"],
+      "cpe": "cpe:2.3:a:microsoft:sql_server:{version}:*:*:*:*:*:*:*",
+      "confidence": "high",
+      "source": "curated/datastore",
+      "ports": [1433],
+      "protocols": ["tcp"]
+    },
+    {
+      "match": ["rds-sqlserver", "aws-rds-sqlserver", "rds-mssql", "aws-rds-mssql"],
+      "cpe": "cpe:2.3:a:microsoft:sql_server:{version}:*:*:*:*:*:*:*",
+      "confidence": "medium",
+      "source": "curated/managed-db",
+      "ports": [1433],
+      "protocols": ["tcp"]
+    },
+    {
+      "match": ["cloudsql-sqlserver", "cloud-sql-sqlserver", "cloudsql-mssql", "cloud-sql-mssql"],
+      "cpe": "cpe:2.3:a:microsoft:sql_server:{version}:*:*:*:*:*:*:*",
+      "confidence": "medium",
+      "source": "curated/managed-db",
+      "ports": [1433],
+      "protocols": ["tcp"]
+    },
+    {
       "match": ["redis"],
       "cpe": "cpe:2.3:a:redislabs:redis:{version}:*:*:*:*:*:*:*",
       "confidence": "high",
       "source": "curated/datastore"
+    },
+    {
+      "match": ["ldap", "ldaps", "openldap"],
+      "cpe": "cpe:2.3:a:openldap:openldap:{version}:*:*:*:*:*:*:*",
+      "confidence": "medium",
+      "source": "curated/directory",
+      "protocols": ["tcp"]
+    },
+    {
+      "match": ["mqtt"],
+      "cpe": "cpe:2.3:a:eclipse:paho:{version}:*:*:*:*:*:*:*",
+      "confidence": "low",
+      "source": "curated/messaging",
+      "protocols": ["tcp"]
     },
     {
       "match": ["mongodb"],
@@ -179,6 +253,60 @@
       "cpe": "cpe:2.3:a:minio:minio:{version}:*:*:*:*:*:*:*",
       "confidence": "medium",
       "source": "curated/storage"
+    },
+    {
+      "match": ["memcached"],
+      "cpe": "cpe:2.3:a:memcached:memcached:{version}:*:*:*:*:*:*:*",
+      "confidence": "high",
+      "source": "curated/cache",
+      "ports": [11211],
+      "protocols": ["tcp", "udp"]
+    },
+    {
+      "match": ["kafka"],
+      "cpe": "cpe:2.3:a:apache:kafka:{version}:*:*:*:*:*:*:*",
+      "confidence": "medium",
+      "source": "curated/messaging",
+      "ports": [9092],
+      "protocols": ["tcp"]
+    },
+    {
+      "match": ["zookeeper"],
+      "cpe": "cpe:2.3:a:apache:zookeeper:{version}:*:*:*:*:*:*:*",
+      "confidence": "medium",
+      "source": "curated/messaging",
+      "ports": [2181],
+      "protocols": ["tcp"]
+    },
+    {
+      "match": ["consul"],
+      "cpe": "cpe:2.3:a:hashicorp:consul:{version}:*:*:*:*:*:*:*",
+      "confidence": "medium",
+      "source": "curated/service-mesh",
+      "ports": [8500],
+      "protocols": ["tcp"]
+    },
+    {
+      "match": ["vault"],
+      "cpe": "cpe:2.3:a:hashicorp:vault:{version}:*:*:*:*:*:*:*",
+      "confidence": "medium",
+      "source": "curated/secrets",
+      "ports": [8200],
+      "protocols": ["tcp"]
+    },
+    {
+      "match": ["phpmyadmin"],
+      "cpe": "cpe:2.3:a:phpmyadmin:phpmyadmin:{version}:*:*:*:*:*:*:*",
+      "confidence": "medium",
+      "source": "curated/web-admin"
+    },
+    {
+      "match": ["sonarqube"],
+      "cpe": "cpe:2.3:a:sonarsource:sonarqube:{version}:*:*:*:*:*:*:*",
+      "confidence": "medium",
+      "source": "curated/code-quality",
+      "ports": [9000],
+      "protocols": ["tcp"]
     }
   ]
 }
