@@ -267,6 +267,67 @@ class SnmpDetector(Detector):
         return _fingerprint_snmp_from_banner(name, version, observation.port or 161)
 
 
+class PostgresDetector(Detector):
+    name = "postgres-banner"
+    protocols = ("tcp",)
+    priority = 25
+    evidence_kinds = ("postgres_banner", "postgres_ssl_response", "postgres_auth", "postgres_params")
+    ports = {5432, 5433}
+
+    def applies(self, observation: ServiceObservation) -> bool:
+        return observation.protocol == "tcp" and (
+            (observation.port or 0) in self.ports or "postgres" in (observation.service_name or "").lower()
+        )
+
+    def detect(self, host: str, observation: ServiceObservation) -> Optional[FingerprintResult]:
+        port = observation.port or 5432
+        # Issue an SSLRequest to confirm Postgres protocol without authentication.
+        ssl_request = struct.pack("!II", 8, 80877103)  # length + SSLRequest code
+        ssl_resp = None
+        startup_resp = b""
+        try:
+            with socket.create_connection((host, port), timeout=DEFAULT_TIMEOUT) as sock:
+                sock.sendall(ssl_request)
+                ssl_resp = sock.recv(1)
+                # If SSL is rejected ('N') or unsupported, try a minimal startup message to elicit an auth/error code.
+                if ssl_resp != b"S":
+                    startup_msg = _build_postgres_startup(user="clanker-probe")
+                    sock.sendall(startup_msg)
+                    startup_resp = sock.recv(256)
+                else:
+                    # If SSL accepted, complete handshake then send startup to read ParameterStatus/Authentication
+                    context = ssl.create_default_context()
+                    context.check_hostname = False
+                    context.verify_mode = ssl.CERT_NONE
+                    with context.wrap_socket(sock, server_hostname=host) as tls_sock:
+                        startup_msg = _build_postgres_startup(user="clanker-probe")
+                        tls_sock.sendall(startup_msg)
+                        startup_resp = tls_sock.recv(512)
+        except Exception:
+            pass
+        return self.parse_artifacts(
+            host,
+            observation,
+            {
+                "service_name": observation.service_name or "postgresql",
+                "service_version": observation.service_version,
+                "ssl_response": ssl_resp.decode(errors="ignore") if isinstance(ssl_resp, (bytes, bytearray)) else None,
+                "startup_response": startup_resp if isinstance(startup_resp, (bytes, bytearray)) else b"",
+                "port": port,
+            },
+        )
+
+    def parse_artifacts(
+        self, host: str, observation: ServiceObservation, artifacts: Dict[str, object]
+    ) -> Optional[FingerprintResult]:
+        name = str(artifacts.get("service_name") or "postgresql")
+        version = artifacts.get("service_version") or observation.service_version
+        ssl_response = artifacts.get("ssl_response")
+        startup_resp = artifacts.get("startup_response") if isinstance(artifacts.get("startup_response"), (bytes, bytearray)) else b""
+        port = int(artifacts.get("port") or observation.port or 5432)
+        return _fingerprint_postgres_from_banner(name, version, port, ssl_response=ssl_response, startup_response=startup_resp)
+
+
 def _extract_title(body: str) -> Optional[str]:
     match = re.search(r"<title>(.*?)</title>", body, re.IGNORECASE | re.DOTALL)
     if not match:
@@ -563,9 +624,121 @@ def _fingerprint_snmp_from_banner(service_name: str, service_version: Optional[s
         evidence=evidence,
     )
 
+def _build_postgres_startup(user: str) -> bytes:
+    """
+    Build a minimal PostgreSQL startup packet (protocol 3.0) with just user parameter.
+    """
+    payload = b"user\x00" + user.encode() + b"\x00" + b"\x00"
+    length = 4 + 4 + len(payload)
+    return struct.pack("!I", length) + struct.pack("!I", 196608) + payload
+
+
+def _parse_postgres_auth_or_error(resp: bytes) -> Optional[Dict[str, object]]:
+    """
+    Parse PostgreSQL Authentication or ErrorResponse messages to extract auth codes and hints.
+    """
+    if not resp:
+        return None
+    msg_type = chr(resp[0])
+    if len(resp) < 5:
+        return {"summary": f"Unexpected response type {msg_type}", "raw_hex": resp.hex()}
+    length = int.from_bytes(resp[1:5], "big")
+    body = resp[5 : 5 + length - 4] if length >= 4 else b""
+    if msg_type == "R" and len(body) >= 4:
+        auth_code = int.from_bytes(body[:4], "big")
+        return {
+            "summary": f"Authentication code {auth_code}",
+            "auth_code": auth_code,
+            "raw_hex": resp.hex(),
+        }
+    if msg_type == "S":
+        # ParameterStatus: key/value pairs terminated by 0, e.g., server_version
+        fields: Dict[str, str] = {}
+        parts = body.split(b"\x00")
+        # pairwise key/value
+        for i in range(0, len(parts) - 1, 2):
+            key = parts[i].decode(errors="ignore") if parts[i] else ""
+            val = parts[i + 1].decode(errors="ignore") if parts[i + 1] else ""
+            if key:
+                fields[key] = val
+        summary = f"ParameterStatus: {', '.join(f'{k}={v}' for k, v in fields.items())}" if fields else "ParameterStatus"
+        return {"summary": summary, "fields": fields, "raw_hex": resp.hex()}
+    if msg_type == "E":
+        fields: Dict[str, str] = {}
+        parts = body.split(b"\x00")
+        for part in parts:
+            if not part:
+                continue
+            key = chr(part[0])
+            value = part[1:].decode(errors="ignore")
+            fields[key] = value
+        return {"summary": fields.get("M", "Error response"), "fields": fields, "raw_hex": resp.hex()}
+    return {"summary": f"Response {msg_type}", "raw_hex": resp.hex()}
+
+
+def _fingerprint_postgres_from_banner(
+    service_name: str,
+    service_version: Optional[str],
+    port: int,
+    ssl_response: Optional[str] = None,
+    startup_response: bytes = b"",
+) -> FingerprintResult:
+    summary_bits = [f"PostgreSQL detected on {port}"]
+    if ssl_response:
+        summary_bits.append(f"SSL response {ssl_response}")
+    auth_info = _parse_postgres_auth_or_error(startup_response) if startup_response else None
+    if auth_info:
+        summary_bits.append(auth_info.get("summary", "auth response"))
+    summary = " | ".join(summary_bits)
+    evidence = [
+        FingerprintEvidence(
+            type="postgres_banner",
+            summary=summary,
+            data={"service_name": service_name, "service_version": service_version, "ssl_response": ssl_response},
+        )
+    ]
+    if auth_info:
+        evidence.append(
+            FingerprintEvidence(
+                type="postgres_auth",
+                summary=auth_info.get("summary", "auth response"),
+                data=auth_info,
+            )
+        )
+    if auth_info and auth_info.get("fields"):
+        evidence.append(
+            FingerprintEvidence(
+                type="postgres_params",
+                summary=auth_info.get("summary", "parameters"),
+                data=auth_info.get("fields"),
+            )
+        )
+    return FingerprintResult(
+        protocol="postgresql",
+        port=port,
+        vendor=None,
+        product=service_name or "postgresql",
+        version=service_version or (auth_info.get("fields", {}).get("server_version") if auth_info else None),
+        version_confidence=0.6 if (service_version or (auth_info and auth_info.get("fields", {}).get("server_version"))) else 0.2,
+        confidence=0.4 if (service_version or auth_info) else 0.25,
+        source="nmap_banner",
+        attributes={"service_version": service_version, "ssl_response": ssl_response, "auth_info": auth_info},
+        evidence_summary=summary,
+        evidence=evidence,
+    )
+
 
 DETECTORS: List[Detector] = sorted(
-    [HttpDetector(), TlsDetector(), SshDetector(), MysqlDetector(), RdpDetector(), SmbDetector(), SnmpDetector()],
+    [
+        HttpDetector(),
+        TlsDetector(),
+        SshDetector(),
+        MysqlDetector(),
+        PostgresDetector(),
+        RdpDetector(),
+        SmbDetector(),
+        SnmpDetector(),
+    ],
     key=lambda det: det.priority,
 )
 

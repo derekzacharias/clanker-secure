@@ -110,6 +110,7 @@ interface Finding {
   why_trace?: string | null;
   version_confidence?: number | null;
   evidence_types?: string[];
+  evidence_summary?: string | null;
 }
 
 interface FindingEnrichment {
@@ -301,8 +302,9 @@ function App() {
   const [loading, setLoading] = useState(false);
   const [autoRefresh, setAutoRefresh] = useState(true);
   const [findingFilter, setFindingFilter] = useState<'all' | 'low' | 'medium' | 'high' | 'critical'>('all');
+  const [evidenceFilter, setEvidenceFilter] = useState<'any' | 'low' | 'medium' | 'high'>('any');
   const [findingSearch, setFindingSearch] = useState('');
-  const [findingSort, setFindingSort] = useState<'recent' | 'severity' | 'port'>('recent');
+  const [findingSort, setFindingSort] = useState<'recent' | 'severity' | 'port' | 'evidence'>('recent');
   const [selectedFinding, setSelectedFinding] = useState<Finding | null>(null);
   const [selectedFindingEnrichment, setSelectedFindingEnrichment] = useState<FindingEnrichment | null>(null);
   const [findingGroupLimit] = useState(8);
@@ -483,7 +485,7 @@ useEffect(() => {
     return;
   }
   refreshFindings(0, false);
-}, [findingFilter, findingSearch]);
+}, [findingFilter, evidenceFilter, findingSearch, findingSort]);
 
 const resetAssetForm = () => {
   setAssetForm({
@@ -514,6 +516,8 @@ const buildFindingsParams = (offsetValue: number) => ({
   limit: pageSize,
   offset: offsetValue,
   severity: findingFilter === 'all' ? undefined : findingFilter,
+  evidence_grade: evidenceFilter === 'any' ? undefined : evidenceFilter,
+  sort: findingSort,
   q: findingSearch.trim() ? findingSearch.trim() : undefined,
 });
 
@@ -876,16 +880,21 @@ const handleLogout = async (): Promise<void> => {
     if (findingFilter !== 'all') {
       list = list.filter((f) => f.severity.toLowerCase() === findingFilter);
     }
+    if (evidenceFilter !== 'any') {
+      list = list.filter((f) => (f.evidence_grade || '').toLowerCase() === evidenceFilter);
+    }
     if (findingSearch.trim()) {
       const q = findingSearch.trim().toLowerCase();
       list = list.filter((f) =>
         (f.service_name || '').toLowerCase().includes(q) ||
         (f.host_address || '').toLowerCase().includes(q) ||
-        (f.description || '').toLowerCase().includes(q)
+        (f.description || '').toLowerCase().includes(q) ||
+        (f.evidence_summary || '').toLowerCase().includes(q) ||
+        (f.why_trace || '').toLowerCase().includes(q)
       );
     }
     return list;
-  }, [findings, findingFilter, findingSearch]);
+  }, [findings, findingFilter, evidenceFilter, findingSearch]);
 
   const surfaces = useMemo(() => {
     const isLight = colorScheme === 'light';
@@ -2375,6 +2384,19 @@ const handleLogout = async (): Promise<void> => {
                         { label: 'Critical', value: 'critical' },
                       ]}
                     />
+                    <Select
+                      value={evidenceFilter}
+                      onChange={(value) => setEvidenceFilter((value as typeof evidenceFilter) || 'any')}
+                      data={[
+                        { label: 'Evidence: Any', value: 'any' },
+                        { label: 'High', value: 'high' },
+                        { label: 'Medium', value: 'medium' },
+                        { label: 'Low', value: 'low' },
+                      ]}
+                      searchable
+                      clearable={false}
+                      w={160}
+                    />
                     <SegmentedControl
                       value={findingSort}
                       onChange={(v) => setFindingSort(v as typeof findingSort)}
@@ -2416,7 +2438,7 @@ const handleLogout = async (): Promise<void> => {
                         <Table.Thead>
                           <Table.Tr>
                             <Table.Th>PORT</Table.Th>
-                            <Table.Th>SERVICE</Table.Th>
+                            <Table.Th>SERVICE / EVIDENCE</Table.Th>
                             <Table.Th>SEVERITY</Table.Th>
                             <Table.Th>STATUS</Table.Th>
                             <Table.Th>DETECTED</Table.Th>
@@ -2440,7 +2462,38 @@ const handleLogout = async (): Promise<void> => {
                             .map((finding) => (
                               <Table.Tr key={`${group.hostLabel}-${finding.id}`} onClick={() => setSelectedFinding(finding)} style={{ cursor: 'pointer' }}>
                                 <Table.Td>{finding.port ? `${finding.port}/${finding.protocol || 'tcp'}` : '-'}</Table.Td>
-                                <Table.Td>{finding.service_name || 'unknown'}</Table.Td>
+                                <Table.Td>
+                                  <Stack gap={4} align="flex-start">
+                                    <Text fw={600} size="sm">{finding.service_name || 'unknown'}</Text>
+                                    <Group gap={6} wrap="wrap">
+                                      {finding.evidence_grade && (
+                                        <Badge
+                                          size="xs"
+                                          variant="outline"
+                                          color={
+                                            finding.evidence_grade === 'high'
+                                              ? 'red'
+                                              : finding.evidence_grade === 'medium'
+                                                ? 'orange'
+                                                : 'gray'
+                                          }
+                                        >
+                                          Evidence: {finding.evidence_grade}
+                                        </Badge>
+                                      )}
+                                      {finding.version_confidence != null && (
+                                        <Badge size="xs" variant="dot" color="indigo">
+                                          v-conf {Math.round((finding.version_confidence ?? 0) * 100)}%
+                                        </Badge>
+                                      )}
+                                      {finding.why_trace && (
+                                        <Tooltip label={finding.why_trace} multiline maw={260}>
+                                          <Badge size="xs" variant="light" color="teal">Why</Badge>
+                                        </Tooltip>
+                                      )}
+                                    </Group>
+                                  </Stack>
+                                </Table.Td>
                                 <Table.Td>
                                   <SeverityBadge severity={finding.severity} />
                                 </Table.Td>

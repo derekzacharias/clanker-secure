@@ -245,12 +245,15 @@ def list_findings(
     status_filter: Optional[str] = Query(default=None, alias="status"),
     asset_id: Optional[int] = Query(default=None),
     search: Optional[str] = Query(default=None, alias="q"),
+    evidence_grade: Optional[str] = Query(default=None),
     limit: int = Query(default=100, ge=1, le=1000),
     offset: int = Query(default=0, ge=0),
     response: Response = None,  # type: ignore[assignment]
     session: Session = Depends(session_dep),
 ) -> List[Finding]:
-    query, where_sql, params = cm._build_finding_filters(scan_id, severity, status_filter, asset_id, search)  # type: ignore[attr-defined]
+    query, where_sql, params = cm._build_finding_filters(  # type: ignore[attr-defined]
+        scan_id, severity, status_filter, asset_id, evidence_grade, search
+    )
     rows, total = cm._paginate_query(session, query.order_by(Finding.detected_at.desc()), limit, offset)  # type: ignore[attr-defined]
     enrichment_by_finding: Dict[int, Dict[str, Any]] = {}
     ids = [f.id for f in rows if f.id is not None]

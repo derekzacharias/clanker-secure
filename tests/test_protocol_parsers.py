@@ -97,9 +97,48 @@ def test_smb_and_snmp_banners_capture_versions() -> None:
     assert snmp_updated and (snmp_updated.version_confidence or 0) >= 0.25
 
 
+def test_postgres_banner_inference_preserves_version() -> None:
+    pg_obs = _observation(5432, service_name="postgresql")
+    pg_updated = parse_fingerprint_artifact(
+        "postgres_banner", pg_obs, {"service_name": "PostgreSQL", "service_version": "13.4"}, host=None
+    )
+    assert pg_updated is not None
+    assert pg_updated.fingerprint and pg_updated.fingerprint["protocol"] == "postgresql"
+    assert pg_updated.service_version == "13.4"
+    assert (pg_updated.version_confidence or 0) >= 0.4
+    # SSL response evidence path
+    ssl_updated = parse_fingerprint_artifact(
+        "postgres_ssl_response",
+        pg_obs,
+        {"service_name": "postgresql", "service_version": None, "ssl_response": "S", "port": 5432},
+        host=None,
+    )
+    assert ssl_updated is not None
+    assert "ssl_response" in (ssl_updated.evidence or [])[0]["data"]
+    # Authentication message parsing
+    auth_packet = bytes.fromhex((DATA_DIR / "postgres_auth.hex").read_text().strip().replace(" ", ""))
+    auth_updated = parse_fingerprint_artifact(
+        "postgres_auth",
+        pg_obs,
+        {"service_name": "postgresql", "service_version": None, "startup_response": auth_packet, "port": 5432},
+        host=None,
+    )
+    assert auth_updated is not None
+    assert any(ev for ev in (auth_updated.evidence or []) if ev["type"] == "postgres_auth")
+    assert any(ev for ev in (auth_updated.evidence or []) if ev["type"] == "postgres_params")
+
+
 def test_parser_inventory_includes_prioritized_protocols() -> None:
     inventory = parser_inventory()
     protocol_names = [item["name"] for item in inventory]
     assert protocol_names[0] == "http-basic"
-    for expected in {"tls-handshake", "ssh-banner", "mysql-handshake", "rdp-probe", "smb-probe", "snmp-udp"}:
+    for expected in {
+        "tls-handshake",
+        "ssh-banner",
+        "mysql-handshake",
+        "postgres-banner",
+        "rdp-probe",
+        "smb-probe",
+        "snmp-udp",
+    }:
         assert expected in protocol_names
