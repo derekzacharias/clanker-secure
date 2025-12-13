@@ -1,0 +1,4 @@
+# Server
+redis_version:7.0.12
+redis_git_sha1:00000000
+redis_git_dirty:0

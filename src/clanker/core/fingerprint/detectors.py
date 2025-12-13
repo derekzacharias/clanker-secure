@@ -419,6 +419,161 @@ def _fingerprint_http_from_artifacts(artifacts: Dict[str, object], port: int) ->
         evidence=evidence,
     )
 
+class MssqlDetector(Detector):
+    name = "mssql-tds"
+    protocols = ("tcp",)
+    priority = 28
+    evidence_kinds = ("mssql_tds_prelogin",)
+    ports = {1433, 14330, 14331}
+
+    def applies(self, observation: ServiceObservation) -> bool:
+        port = observation.port or 0
+        service = (observation.service_name or "").lower()
+        return observation.protocol == "tcp" and (port in self.ports or "ms-sql" in service or "sql server" in service)
+
+    def detect(self, host: str, observation: ServiceObservation) -> Optional[FingerprintResult]:
+        port = observation.port or 1433
+        # Minimal TDS prelogin packet
+        prelogin = bytes.fromhex("1201002f0000000000000000000000000000000000000000000000000000000000000000")
+        try:
+            with socket.create_connection((host, port), timeout=DEFAULT_TIMEOUT) as sock:
+                sock.sendall(prelogin)
+                resp = sock.recv(512)
+        except Exception:
+            resp = b""
+        return self.parse_artifacts(host, observation, {"response": resp, "port": port})
+
+    def parse_artifacts(
+        self, host: str, observation: ServiceObservation, artifacts: Dict[str, object]
+    ) -> Optional[FingerprintResult]:
+        resp = artifacts.get("response") or b""
+        port = int(artifacts.get("port") or observation.port or 1433)
+        return _fingerprint_mssql_from_prelogin(bytes(resp), port)
+
+
+class LdapDetector(Detector):
+    name = "ldap-banner"
+    protocols = ("tcp",)
+    priority = 32
+    evidence_kinds = ("ldap_banner",)
+    ports = {389, 636}
+
+    def applies(self, observation: ServiceObservation) -> bool:
+        port = observation.port or 0
+        service = (observation.service_name or "").lower()
+        return observation.protocol == "tcp" and (port in self.ports or "ldap" in service)
+
+    def detect(self, host: str, observation: ServiceObservation) -> Optional[FingerprintResult]:
+        port = observation.port or 389
+        try:
+            with socket.create_connection((host, port), timeout=DEFAULT_TIMEOUT) as sock:
+                # Minimal LDAP root DSE query is more involved; here we just rely on accept + immediate close/bind fail banner.
+                banner = sock.recv(256)
+        except Exception:
+            banner = b""
+        return self.parse_artifacts(host, observation, {"banner": banner, "port": port})
+
+    def parse_artifacts(
+        self, host: str, observation: ServiceObservation, artifacts: Dict[str, object]
+    ) -> Optional[FingerprintResult]:
+        banner = artifacts.get("banner") or b""
+        port = int(artifacts.get("port") or observation.port or 389)
+        return _fingerprint_ldap_from_banner(bytes(banner), port)
+
+
+class RedisDetector(Detector):
+    name = "redis-ping"
+    protocols = ("tcp",)
+    priority = 35
+    evidence_kinds = ("redis_info",)
+    ports = {6379}
+
+    def applies(self, observation: ServiceObservation) -> bool:
+        port = observation.port or 0
+        service = (observation.service_name or "").lower()
+        return observation.protocol == "tcp" and (port in self.ports or "redis" in service)
+
+    def detect(self, host: str, observation: ServiceObservation) -> Optional[FingerprintResult]:
+        port = observation.port or 6379
+        info_response = b""
+        try:
+            with socket.create_connection((host, port), timeout=DEFAULT_TIMEOUT) as sock:
+                sock.sendall(b"*1\r\n$4\r\nINFO\r\n")
+                info_response = sock.recv(1024)
+        except Exception:
+            pass
+        return self.parse_artifacts(host, observation, {"response": info_response, "port": port})
+
+    def parse_artifacts(
+        self, host: str, observation: ServiceObservation, artifacts: Dict[str, object]
+    ) -> Optional[FingerprintResult]:
+        resp = artifacts.get("response") or b""
+        port = int(artifacts.get("port") or observation.port or 6379)
+        return _fingerprint_redis_from_info(bytes(resp), port)
+
+
+class MemcachedDetector(Detector):
+    name = "memcached-stats"
+    protocols = ("tcp",)
+    priority = 36
+    evidence_kinds = ("memcached_stats",)
+    ports = {11211}
+
+    def applies(self, observation: ServiceObservation) -> bool:
+        port = observation.port or 0
+        service = (observation.service_name or "").lower()
+        return observation.protocol == "tcp" and (port in self.ports or "memcached" in service)
+
+    def detect(self, host: str, observation: ServiceObservation) -> Optional[FingerprintResult]:
+        port = observation.port or 11211
+        stats = b""
+        try:
+            with socket.create_connection((host, port), timeout=DEFAULT_TIMEOUT) as sock:
+                sock.sendall(b"stats\r\n")
+                stats = sock.recv(1024)
+        except Exception:
+            pass
+        return self.parse_artifacts(host, observation, {"response": stats, "port": port})
+
+    def parse_artifacts(
+        self, host: str, observation: ServiceObservation, artifacts: Dict[str, object]
+    ) -> Optional[FingerprintResult]:
+        resp = artifacts.get("response") or b""
+        port = int(artifacts.get("port") or observation.port or 11211)
+        return _fingerprint_memcached_from_stats(bytes(resp), port)
+
+
+class MqttDetector(Detector):
+    name = "mqtt-connect"
+    protocols = ("tcp",)
+    priority = 38
+    evidence_kinds = ("mqtt_connack",)
+    ports = {1883, 8883}
+
+    def applies(self, observation: ServiceObservation) -> bool:
+        port = observation.port or 0
+        service = (observation.service_name or "").lower()
+        return observation.protocol == "tcp" and (port in self.ports or "mqtt" in service)
+
+    def detect(self, host: str, observation: ServiceObservation) -> Optional[FingerprintResult]:
+        port = observation.port or 1883
+        connack = b""
+        try:
+            connect_packet = bytes.fromhex("101600044d5154540402003c00044d515454")
+            with socket.create_connection((host, port), timeout=DEFAULT_TIMEOUT) as sock:
+                sock.sendall(connect_packet)
+                connack = sock.recv(32)
+        except Exception:
+            pass
+        return self.parse_artifacts(host, observation, {"response": connack, "port": port})
+
+    def parse_artifacts(
+        self, host: str, observation: ServiceObservation, artifacts: Dict[str, object]
+    ) -> Optional[FingerprintResult]:
+        resp = artifacts.get("response") or b""
+        port = int(artifacts.get("port") or observation.port or 1883)
+        return _fingerprint_mqtt_from_connack(bytes(resp), port)
+
 
 def _fingerprint_tls_from_artifacts(artifacts: Dict[str, object]) -> Optional[FingerprintResult]:
     cert = artifacts.get("cert") or {}
@@ -601,6 +756,141 @@ def _fingerprint_smb_from_banner(service_name: str, service_version: Optional[st
     )
 
 
+def _fingerprint_mssql_from_prelogin(resp: bytes, port: int) -> FingerprintResult:
+    summary = "MSSQL/TDS service detected"
+    evidence = [
+        FingerprintEvidence(
+            type="mssql_tds_prelogin",
+            summary=summary,
+            data={"response_hex": resp.hex() if resp else None, "length": len(resp)},
+        )
+    ]
+    return FingerprintResult(
+        protocol="mssql",
+        port=port,
+        vendor=None,
+        product="mssql",
+        version=None,
+        version_confidence=0.0,
+        confidence=0.4 if resp else 0.2,
+        source="tds_prelogin",
+        attributes={"response_len": len(resp)},
+        evidence_summary=summary,
+        evidence=evidence,
+    )
+
+
+def _fingerprint_ldap_from_banner(banner: bytes, port: int) -> FingerprintResult:
+    summary = "LDAP endpoint detected"
+    evidence = [
+        FingerprintEvidence(
+            type="ldap_banner",
+            summary=summary,
+            data={"banner_hex": banner.hex() if banner else None, "length": len(banner)},
+        )
+    ]
+    return FingerprintResult(
+        protocol="ldap" if port == 389 else "ldaps",
+        port=port,
+        vendor=None,
+        product="ldap",
+        version=None,
+        version_confidence=0.0,
+        confidence=0.3,
+        source="ldap_probe",
+        attributes={"banner_len": len(banner)},
+        evidence_summary=summary,
+        evidence=evidence,
+    )
+
+
+def _fingerprint_redis_from_info(resp: bytes, port: int) -> FingerprintResult:
+    text = resp.decode(errors="ignore") if resp else ""
+    version = None
+    if "redis_version" in text:
+        for line in text.splitlines():
+            if line.startswith("redis_version:"):
+                version = line.split(":", 1)[1].strip()
+                break
+    summary = "Redis INFO response" if resp else "Redis probe"
+    evidence = [
+        FingerprintEvidence(
+            type="redis_info",
+            summary=summary,
+            data={"redis_version": version, "preview": text[:200]},
+        )
+    ]
+    return FingerprintResult(
+        protocol="redis",
+        port=port,
+        vendor=None,
+        product="redis",
+        version=version,
+        version_confidence=0.6 if version else 0.2,
+        confidence=0.5 if resp else 0.25,
+        source="redis_info",
+        attributes={"redis_version": version},
+        evidence_summary=summary,
+        evidence=evidence,
+    )
+
+
+def _fingerprint_memcached_from_stats(resp: bytes, port: int) -> FingerprintResult:
+    text = resp.decode(errors="ignore") if resp else ""
+    version = None
+    for line in text.splitlines():
+        if line.startswith("STAT version"):
+            parts = line.split()
+            if len(parts) >= 3:
+                version = parts[2]
+                break
+    summary = "Memcached stats response" if resp else "Memcached probe"
+    evidence = [
+        FingerprintEvidence(
+            type="memcached_stats",
+            summary=summary,
+            data={"version": version, "preview": text[:200]},
+        )
+    ]
+    return FingerprintResult(
+        protocol="memcached",
+        port=port,
+        vendor=None,
+        product="memcached",
+        version=version,
+        version_confidence=0.6 if version else 0.2,
+        confidence=0.45 if resp else 0.25,
+        source="memcached_stats",
+        attributes={"version": version},
+        evidence_summary=summary,
+        evidence=evidence,
+    )
+
+
+def _fingerprint_mqtt_from_connack(resp: bytes, port: int) -> FingerprintResult:
+    summary = "MQTT CONNACK received" if resp else "MQTT probe"
+    evidence = [
+        FingerprintEvidence(
+            type="mqtt_connack",
+            summary=summary,
+            data={"response_hex": resp.hex() if resp else None, "length": len(resp)},
+        )
+    ]
+    return FingerprintResult(
+        protocol="mqtt",
+        port=port,
+        vendor=None,
+        product="mqtt",
+        version=None,
+        version_confidence=0.0,
+        confidence=0.35 if resp else 0.2,
+        source="mqtt_connect",
+        attributes={"response_len": len(resp)},
+        evidence_summary=summary,
+        evidence=evidence,
+    )
+
+
 def _fingerprint_snmp_from_banner(service_name: str, service_version: Optional[str], port: int) -> FingerprintResult:
     summary = "SNMP endpoint discovered"
     evidence = [
@@ -735,6 +1025,11 @@ DETECTORS: List[Detector] = sorted(
         SshDetector(),
         MysqlDetector(),
         PostgresDetector(),
+        MssqlDetector(),
+        LdapDetector(),
+        RedisDetector(),
+        MemcachedDetector(),
+        MqttDetector(),
         RdpDetector(),
         SmbDetector(),
         SnmpDetector(),

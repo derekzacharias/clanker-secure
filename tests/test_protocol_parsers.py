@@ -137,8 +137,51 @@ def test_parser_inventory_includes_prioritized_protocols() -> None:
         "ssh-banner",
         "mysql-handshake",
         "postgres-banner",
+        "mssql-tds",
+        "ldap-banner",
+        "redis-ping",
+        "memcached-stats",
+        "mqtt-connect",
         "rdp-probe",
         "smb-probe",
         "snmp-udp",
     }:
         assert expected in protocol_names
+
+
+def test_mssql_prelogin_parsing() -> None:
+    packet = bytes.fromhex((DATA_DIR / "mssql_prelogin.hex").read_text().strip())
+    obs = _observation(1433, service_name="ms-sql-s")
+    updated = parse_fingerprint_artifact("mssql_tds_prelogin", obs, {"response": packet, "port": 1433})
+    assert updated is not None
+    assert updated.fingerprint and updated.fingerprint["protocol"] == "mssql"
+    assert updated.evidence and updated.evidence[0]["type"] == "mssql_tds_prelogin"
+
+
+def test_ldap_banner_parser() -> None:
+    banner = b"\x30\x0c\x02\x01\x01`\x07\x02\x01\x03\x04\x00\x80\x00"  # simple bind response header
+    obs = _observation(389, service_name="ldap")
+    updated = parse_fingerprint_artifact("ldap_banner", obs, {"banner": banner, "port": 389})
+    assert updated is not None
+    assert updated.fingerprint and updated.fingerprint["protocol"] == "ldap"
+
+
+def test_redis_and_memcached_parsers_extract_versions() -> None:
+    redis_info = (DATA_DIR / "redis_info.txt").read_text()
+    memcached_stats = (DATA_DIR / "memcached_stats.txt").read_text()
+    redis_obs = _observation(6379, service_name="redis")
+    memc_obs = _observation(11211, service_name="memcached")
+    redis_updated = parse_fingerprint_artifact("redis_info", redis_obs, {"response": redis_info.encode(), "port": 6379})
+    memc_updated = parse_fingerprint_artifact(
+        "memcached_stats", memc_obs, {"response": memcached_stats.encode(), "port": 11211}
+    )
+    assert redis_updated is not None and redis_updated.service_version == "7.0.12"
+    assert memc_updated is not None and memc_updated.service_version == "1.6.9"
+
+
+def test_mqtt_connack_parser() -> None:
+    connack = bytes.fromhex("20020000")
+    obs = _observation(1883, service_name="mqtt")
+    updated = parse_fingerprint_artifact("mqtt_connack", obs, {"response": connack, "port": 1883})
+    assert updated is not None
+    assert updated.fingerprint and updated.fingerprint["protocol"] == "mqtt"

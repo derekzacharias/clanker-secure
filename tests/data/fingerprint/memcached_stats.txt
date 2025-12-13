@@ -1,0 +1,5 @@
+STAT pid 1234
+STAT uptime 3600
+STAT time 1600000000
+STAT version 1.6.9
+END
