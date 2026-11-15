@@ -32,6 +32,7 @@ from sqlalchemy.orm import selectinload
 from sqlmodel import Session, func, select, delete
 
 from clanker.config import settings
+from clanker.core import authz
 from clanker.core.agent_vuln_logic import agent_rule_counts, persist_agent_findings, reload_agent_rules
 from clanker.core.coverage import load_rule_gaps, summarize_rule_gaps, stub_rule_from_gap
 from clanker.core.evidence import dedupe_evidence, grade_evidence
@@ -1267,9 +1268,50 @@ def get_current_user(
     return CurrentUser(user=user, token=token)
 
 
-def require_roles(*roles: str):
+def require_permission(*required: str):
+    """Central guard: 403 unless the caller holds every listed permission."""
+    for permission in required:
+        if permission not in authz.ALL_PERMISSIONS:
+            raise RuntimeError(f"require_permission: unknown permission {permission}")
+
     def dep(current: CurrentUser = Depends(get_current_user)) -> CurrentUser:
-        if current.user.role not in roles:
+        granted = authz.permissions_for(current.user.role)
+        if not all(p in granted for p in required):
+            raise HTTPException(status_code=403, detail="Insufficient permissions")
+        return current
+
+    return dep
+
+
+def _revoke_sessions(session: Session, user_id: int, reason: str) -> int:
+    """Revoke every live token for a user.
+
+    Called when an account is disabled, its role is reduced, or its password is reset:
+    a session that outlives the credential it was issued for is a standing bypass.
+    """
+    tokens = session.exec(
+        select(SessionToken).where(SessionToken.user_id == user_id, SessionToken.revoked == False)  # noqa: E712
+    ).all()
+    for token in tokens:
+        token.revoked = True
+        session.add(token)
+    if tokens:
+        session.add(AuditLog(actor_user_id=user_id, action="sessions_revoked",
+                             target=str(user_id), ip=None, detail=f"{len(tokens)} token(s): {reason}"))
+    return len(tokens)
+
+
+def require_roles(*roles: str):
+    """Legacy guard: kept so existing handlers keep working.
+
+    New code should ask for a permission (`require_permission("findings.assign")`)
+    because a role name in a handler cannot express "assignment without execution".
+    This shim delegates to the same table, so the two can never disagree.
+    """
+    wanted = {authz.normalise_role(r) for r in roles if r}
+
+    def dep(current: CurrentUser = Depends(get_current_user)) -> CurrentUser:
+        if current.user.role not in wanted:
             raise HTTPException(status_code=403, detail="Insufficient role")
         return current
 
@@ -1357,7 +1399,9 @@ class UserCreate(BaseModel):
     email: str
     name: Optional[str] = None
     password: str
-    role: str = "operator"
+    # No default role: the server applies authz.DEFAULT_ROLE (least privilege), so a
+    # new account is never an operator by accident.
+    role: Optional[str] = None
     active: bool = True
 
 
@@ -1366,6 +1410,10 @@ class UserUpdate(BaseModel):
     role: Optional[str] = None
     active: Optional[bool] = None
     password: Optional[str] = None
+
+
+class ResetPasswordRequest(BaseModel):
+    new_password: str
 
 
 class ChangePasswordRequest(BaseModel):
@@ -1810,12 +1858,26 @@ def refresh(payload: RefreshRequest, session: Session = Depends(session_dep)) ->
         tok.expires_at = tok.expires_at.replace(tzinfo=timezone.utc)
         session.add(tok)
         session.flush()
-    if not tok or tok.revoked or tok.expires_at <= now_utc():
+    if not tok:
+        raise HTTPException(status_code=401, detail="Invalid or expired refresh token")
+
+    if tok.revoked:
+        # A refresh token that was already rotated is being replayed: revoke every
+        # session for the user, because the token has leaked.
+        _revoke_sessions(session, tok.user_id, reason="refresh token reuse detected")
+        session.add(AuditLog(actor_user_id=tok.user_id, action="refresh_reuse_detected",
+                             target=str(tok.user_id), ip=None, detail="all sessions revoked"))
+        session.commit()
         raise HTTPException(status_code=401, detail="Invalid or expired refresh token")
 
     user = session.get(User, tok.user_id)
     if not user or not user.active:
         raise HTTPException(status_code=403, detail="User disabled")
+
+    # Rotate: the presented refresh token is single-use.
+    tok.revoked = True
+    session.add(tok)
+    session.flush()
 
     access = create_session_token(session, user_id=user.id, token_type="access", lifetime=ACCESS_TTL)
     refresh = create_session_token(session, user_id=user.id, token_type="refresh", lifetime=REFRESH_TTL)
@@ -1889,33 +1951,38 @@ def seed_admin(payload: SeedAdminRequest, session: Session = Depends(session_dep
 
 
 @app.get("/users", response_model=List[UserRead])
-def list_users(_: object = Depends(require_roles("admin")), session: Session = Depends(session_dep)) -> list[User]:
+def list_users(_: object = Depends(require_permission("users.read")), session: Session = Depends(session_dep)) -> list[User]:
     return session.exec(select(User).order_by(User.created_at.desc())).all()
 
 
 @app.post("/users", response_model=UserRead, status_code=201)
-def create_user(payload: UserCreate, _: object = Depends(require_roles("admin")), session: Session = Depends(session_dep)) -> User:
+def create_user(payload: UserCreate, current=Depends(require_permission("users.manage")), session: Session = Depends(session_dep)) -> User:
     existing = session.exec(select(User).where(User.email == payload.email)).first()
     if existing:
         raise HTTPException(status_code=400, detail="Email already exists")
     if not _password_complex_enough(payload.password):
         raise HTTPException(status_code=400, detail="Password does not meet complexity requirements")
+    try:
+        role = authz.normalise_role(payload.role)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     user = User(
         email=payload.email,
         name=payload.name,
         hashed_password=hash_password(payload.password),
-        role=payload.role or "operator",
+        role=role,
         active=payload.active,
     )
     session.add(user)
     session.flush()
     session.refresh(user)
-    session.add(AuditLog(actor_user_id=None, action="user_created", target=str(user.id), ip=None, detail=user.email))
+    session.add(AuditLog(actor_user_id=current.user.id, action="user_created", target=str(user.id), ip=None,
+                         detail=f"{user.email} role={user.role}"))
     return user
 
 
 @app.patch("/users/{user_id}", response_model=UserRead)
-def update_user(user_id: int, payload: UserUpdate, _: object = Depends(require_roles("admin")), session: Session = Depends(session_dep)) -> User:
+def update_user(user_id: int, payload: UserUpdate, current=Depends(require_permission("users.manage")), session: Session = Depends(session_dep)) -> User:
     user = session.get(User, user_id)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
@@ -1923,26 +1990,106 @@ def update_user(user_id: int, payload: UserUpdate, _: object = Depends(require_r
         raise HTTPException(status_code=400, detail="Cannot change role for administrator accounts")
     if payload.active is not None and user.role == "admin" and payload.active is False:
         raise HTTPException(status_code=400, detail="Cannot disable administrator accounts")
+    revoke_reason = ""
+    if payload.role is not None:
+        try:
+            new_role = authz.normalise_role(payload.role)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if new_role != user.role:
+            user.role = new_role
+            # A reduced role must not keep a live token minted for the old one.
+            revoke_reason = "role changed"
     if payload.name is not None:
         user.name = payload.name
-    if payload.role is not None:
-        user.role = payload.role
     if payload.active is not None:
         user.active = payload.active
+        if not payload.active:
+            revoke_reason = "account disabled"
     if payload.password:
         if not _password_complex_enough(payload.password):
             raise HTTPException(status_code=400, detail="Password does not meet complexity requirements")
         user.hashed_password = hash_password(payload.password)
+        revoke_reason = "password reset"
     session.add(user)
     session.flush()
+    if revoke_reason:
+        _revoke_sessions(session, user.id, revoke_reason)
     session.refresh(user)
-    session.add(AuditLog(actor_user_id=None, action="user_updated", target=str(user.id), ip=None, detail=None))
+    session.add(AuditLog(actor_user_id=current.user.id, action="user_updated", target=str(user.id), ip=None,
+                         detail=",".join(filter(None, [
+                             "role=" + user.role,
+                             "active=" + ("true" if user.active else "false"),
+                             revoke_reason,
+                         ]))))
     return user
+
+
+@app.get("/access/me")
+def access_me(current=Depends(get_current_user)) -> Dict[str, Any]:
+    """Identity plus the effective permissions the UI should honour.
+
+    The frontend uses this only to hide controls it must not offer; every request is
+    still authorised on the server.
+    """
+    return {
+        "user": {
+            "id": current.user.id,
+            "email": current.user.email,
+            "name": current.user.name,
+            "role": current.user.role,
+            "active": current.user.active,
+        },
+        "permissions": sorted(authz.permissions_for(current.user.role)),
+        "roles": authz.roles_matrix(),
+        "default_role": authz.DEFAULT_ROLE,
+    }
+
+
+@app.get("/access/roles")
+def access_roles(_: object = Depends(require_permission("users.read"))) -> Dict[str, Any]:
+    return {"roles": authz.roles_matrix(), "permissions": list(authz.PERMISSIONS), "default_role": authz.DEFAULT_ROLE}
+
+
+@app.post("/users/{user_id}/revoke-sessions")
+def revoke_user_sessions(user_id: int, current=Depends(require_permission("users.manage")),
+                         session: Session = Depends(session_dep)) -> Dict[str, Any]:
+    user = session.get(User, user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    count = _revoke_sessions(session, user_id, "revoked by administrator")
+    session.add(AuditLog(actor_user_id=current.user.id, action="sessions_revoked_by_admin",
+                         target=str(user_id), ip=None, detail=f"{count} token(s)"))
+    session.commit()
+    return {"revoked": count}
+
+
+@app.post("/users/{user_id}/reset-password")
+def reset_user_password(user_id: int, payload: ResetPasswordRequest, current=Depends(require_permission("users.manage")),
+                        session: Session = Depends(session_dep)) -> Dict[str, Any]:
+    """Administrator-initiated password reset.
+
+    The new password is supplied by the administrator (the product has no mail
+    provider, so pretending to send a reset link would be a lie). Existing sessions are
+    revoked for the same reason a self-service reset revokes them.
+    """
+    user = session.get(User, user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    if not _password_complex_enough(payload.new_password):
+        raise HTTPException(status_code=400, detail="Password does not meet complexity requirements")
+    user.hashed_password = hash_password(payload.new_password)
+    session.add(user)
+    revoked = _revoke_sessions(session, user_id, "password reset by administrator")
+    session.add(AuditLog(actor_user_id=current.user.id, action="password_reset_by_admin",
+                         target=str(user_id), ip=None, detail=f"{revoked} session(s) revoked"))
+    session.flush()
+    return {"status": "ok", "sessions_revoked": revoked}
 
 
 @app.get("/audit_logs", response_model=List[AuditLogRead])
 def list_audit_logs(
-    _: object = Depends(require_roles("admin")),
+    _: object = Depends(require_permission("audit.read")),
     user_id: Optional[int] = Query(default=None),
     action: Optional[str] = Query(default=None),
     since: Optional[str] = Query(default=None),
@@ -1989,21 +2136,16 @@ def _seed_admin_if_configured(session: Session) -> None:
     password = os.getenv("CLANKER_ADMIN_PASSWORD")
     if not email or not password:
         return
-    hashed = hash_password(password)
+    # Create-only. Resetting the password, re-granting admin or re-activating a
+    # disabled account on every restart would let an environment variable override an
+    # operator's decision (including a deliberate disable or lockout). Rotating a
+    # credential is an explicit, audited action.
     existing = session.exec(select(User).where(User.email == email)).first()
     if existing:
-        existing.hashed_password = hashed
-        existing.role = "admin"
-        existing.active = True
-        if not existing.name:
-            existing.name = "Administrator"
-        session.add(existing)
-    else:
-        user = User(email=email, name="Administrator", hashed_password=hashed, role="admin", active=True)
-        session.add(user)
-    # Clear lockouts for the seeded admin account
-    for attempt in session.exec(select(LoginAttempt).where(LoginAttempt.email == email)).all():
-        session.delete(attempt)
+        return
+    user = User(email=email, name="Administrator", hashed_password=hash_password(password),
+                role="admin", active=True)
+    session.add(user)
 
 
 @register_startup_hook

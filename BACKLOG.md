@@ -260,7 +260,11 @@ Observability
 
 ## Enterprise user management, access control and remediation assignment
 
-Source: architecture brief (2026-11-15). **Status: assessed, not implemented.**
+Source: architecture brief (2026-11-15).
+**Status: Milestone 1 backend implemented** (permissions, bootstrap hardening, refresh
+rotation, session revocation, audit attribution, `/access/*` + user lifecycle
+endpoints, 17 tests). The **Users & Access interface, teams, invitations, asset
+ownership and ticketing remain open** — see the milestone list below.
 Scope discipline per `AGENTS.md`: this is recorded here and in
 `docs/requirements.md` before code, and delivered through the milestones below.
 
