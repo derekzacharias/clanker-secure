@@ -28,6 +28,7 @@ const findings = [
     cvss_v31_base: 9.8, references: ['https://nvd.nist.gov/vuln/detail/CVE-2026-1234'], rule_source: 'openssh-vulners',
     evidence_grade: 'high', why_trace: 'version banner matched 8.9p1', version_confidence: 0.92,
     evidence_types: ['banner'], evidence_summary: 'SSH-2.0-OpenSSH_8.9p1 matched against advisory range',
+    host_report: 'PORT   STATE SERVICE VERSION\n22/tcp open  ssh     OpenSSH 8.9p1 Ubuntu 3ubuntu0.4 (Ubuntu Linux; protocol 2.0)\n| vulners:\n|   CVE-2026-1234  9.8  https://vulners.com/cve/CVE-2026-1234\n|_  CVE-2025-26465  6.5  https://vulners.com/cve/CVE-2025-26465',
   },
   {
     id: 102, scan_id: 11, asset_id: 2, host_address: '10.0.4.20', host_os_name: 'Linux', port: 8080, protocol: 'tcp',

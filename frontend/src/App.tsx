@@ -44,6 +44,8 @@ import {
 import axios from 'axios';
 import { AppLayout } from './app/AppLayout';
 import { navigate, routeOf, usePathname, type RouteName } from './app/router';
+import { panelStyle, surfaceTokens } from './app/theme';
+import { CodeBlock } from './components/ui/CodeBlock';
 
 const API_BASE = import.meta.env.VITE_API_BASE ?? '';
 
@@ -275,24 +277,12 @@ const parseApiError = (error: unknown): { message: string; status?: number } => 
   return { message: 'Unexpected error' };
 };
 
-const glassStyles = {
-  background: 'rgba(10, 15, 28, 0.72)',
-  border: '1px solid rgba(99,102,241,0.12)',
-  backdropFilter: 'blur(18px)',
-};
-
-const hostCardStyles = {
-  background: 'linear-gradient(135deg, rgba(8,11,20,0.92), rgba(17,24,39,0.85))',
-  border: '1px solid rgba(99,102,241,0.18)',
-  boxShadow: '0 25px 40px rgba(2,6,23,0.6)',
-};
-
-const gradientCard = (gradient: string) => ({
-  background: gradient,
-  border: '1px solid rgba(255,255,255,0.1)',
-  boxShadow: '0 20px 40px rgba(0,0,0,0.3)',
-});
-
+/**
+ * Panels come from the theme tokens: three levels of surface (application
+ * background, content panel, nested panel) with a border and no elevation. The
+ * previous helpers here built blurred and gradient surfaces, which is why every
+ * section used to blend into the next.
+ */
 function StatusBadge({ status }: { status: string }) {
   return <Badge color={STATUS_COLORS[status] || 'gray'}>{status.replaceAll('_', ' ')}</Badge>;
 }
@@ -913,36 +903,14 @@ const handleLogout = async (): Promise<void> => {
 
   const surfaces = useMemo(() => {
     const isLight = colorScheme === 'light';
+    const scheme: 'light' | 'dark' = isLight ? 'light' : 'dark';
     return {
-      glass: isLight
-        ? {
-            background: 'rgba(255, 255, 255, 0.75)',
-            border: '1px solid rgba(15, 23, 42, 0.08)',
-            backdropFilter: 'blur(14px)',
-          }
-        : glassStyles,
-      host: isLight
-        ? {
-            background: 'linear-gradient(135deg, rgba(248,250,252,0.95), rgba(241,245,249,0.9))',
-            border: '1px solid rgba(2,6,23,0.06)',
-            boxShadow: '0 12px 24px rgba(2,6,23,0.08)',
-          }
-        : hostCardStyles,
-      accent: (from: string, to: string) =>
-        isLight
-          ? {
-              background: `linear-gradient(135deg, ${from}, ${to})`,
-              border: '1px solid rgba(2,6,23,0.06)',
-              boxShadow: '0 12px 28px rgba(2,6,23,0.08)',
-            }
-          : gradientCard(`linear-gradient(135deg, ${from}, ${to})`),
-      tile: isLight
-        ? {
-            background: '#ffffff',
-            border: '1px solid rgba(2,6,23,0.06)',
-            boxShadow: '0 12px 28px rgba(2,6,23,0.08)',
-          }
-        : undefined,
+      glass: panelStyle(scheme, 1),
+      host: panelStyle(scheme, 2),
+      accent: (_from: string, _to: string) => panelStyle(scheme, 1),
+      tile: panelStyle(scheme, 1),
+      nested: panelStyle(scheme, 2),
+      header: surfaceTokens(scheme).sectionHeader,
     } as const;
   }, [colorScheme]);
 
@@ -1372,7 +1340,7 @@ const handleLogout = async (): Promise<void> => {
       <AppShell padding="lg" styles={{ main: { background: 'transparent' } }}>
         <AppShell.Main>
           <Stack align="center" justify="center" style={{ minHeight: '70vh' }}>
-            <Card padding="xl" radius="md" shadow="xl" style={colorScheme === 'light' ? { background: 'white' } : glassStyles}>
+            <Card padding="xl" radius="md" style={surfaces.glass as React.CSSProperties}>
               <Stack w={360}>
                 <Group justify="center">
                   <ThemeIcon
@@ -1418,7 +1386,7 @@ const handleLogout = async (): Promise<void> => {
       <AppShell padding="lg" styles={{ main: { background: 'transparent' } }}>
         <AppShell.Main>
           <Stack align="center" justify="center" style={{ minHeight: '70vh' }}>
-            <Card padding="xl" radius="md" shadow="xl" style={colorScheme === 'light' ? { background: 'white' } : glassStyles}>
+            <Card padding="xl" radius="md" style={surfaces.glass as React.CSSProperties}>
               <Stack w={360}>
                 <Group justify="center">
                   <ThemeIcon
@@ -1713,10 +1681,10 @@ const handleLogout = async (): Promise<void> => {
                 padding="lg"
                 radius="md"
                 style={{
-                  ...(colorScheme === 'light' ? (surfaces.tile as React.CSSProperties) : glassStyles),
+                  ...(surfaces.glass as React.CSSProperties),
                   height: isMobile ? SUMMARY_CARD_HEIGHT_MOBILE : SUMMARY_CARD_HEIGHT,
                 }}
-                shadow="xl"
+               
               >
                 <Group justify="space-between" mb="md">
                   <div>
@@ -1757,10 +1725,10 @@ const handleLogout = async (): Promise<void> => {
                 padding="lg"
                 radius="md"
                 style={{
-                  ...(colorScheme === 'light' ? (surfaces.tile as React.CSSProperties) : glassStyles),
+                  ...(surfaces.glass as React.CSSProperties),
                   height: isMobile ? SUMMARY_CARD_HEIGHT_MOBILE : SUMMARY_CARD_HEIGHT,
                 }}
-                shadow="xl"
+               
               >
                 <Group justify="space-between" mb="md">
                   <div>
@@ -1799,7 +1767,7 @@ const handleLogout = async (): Promise<void> => {
           <Tabs value={activeTab} onChange={(value) => value && navigate(`/${value}`)} radius="md" variant="pills">
 
             <Tabs.Panel value="coverage" pt="sm">
-              <Card padding="lg" radius="md" shadow="xl" style={colorScheme === 'light' ? (surfaces.tile as React.CSSProperties) : glassStyles}>
+              <Card padding="lg" radius="md" style={surfaces.glass as React.CSSProperties}>
                 <Stack gap="md">
                   <Group justify="space-between" align="flex-start">
                     <div>
@@ -1831,7 +1799,7 @@ const handleLogout = async (): Promise<void> => {
                       {ruleGapSummary?.buckets?.length ? (
                         <SimpleGrid cols={{ base: 1, md: 2 }} spacing="md">
                           {ruleGapSummary.buckets.map((bucket) => (
-                            <Paper key={`${bucket.protocol}-${bucket.port ?? 'any'}-${bucket.service_name}`} withBorder p="md" radius="md" style={colorScheme === 'light' ? (surfaces.tile as React.CSSProperties) : glassStyles}>
+                            <Paper key={`${bucket.protocol}-${bucket.port ?? 'any'}-${bucket.service_name}`} withBorder p="md" radius="md" style={surfaces.glass as React.CSSProperties}>
                               <Group justify="space-between" mb="xs">
                                 <div>
                                   <Group gap="xs">
@@ -1932,7 +1900,7 @@ const handleLogout = async (): Promise<void> => {
             </Tabs.Panel>
 
             <Tabs.Panel value="integrations" pt="sm">
-              <Card padding="lg" radius="md" shadow="xl" style={colorScheme === 'light' ? (surfaces.tile as React.CSSProperties) : glassStyles}>
+              <Card padding="lg" radius="md" style={surfaces.glass as React.CSSProperties}>
                 <Stack gap="md">
                   <Group justify="space-between" align="flex-start">
                     <div>
@@ -1991,7 +1959,7 @@ const handleLogout = async (): Promise<void> => {
             </Tabs.Panel>
 
             <Tabs.Panel value="reports" pt="sm">
-              <Card padding="lg" radius="md" shadow="xl" style={colorScheme === 'light' ? (surfaces.tile as React.CSSProperties) : glassStyles}>
+              <Card padding="lg" radius="md" style={surfaces.glass as React.CSSProperties}>
                 <Title order={4}>Reports</Title>
                 <Text c="dimmed" size="sm">Coming soon: rollups and exports.</Text>
               </Card>
@@ -2003,8 +1971,8 @@ const handleLogout = async (): Promise<void> => {
                   <Card
                     padding="lg"
                     radius="md"
-                    style={colorScheme === 'light' ? (surfaces.tile as React.CSSProperties) : glassStyles}
-                    shadow="xl"
+                    style={surfaces.glass as React.CSSProperties}
+                   
                   >
                     <Group justify="space-between" mb="sm">
                       <Title order={4} c={colorScheme === 'light' ? '#0b1220' : undefined}>
@@ -2106,7 +2074,7 @@ const handleLogout = async (): Promise<void> => {
                   </Card>
                 </Grid.Col>
                 <Grid.Col span={{ base: 12, md: 8 }}>
-                  <Card padding="lg" radius="md" style={surfaces.glass} shadow="xl">
+                  <Card padding="lg" radius="md" style={surfaces.glass}>
                     <Group justify="space-between" mb="xs">
                       <Group gap="xs">
                         <Badge variant="light">{assets.length} total</Badge>
@@ -2181,7 +2149,7 @@ const handleLogout = async (): Promise<void> => {
             <Tabs.Panel value="scans" pt="sm">
               <Grid gutter={{ base: 'md', md: 'xl' }}>
                 <Grid.Col span={{ base: 12, md: 4 }}>
-                  <Card padding="lg" radius="md" style={colorScheme === 'light' ? (surfaces.tile as React.CSSProperties) : glassStyles} shadow="xl">
+                  <Card padding="lg" radius="md" style={surfaces.glass as React.CSSProperties}>
                     <Title order={5} mb="sm">
                       Queue scan
                     </Title>
@@ -2210,7 +2178,7 @@ const handleLogout = async (): Promise<void> => {
                   </Card>
                 </Grid.Col>
                 <Grid.Col span={{ base: 12, md: 8 }}>
-                  <Card padding="lg" radius="md" style={colorScheme === 'light' ? (surfaces.tile as React.CSSProperties) : glassStyles} shadow="xl">
+                  <Card padding="lg" radius="md" style={surfaces.glass as React.CSSProperties}>
                     <Group justify="space-between" mb="xs">
                       <Group gap="xs">
                         <SegmentedControl value={scanFilter} onChange={(v) => setScanFilter(v as typeof scanFilter)} data={[{ label: 'All', value: 'all' }, { label: 'Queued', value: 'queued' }, { label: 'Running', value: 'running' }, { label: 'Done', value: 'completed' }, { label: 'Failed', value: 'failed' }]} />
@@ -2272,7 +2240,7 @@ const handleLogout = async (): Promise<void> => {
             </Tabs.Panel>
 
             <Tabs.Panel value="findings" pt="sm">
-              <Card padding="lg" radius="md" style={colorScheme === 'light' ? (surfaces.tile as React.CSSProperties) : glassStyles} shadow="xl">
+              <Card padding="lg" radius="md" style={surfaces.glass as React.CSSProperties}>
                 <Stack gap="sm" mb="md">
                   <Title order={5}>Findings</Title>
                   <Group gap="xs" wrap="wrap">
@@ -2409,15 +2377,7 @@ const handleLogout = async (): Promise<void> => {
                         </Table.Tbody>
                       </Table>
                       {group.hostReport && (
-                        <Paper
-                          mt="md"
-                          p="md"
-                          radius="md"
-                          style={{
-                            background: 'rgba(15,23,42,0.7)',
-                            border: '1px solid rgba(148,163,184,0.25)',
-                          }}
-                        >
+                        <Paper mt="md" p="md" radius="md" withBorder style={surfaces.nested}>
                           <Group justify="space-between" mb="sm">
                             <Text fw={600} size="sm" c={colorScheme === 'light' ? '#ffffff' : undefined}>
                               Intense scan details
@@ -2426,20 +2386,9 @@ const handleLogout = async (): Promise<void> => {
                               Raw nmap output
                             </Badge>
                           </Group>
-                          <ScrollArea h={220} offsetScrollbars>
-                            <Text
-                              component="pre"
-                              style={{
-                                whiteSpace: 'pre-wrap',
-                                fontFamily: 'SFMono-Regular, Menlo, Monaco, Consolas, monospace',
-                                fontSize: '0.85rem',
-                                lineHeight: 1.4,
-                                color: colorScheme === 'light' ? '#ffffff' : undefined,
-                              }}
-                            >
-                              {group.hostReport}
-                            </Text>
-                          </ScrollArea>
+                          <CodeBlock language="Nmap output" wrap maxHeight={220} scheme={colorScheme === 'light' ? 'light' : 'dark'}>
+                            {group.hostReport}
+                          </CodeBlock>
                         </Paper>
                       )}
                     </Paper>
@@ -2460,7 +2409,7 @@ const handleLogout = async (): Promise<void> => {
 
             {currentUser?.role === 'admin' && (
               <Tabs.Panel value="schedules" pt="sm">
-                <Card padding="lg" radius="md" style={colorScheme === 'light' ? (surfaces.tile as React.CSSProperties) : glassStyles} shadow="xl">
+                <Card padding="lg" radius="md" style={surfaces.glass as React.CSSProperties}>
                   <Group justify="space-between" mb="md">
                     <div>
                       <Title order={4} c={colorScheme === 'light' ? '#0b1220' : undefined}>Schedules</Title>
@@ -2650,11 +2599,9 @@ const handleLogout = async (): Promise<void> => {
             {findingGroupIndex.get(selectedFinding.id)?.hostReport && (
               <Paper p="sm" withBorder>
                 <Text fw={600} size="sm" mb={4}>Raw nmap output (excerpt)</Text>
-                <ScrollArea h={200} offsetScrollbars>
-                  <Text component="pre" style={{ whiteSpace: 'pre-wrap', fontFamily: 'SFMono-Regular, Menlo, Monaco, Consolas, monospace', fontSize: '0.85rem' }}>
-                    {findingGroupIndex.get(selectedFinding.id)?.hostReport}
-                  </Text>
-                </ScrollArea>
+                <CodeBlock language="Nmap output" wrap maxHeight={200} scheme={colorScheme === 'light' ? 'light' : 'dark'}>
+                  {findingGroupIndex.get(selectedFinding.id)?.hostReport ?? ''}
+                </CodeBlock>
               </Paper>
             )}
             {selectedFinding.why_trace && (

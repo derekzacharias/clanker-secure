@@ -88,27 +88,52 @@ export const highOrange: MantineColorsTuple = scale(semantic.high);
 export const surfaces = {
   dark: {
     background: '#0B1220',
+    // level 1: content panels
     surface: '#172235',
-    surfaceElevated: '#1E293B',
-    border: '#26344A',
+    // level 2: nested panels, table bodies, inner cards
+    surfaceElevated: '#233247',
+    // level 0.5: section headers inside a panel
+    sectionHeader: '#1D2C40',
+    border: '#34445B',
+    borderStrong: '#465364',
     text: '#E8EEF7',
-    textMuted: '#9AA9BD',
-    tableHeader: '#141F31',
-    tableRowHover: '#1B283C',
+    textMuted: '#A5B4C7',
+    tableHeader: '#1D2C40',
+    tableRowHover: '#243349',
+    codeBg: '#293241',
+    codeBorder: '#465364',
+    codeText: '#F1F5F9',
+    codeMuted: '#AEBBCC',
   },
   light: {
     background: '#F5F7FB',
     surface: '#FFFFFF',
-    surfaceElevated: '#F8FAFC',
-    border: '#E1E7EF',
+    surfaceElevated: '#EFF3F8',
+    sectionHeader: '#F1F5F9',
+    border: '#D8E0EA',
+    borderStrong: '#CDD5DF',
     text: '#172235',
     textMuted: '#64748B',
     tableHeader: '#F1F5F9',
     tableRowHover: '#F8FAFC',
+    codeBg: '#E9EDF2',
+    codeBorder: '#CDD5DF',
+    codeText: '#263445',
+    codeMuted: '#64748B',
   },
 } as const;
 
 export type Scheme = keyof typeof surfaces;
+
+/** Flat panel style for a given nesting level: 1 = content, 2 = nested. */
+export function panelStyle(scheme: Scheme, level: 1 | 2 = 1): React.CSSProperties {
+  const t = surfaceTokens(scheme);
+  return {
+    background: level === 1 ? t.surface : t.surfaceElevated,
+    border: `1px solid ${t.border}`,
+    boxShadow: 'none',
+  };
+}
 
 export function surfaceTokens(scheme: Scheme) {
   return surfaces[scheme === 'light' ? 'light' : 'dark'];
