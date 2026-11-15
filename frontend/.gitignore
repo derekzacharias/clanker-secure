@@ -22,3 +22,6 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Playwright output (screenshots, traces, videos)
+e2e/.artifacts/
