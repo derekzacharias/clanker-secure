@@ -257,3 +257,107 @@ Security & Deployment
 
 Observability
 - [ ] Structured logs with redaction; basic metrics; task status reporting
+
+## Enterprise user management, access control and remediation assignment
+
+Source: architecture brief (2026-11-15). **Status: assessed, not implemented.**
+Scope discipline per `AGENTS.md`: this is recorded here and in
+`docs/requirements.md` before code, and delivered through the milestones below.
+
+### Verified assessment of this checkout (blocking first)
+
+| # | Severity | Finding | Evidence |
+|---|---|---|---|
+| B0.1 | **Blocking** | `main.py` imports `build_scan_job_queue`, which did not exist — the app could not import, so no endpoint or test could run. **Fixed**: `core/job_queue.py` now provides the factory and *fails closed* for the `redis`/`rq` backend and for `max_concurrency > 1` instead of silently running single-threaded | `main.py:40`, `core/job_queue.py:165` |
+| B0.2 | **Blocking** | `main.py` imports the `ReportJob` table from `db/models.py`, which did not exist. **Fixed**: restored from its call sites (`_process_report_job`, `_serialize_report_job`) with the fields the code reads/writes | `main.py:52,3136-3200`, `db/models.py` |
+| B0.3 | High | `pytest tests/` cannot pass in this checkout: **18 of 25 failures are missing fixtures that were never committed** (`tests/data/agent_parsers/*`, `tests/data/rule_gaps.json`, protocol parser fixtures); only 4 files exist under `tests/data` | `tests/data/`, `.gitignore` |
+
+Baseline after B0.1/B0.2: `49 passed, 25 failed` — 18 `FileNotFoundError`
+(fixtures), 4 assertion failures in CPE inference/rule-gap summarisation that need
+investigation once fixtures exist, 3 other. Reported as-is; no test is claimed to
+pass that was not run.
+
+### Verified authentication / authorisation risks (Phase 10)
+
+| # | Severity | Finding | Evidence |
+|---|---|---|---|
+| S1 | **Critical** | Startup seeding overwrites an existing administrator: sets `hashed_password` from the env value, forces `role="admin"`, sets `active=True`, and clears its login lockouts — on **every restart**. A rotating env secret or a deliberate disable/lockout is undone by a restart | `main.py:1988-2005` (`_seed_admin_if_configured`), duplicated at `overlay/auth/api.py:206` |
+| S2 | High | Role is a free string with no validation; `User.role` defaults to **`admin`** in the model and `create_user` defaults to `operator`. Unknown role strings become valid access levels | `db/models.py:291`, `main.py:1356-1362,1907` |
+| S3 | High | Refresh tokens are not rotated on use: `/auth/refresh` issues new tokens without revoking the presented one, so a stolen refresh token replays until expiry and reuse is undetectable | `main.py:1805-1823` |
+| S4 | High | Password reset and privilege changes do not revoke existing sessions (`update_user` never touches `SessionToken`), so a compromised session survives a credential reset | `main.py:1917-1942` |
+| S5 | Medium | Audit rows for user create/update record `actor_user_id=None` — administrative changes are unattributable | `main.py:1913,1940` |
+| S6 | Medium | Authorisation is `require_roles("admin", …)` by name throughout; no permission vocabulary, so new roles require editing handlers | `overlay/auth/security.py:110`, `overlay/rbac_override.py` |
+| S7 | Medium | `rbac_override.py` removes and re-registers routes at import time; if import order changes, protection disappears silently with no test guarding it | `overlay/rbac_override.py:26-71` |
+| S8 | Medium | Session tokens are stored in plaintext (`SessionToken.token`) | `overlay/auth/models.py` |
+
+### Milestones (each item states its acceptance criterion)
+
+**M1 — Secure user administration** (do the security items first)
+1. S1: bootstrap seeds only when *no* user exists; never rewrites an existing
+   account's password/role/active state. Password rotation becomes an explicit,
+   audited action. Duplicate seeding path in `overlay/` removed.
+2. S2: central role allowlist (`admin`, `operator`, `viewer`, plus new
+   `security_engineer`, `system_operator`, `developer`, `auditor`), validated on
+   every write; new users default to the least-privileged role.
+3. S3/S4: refresh rotation with reuse detection (reuse → revoke the whole family);
+   disabling an account, changing a role, or resetting a password revokes all of
+   that user's tokens immediately.
+4. S5: every user/team/role change records the authenticated actor.
+5. S6/S7: one permission service (`users.read`, `users.manage`, `teams.manage`,
+   `roles.manage`, `findings.assign`, `findings.verify`, `tickets.create`,
+   `remediation.request|approve|execute|verify`, `audit.read`,
+   `integrations.manage`), enforced server-side; `require_roles` kept as a thin
+   shim for existing routes; route-table mutation removed in favour of explicit
+   dependencies.
+- *Acceptance:* a viewer/developer/auditor cannot reach any admin endpoint
+  (tested per endpoint, not only in the UI); a disabled user's access token and
+  refresh token both fail immediately; a refresh replay revokes the family; the
+  bootstrap cannot change an existing account.
+
+**M2 — Teams and asset ownership**
+- `Team` + `TeamMembership` (a user may hold several teams with one primary),
+  `AssetOwnership` (team, primary user, secondary team, business service,
+  environment, criticality, maintenance window, source, status).
+- Migration keeps the legacy free-text `Asset.owner` verbatim; unresolved assets
+  appear in an **Unassigned** queue, never defaulted to Security Engineering.
+- Bulk assignment from Users & Access and from the asset inventory.
+- *Acceptance:* ownership is relational, legacy values preserved, unassigned
+  assets are visible as such, no automatic default ownership.
+
+**M3 — Remediation assignment**
+- Finding → team/engineer routing from the asset's ownership plus a configurable
+  responsibility map (OS/deps/config/cloud/code); "My Remediation Work" view
+  scoped to the caller's authorisation; SLA due dates from existing risk inputs.
+- *Acceptance:* a new finding lands on the owning team, is visible only to its
+  scope, and shows a due date it can explain.
+
+**M4 — Ticketing (one provider, honestly labelled)**
+- Provider interface; **Jira implemented and tested against a mocked API**;
+  ServiceNow designed but labelled *not implemented* until connectivity, sync and
+  error handling exist (the UI must not repeat today's fake "connected" states).
+- Deterministic grouping + idempotent create/update keyed by a stable group id;
+  closing a ticket never resolves a finding without verification.
+- *Acceptance:* a mocked end-to-end run creates one ticket for N compatible
+  findings, a rescan updates instead of duplicating, and a ticket comment cannot
+  trigger execution.
+
+**M5 — Verification, audit and UI**
+- Users & Access page (directory, invite, roles, teams, disable, revoke sessions,
+  audit activity) replacing the Users modal; CVE flyout remediation tab; audit
+  evidence for every administrative action.
+- *Acceptance:* the brief's 11 acceptance criteria, exercised by Playwright against
+  the real backend with a mocked ticket provider.
+
+### Decisions required before M2/M4
+1. Whether TOTP is in scope for privileged roles (S1/S3 hardening).
+2. Ownership write-back to the CMDB, or Clanker Guard as the source of truth.
+3. Ticket closure policy: automatic after verification, or owner confirmation.
+4. Approval model for remediation execution (single vs dual control).
+5. Whether `operator` is migrated to `security_engineer` or `system_operator` —
+   **must not silently widen privileges**; the mapping needs an explicit choice.
+
+### Not implemented in this change (explicit)
+No user-management UI, teams, ownership, remediation assignment, ticketing, or
+permission service has been written yet. Only the two blocking import defects and
+this assessment landed. The brief's Milestones 1–5 remain open work; the security
+items S1–S8 are the first things to fix because they are verified in code.

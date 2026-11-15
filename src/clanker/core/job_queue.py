@@ -160,3 +160,37 @@ class ScanJobQueue:
             finally:
                 self._queue.task_done()
                 sleep(self.poll_interval)
+
+
+def build_scan_job_queue(
+    *,
+    worker: Callable[[int], None],
+    hooks: Optional[QueueHooks] = None,
+    max_retries: int = 1,
+    backend: str = "memory",
+    max_concurrency: int = 1,
+    name: str = "scan",
+    redis_url: Optional[str] = None,
+) -> ScanJobQueue:
+    """Build the scan job queue for the configured backend.
+
+    Only the in-process backend exists in this tree. The configuration exposes
+    "redis"/"rq" as options, so rather than silently running a single-threaded
+    queue while claiming durable, multi-worker processing, anything other than the
+    memory backend — or a concurrency request the in-process queue cannot honour —
+    fails loudly at startup. That keeps behaviour honest: a deployment either runs
+    what it was told to run, or it does not start.
+    """
+    normalized = (backend or "memory").strip().lower()
+    if normalized not in {"memory", "inprocess", "in-process"}:
+        raise NotImplementedError(
+            f"scan job queue backend '{backend}' is not implemented in this build; "
+            "set SCAN_JOB_QUEUE_BACKEND=memory"
+        )
+    if max_concurrency > 1:
+        raise NotImplementedError(
+            f"max_concurrency={max_concurrency} is not supported by the in-process queue; "
+            "set SCAN_JOB_MAX_CONCURRENCY=1 (or implement a durable backend)"
+        )
+    _log("scan_queue_backend", {"backend": "memory", "name": name, "redis_url": bool(redis_url)})
+    return ScanJobQueue(worker=worker, max_retries=max_retries, hooks=hooks)

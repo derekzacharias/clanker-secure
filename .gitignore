@@ -6,3 +6,7 @@ scan_artifacts/
 frontend/node_modules/
 frontend/dist/
 uvicorn.log
+
+# local virtualenv (created per checkout, never committed)
+.venv_agent/
+.venv/

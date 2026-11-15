@@ -31,3 +31,16 @@ Seeding Admin
 RBAC Enforcement
 - `overlay/rbac_override.py` wraps write APIs (`/assets` POST/PATCH/DELETE, `/scans` POST/DELETE, `/findings/{id}` PATCH) to require `admin` or `operator` roles.
 
+
+## Planned change: enterprise user management and access control
+
+A dedicated Users & Access area, permission-based authorisation, teams, asset
+ownership and remediation assignment are **planned, not implemented**. The
+assessment (verified security findings S1–S8, milestones and acceptance criteria)
+lives in [`BACKLOG.md`](../BACKLOG.md) under "Enterprise user management, access
+control and remediation assignment".
+
+Read that section before changing anything in `overlay/auth/` or the user
+endpoints: the bootstrap seeding path (`main.py:_seed_admin_if_configured`) is
+known to reset an existing administrator on restart, and refresh tokens are not
+rotated on use.

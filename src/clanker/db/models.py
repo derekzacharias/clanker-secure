@@ -402,3 +402,29 @@ __all__ = [
     "Schedule",
     "AgentIngest",
 ]
+
+
+class ReportJob(SQLModel, table=True):
+    """Background report generation job.
+
+    Restored from its call sites in main.py (`_process_report_job`,
+    `_serialize_report_job`, `/reports/{job_id}`): a report is generated
+    asynchronously, the row records what was asked for (scope/include/timeframe),
+    where the artefact landed, and its checksum so a download can be verified.
+    """
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    kind: str = Field(default="findings", max_length=32)
+    report_type: str = Field(default="technical", max_length=32)
+    format: str = Field(default="csv", max_length=16)
+    status: str = Field(default="processing", max_length=24)
+    scope_json: Optional[str] = None
+    include_json: Optional[str] = None
+    timeframe_from: Optional[str] = None
+    timeframe_to: Optional[str] = None
+    total_count: Optional[int] = None
+    file_path: Optional[str] = None
+    checksum: Optional[str] = None
+    error: Optional[str] = None
+    created_at: datetime = Field(default_factory=utc_now, nullable=False)
+    completed_at: Optional[datetime] = None
