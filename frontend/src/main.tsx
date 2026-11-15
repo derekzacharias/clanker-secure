@@ -6,6 +6,7 @@ import '@mantine/core/styles.css';
 import '@mantine/notifications/styles.css';
 import { Global } from '@emotion/react';
 import App from './App';
+import { theme } from './app/theme';
 
 // Ensure browser tab reflects the product name as early as possible
 document.title = 'Clanker Command Console';
@@ -35,36 +36,57 @@ ReactDOM.createRoot(document.getElementById('root') as HTMLElement).render(
     <MantineProvider
       defaultColorScheme="dark"
       colorSchemeManager={localStorageColorSchemeManager({ key: 'clanker-color-scheme' })}
-      theme={{
-        primaryColor: 'indigo',
-        fontFamily: 'Inter, system-ui, -apple-system, BlinkMacSystemFont, sans-serif',
-        headings: { fontFamily: 'Space Grotesk, Inter, sans-serif' },
-      }}
+      theme={theme}
     >
       <Global
-        styles={{
+        styles={() => ({
+          // One flat background per scheme: no gradients, no glow. Depth comes
+          // from borders and a single elevated surface.
+          'html[data-mantine-color-scheme="dark"], html[data-mantine-color-scheme="dark"] body': {
+            background: '#0B1220',
+            color: '#E8EEF7',
+          },
+          'html[data-mantine-color-scheme="light"], html[data-mantine-color-scheme="light"] body': {
+            background: '#F5F7FB',
+            color: '#172235',
+          },
           body: {
             margin: 0,
             minHeight: '100vh',
-            background:
-              'radial-gradient(1200px 600px at 10% -10%, rgba(99,102,241,0.18), transparent 60%), radial-gradient(900px 500px at 110% 0%, rgba(56,189,248,0.16), transparent 55%), radial-gradient(700px 400px at 50% 120%, rgba(147,51,234,0.12), transparent 60%), #0a0f1c',
-            color: '#f8fafc',
-            fontFamily: 'Inter, sans-serif',
+            fontFamily: 'Inter, system-ui, -apple-system, BlinkMacSystemFont, sans-serif',
+            fontSize: '13.5px',
+            WebkitFontSmoothing: 'antialiased',
           },
-          'html[data-mantine-color-scheme="light"] body': {
-            background:
-              'radial-gradient(1400px 700px at 0% -20%, rgba(99,102,241,0.24), transparent 60%), radial-gradient(1200px 600px at 100% -10%, rgba(14,165,233,0.22), transparent 55%), radial-gradient(900px 500px at 50% 120%, rgba(167,139,250,0.20), transparent 60%), #e8eefc',
-            color: '#0b1220',
+          '#root': { minHeight: '100vh' },
+          // Mantine surface variables, so components inherit the tokens rather
+          // than hardcoding hex values in every file.
+          'html[data-mantine-color-scheme="dark"]': {
+            '--mantine-color-body': '#0B1220',
+            '--mantine-color-default-border': '#26344A',
+            '--mantine-color-text': '#E8EEF7',
+            '--mantine-color-dimmed': '#9AA9BD',
+            '--mantine-color-default': '#172235',
+            '--mantine-color-default-hover': '#1E293B',
+            '--mantine-color-dark-6': '#172235',
+            '--mantine-color-dark-7': '#0B1220',
           },
-          '#root': {
-            minHeight: '100vh',
+          'html[data-mantine-color-scheme="light"]': {
+            '--mantine-color-body': '#F5F7FB',
+            '--mantine-color-default-border': '#E1E7EF',
+            '--mantine-color-text': '#172235',
+            '--mantine-color-dimmed': '#64748B',
+            '--mantine-color-gray-0': '#F8FAFC',
           },
-          // Smooth progress bar updates
-          '.animate-progress .mantine-Progress-section': {
-            transition: 'width 700ms ease',
-            willChange: 'width',
+          // Technical identifiers stay monospaced and tabular for scanning.
+          '.mono, .mantine-Table-td code': {
+            fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
+            fontVariantNumeric: 'tabular-nums',
           },
-        }}
+          ':focus-visible': { outline: '2px solid #2563EB', outlineOffset: 2 },
+          '@media (prefers-reduced-motion: reduce)': {
+            '*, *::before, *::after': { animationDuration: '0.001ms !important', transitionDuration: '0.001ms !important' },
+          },
+        })}
       />
       {/* Keep Mantine's own animated stripes by not overriding its animation property */}
       <Notifications position="top-right" zIndex={1000} />

@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import {
+  Alert,
   AppShell,
   Badge,
   Button,
@@ -23,18 +24,15 @@ import {
   ThemeIcon,
   Title,
   Tooltip,
-  ActionIcon,
   useMantineColorScheme,
   Drawer,
   rem,
 } from '@mantine/core';
 import { notifications } from '@mantine/notifications';
 import { Modal, PasswordInput } from '@mantine/core';
-import { Burger, Divider } from '@mantine/core';
 import { Loader } from '@mantine/core';
 import {
   IconAlertTriangle,
-  IconClockHour4,
   IconRadar2,
   IconRefresh,
   IconRobot,
@@ -43,8 +41,9 @@ import {
   IconTarget,
   IconPlugConnected,
 } from '@tabler/icons-react';
-import { IconLogout, IconUser } from '@tabler/icons-react';
 import axios from 'axios';
+import { AppLayout } from './app/AppLayout';
+import { navigate, routeOf, usePathname, type RouteName } from './app/router';
 
 const API_BASE = import.meta.env.VITE_API_BASE ?? '';
 
@@ -210,11 +209,20 @@ const INTEGRATION_STATUS_COLORS: Record<Integration['status'], string> = {
 
 const TABLE_HEIGHT = 420;
 const TABLE_HEIGHT_MOBILE = 320;
-const SUMMARY_TILE_HEIGHT = 160;
-const SUMMARY_TILE_HEIGHT_MOBILE = 140;
 const SUMMARY_CARD_HEIGHT = 200;
 const SUMMARY_CARD_HEIGHT_MOBILE = 180;
 const SUMMARY_CARD_BODY_HEIGHT = 120;
+
+/** Route → panel. Overview has its own layout below, so it is absent here. */
+const ROUTE_TAB: Partial<Record<RouteName, 'assets' | 'scans' | 'findings' | 'coverage' | 'schedules' | 'integrations' | 'reports'>> = {
+  assets: 'assets',
+  scans: 'scans',
+  findings: 'findings',
+  coverage: 'coverage',
+  schedules: 'schedules',
+  integrations: 'integrations',
+  reports: 'reports',
+};
 
 const api = axios.create({ baseURL: API_BASE, timeout: 15000 });
 
@@ -295,19 +303,18 @@ function SeverityBadge({ severity }: { severity: string }) {
 }
 
 function App() {
-  const { colorScheme, setColorScheme } = useMantineColorScheme();
+  const { colorScheme } = useMantineColorScheme();
   const [assets, setAssets] = useState<Asset[]>([]);
   const [scans, setScans] = useState<Scan[]>([]);
   const [findings, setFindings] = useState<Finding[]>([]);
   const [loading, setLoading] = useState(false);
-  const [autoRefresh, setAutoRefresh] = useState(true);
+  const [autoRefresh] = useState(true);
   const [findingFilter, setFindingFilter] = useState<'all' | 'low' | 'medium' | 'high' | 'critical'>('all');
   const [evidenceFilter, setEvidenceFilter] = useState<'any' | 'low' | 'medium' | 'high'>('any');
   const [findingSearch, setFindingSearch] = useState('');
   const [findingSort, setFindingSort] = useState<'recent' | 'severity' | 'port' | 'evidence'>('recent');
   const [selectedFinding, setSelectedFinding] = useState<Finding | null>(null);
   const [selectedFindingEnrichment, setSelectedFindingEnrichment] = useState<FindingEnrichment | null>(null);
-  const [findingGroupLimit] = useState(8);
   const [scanFilter, setScanFilter] = useState<'all' | 'queued' | 'running' | 'completed' | 'failed' | 'completed_with_errors'>('all');
   const [selectedScanId, setSelectedScanId] = useState<number | null>(null);
   const [scanEvents, setScanEvents] = useState<Array<{ id: number; created_at: string; message: string }>>([]);
@@ -315,7 +322,6 @@ function App() {
   const [assetStatuses, setAssetStatuses] = useState<ScanAssetStatusRow[]>([]);
   const [currentUser, setCurrentUser] = useState<{ email: string; role: string; name?: string | null } | null>(null);
   const canWrite = !!currentUser && ['admin', 'operator'].includes(currentUser.role);
-  const [menuOpen, setMenuOpen] = useState<boolean>(false);
   const [authChecked, setAuthChecked] = useState<boolean>(false);
   const path = typeof window !== 'undefined' ? window.location.pathname.toLowerCase() : '';
   const isLoginPage = path.endsWith('/app/login') || path.endsWith('/login');
@@ -348,7 +354,15 @@ function App() {
   const [assetsOffset, setAssetsOffset] = useState(0);
   const [scansOffset, setScansOffset] = useState(0);
   const [findingsOffset, setFindingsOffset] = useState(0);
+  const pathname = usePathname();
+  const route = routeOf(pathname);
   const [activeTab, setActiveTab] = useState<'assets' | 'scans' | 'findings' | 'coverage' | 'schedules' | 'integrations' | 'reports'>('assets');
+
+  // The URL is the source of truth for navigation; the panel follows it.
+  useEffect(() => {
+    const tab = ROUTE_TAB[route];
+    if (tab) setActiveTab(tab);
+  }, [route]);
   const [loginOpen, setLoginOpen] = useState<boolean>(false);
   const [loginEmail, setLoginEmail] = useState<string>('');
   const [loginPassword, setLoginPassword] = useState<string>('');
@@ -548,7 +562,6 @@ const handleLogout = async (): Promise<void> => {
     localStorage.removeItem('clanker_refresh_token');
     setCurrentUser(null);
     notifications.show({ color: 'green', title: 'Logged out', message: 'Your session has been cleared' });
-    setMenuOpen(false);
   };
 
   const handleLogin = async (): Promise<void> => {
@@ -560,7 +573,6 @@ const handleLogout = async (): Promise<void> => {
       setCurrentUser({ email: me.data.email, role: me.data.role, name: me.data.name });
       notifications.show({ color: 'green', title: 'Logged in', message: me.data.email });
       setLoginOpen(false);
-      setMenuOpen(false);
     } catch (e) {
       const { message, status } = parseApiError(e);
       const title = status === 429 ? 'Too many attempts' : 'Login failed';
@@ -821,6 +833,9 @@ const handleLogout = async (): Promise<void> => {
 
   const openFindings = useMemo(() => findings.filter((finding) => finding.status.toLowerCase() === 'open').length, [findings]);
   const activeScans = (scanStatusSummary.running ?? 0) + (scanStatusSummary.queued ?? 0);
+  // There is no /integrations endpoint yet (see BACKLOG): this list is a
+  // placeholder, so it is labelled as such in the Integrations tab instead of
+  // pretending to be live delivery status.
   const integrations = useMemo<Integration[]>(() => [
     {
       id: 1,
@@ -1431,121 +1446,24 @@ const handleLogout = async (): Promise<void> => {
   }
 
   return (
-    <AppShell padding="lg" header={{ height: 70 }} styles={{ main: { background: 'transparent' } }}>
-      <AppShell.Header style={{ background: 'rgba(5,8,15,0.7)', borderBottom: '1px solid rgba(255,255,255,0.08)' }}>
-        <Stack gap="sm" px="lg" py="sm">
-          <Group gap="md" align="center" justify="flex-start" wrap="wrap">
-            <Group gap="md" align="center" wrap="wrap">
-              <Burger opened={menuOpen} onClick={() => setMenuOpen((v) => !v)} size="sm" aria-label="Open menu" />
-              <ThemeIcon
-                size={48}
-                radius="xl"
-                variant="gradient"
-                gradient={{ from: 'red', to: 'grape' }}
-                style={{ boxShadow: '0 15px 30px rgba(239,68,68,0.45)' }}
-              >
-                <IconRobot size={24} />
-              </ThemeIcon>
-              <div>
-                <Text
-                  component="h1"
-                  fw={700}
-                  size="xl"
-                  style={{
-                    background: 'linear-gradient(120deg, #60a5fa, #a78bfa)',
-                    WebkitBackgroundClip: 'text',
-                    color: 'transparent',
-                    margin: 0,
-                  }}
-                >
-                  Clanker Command Console
-                </Text>
-                <Text
-                  size="md"
-                  fw={600}
-                  c={colorScheme === 'light' ? '#0b1220' : '#e5e7eb'}
-                  style={{ letterSpacing: 0.2, textShadow: colorScheme === 'light' ? 'none' : '0 1px 2px rgba(0,0,0,0.45)' }}
-                >
-                  Network awareness & vulnerability visibility
-                </Text>
-              </div>
-            </Group>
-            <Group gap="sm" align="center" style={{ marginLeft: 'auto' }}>
-              <Group gap="sm" align="center">
-                <Badge
-                  color={autoRefresh ? 'green' : 'gray'}
-                  variant="light"
-                  radius="xl"
-                  leftSection={<IconClockHour4 size={14} />}
-                  onClick={() => setAutoRefresh((prev) => !prev)}
-                  style={{ cursor: 'pointer' }}
-                >
-                  Auto refresh: {autoRefresh ? 'ON' : 'OFF'}
-                </Badge>
-                <Badge color={activeScans > 0 ? 'indigo' : 'gray'} variant="filled">
-                  Active scans: {activeScans}
-                </Badge>
-              </Group>
-              <Tooltip label="Refresh data now">
-                <Button rightSection={<IconRefresh size={16} />} variant="gradient" gradient={{ from: 'indigo', to: 'cyan' }} onClick={refreshAll} loading={loading}>
-                  Refresh
-                </Button>
-              </Tooltip>
-            </Group>
-          </Group>
-          <Drawer opened={menuOpen} onClose={() => setMenuOpen(false)} position="left" size="xs" title="Menu">
-            <Stack>
-              {currentUser ? (
-                <>
-                  <Group gap="xs">
-                    <ThemeIcon variant="light" color="indigo"><IconUser size={16} /></ThemeIcon>
-                    <div>
-                      <Text fw={600} size="sm">{currentUser.name || currentUser.email}</Text>
-                      <Text size="xs" c="dimmed">Role: {currentUser.role}</Text>
-                    </div>
-                  </Group>
-                  <Divider />
-            <Button fullWidth variant="light" onClick={() => { setActiveTab('assets'); setMenuOpen(false); }}>Assets</Button>
-            <Button fullWidth variant="light" onClick={() => { setActiveTab('scans'); setMenuOpen(false); }}>Scans</Button>
-            <Button fullWidth variant="light" onClick={() => { setActiveTab('findings'); setMenuOpen(false); }}>Findings</Button>
-            <Button fullWidth variant="light" onClick={() => { setProfileName(currentUser?.name || ''); setProfileOpen(true); }}>My Profile</Button>
-            <Button fullWidth variant="light" onClick={() => setChangePwOpen(true)}>Change Password</Button>
-            {currentUser.role === 'admin' && (
-              <>
-                <Button fullWidth variant="light" onClick={() => setUsersOpen(true)}>Users</Button>
-                <Button fullWidth variant="light" onClick={async () => { try { setAuditOpen(true); const r = await api.get('/audit_logs'); setAuditRows(r.data); } catch (e) { notifications.show({ color: 'red', title: 'Failed to load audit logs', message: `${e}` }); } }}>Audit Logs</Button>
-              </>
-            )}
-                  <Button fullWidth variant="light" onClick={() => setColorScheme(colorScheme === 'light' ? 'dark' : 'light')}>
-                    Switch to {colorScheme === 'light' ? 'dark' : 'light'} mode
-                  </Button>
-                  <Divider />
-                  <Button fullWidth variant="light" color="red" leftSection={<IconLogout size={16} />} onClick={handleLogout}>Logout</Button>
-                </>
-              ) : (
-                <>
-                  <Text c="dimmed">Not signed in</Text>
-                  <Group gap="xs">
-                    <Button fullWidth onClick={() => setLoginOpen(true)}>Login</Button>
-                    <Button fullWidth variant="subtle" component="a" href="/app/login">Login page</Button>
-                  </Group>
-                </>
-              )}
-            </Stack>
-          </Drawer>
-          <Group gap="sm" justify="space-between" wrap="wrap">
-            <Group gap="sm" wrap="wrap">
-              <ActionIcon
-                variant="subtle"
-                size="lg"
-                aria-label="Toggle color scheme"
-                onClick={() => setColorScheme(colorScheme === 'light' ? 'dark' : 'light')}
-                title={colorScheme === 'light' ? 'Switch to dark mode' : 'Switch to light mode'}
-              />
-            </Group>
-          </Group>
-        </Stack>
-      </AppShell.Header>
+    <AppLayout
+      user={currentUser}
+      canWrite={canWrite}
+      onLogout={handleLogout}
+      onOpenProfile={() => { setProfileName(currentUser?.name || ''); setProfileOpen(true); }}
+      onOpenPassword={() => setChangePwOpen(true)}
+      actions={
+        <Button
+          rightSection={<IconRefresh size={16} />}
+          variant="light"
+          size="xs"
+          onClick={refreshAll}
+          loading={loading}
+        >
+          Refresh
+        </Button>
+      }
+    >
       <Modal opened={loginOpen} onClose={() => setLoginOpen(false)} title="Sign in" centered>
         <Stack>
           <TextInput label="Email" placeholder="you@example.com" value={loginEmail} onChange={(e) => setLoginEmail(e.currentTarget.value)} />
@@ -1722,21 +1640,18 @@ const handleLogout = async (): Promise<void> => {
           </Group>
         </Stack>
       </Modal>
-      <AppShell.Main>
         <Stack gap="lg">
+          {route === 'overview' && (
+          <>
           <SimpleGrid cols={{ base: 1, sm: 2, md: 3, lg: 4 }} spacing={{ base: 'sm', sm: 'md', lg: 'lg' }}>
             {(() => {
-              const isLight = colorScheme === 'light';
               const tiles = [
                 {
                   label: 'Assets',
                   value: assets.length,
                   icon: IconTarget,
                   subtitle: 'Managed hosts',
-                  gradientDark: 'linear-gradient(135deg, rgba(129,230,217,0.35), rgba(79,70,229,0.25))',
-                  gradientLight: 'linear-gradient(135deg, rgba(99,102,241,0.30), rgba(34,211,238,0.22))',
-                  iconGradientDark: { from: 'cyan', to: 'indigo' },
-                  iconGradientLight: { from: 'indigo', to: 'cyan' },
+                  tone: 'brand',
                 },
                 {
                   label: 'Active scans',
@@ -1769,35 +1684,22 @@ const handleLogout = async (): Promise<void> => {
                   iconGradientLight: { from: 'violet', to: 'indigo' },
                 },
               ];
+              // Flat, bordered metric cards: the number is the visual anchor, the
+              // icon is a quiet accent, and nothing competes with the data.
               return tiles.map((card) => (
-                <Card
-                  key={card.label}
-                  padding="lg"
-                  style={{
-                    ...(isLight ? (surfaces.tile as React.CSSProperties) : gradientCard(card.gradientDark)),
-                    height: isMobile ? SUMMARY_TILE_HEIGHT_MOBILE : SUMMARY_TILE_HEIGHT,
-                    display: 'flex',
-                    flexDirection: 'column',
-                    justifyContent: 'space-between',
-                  }}
-                  radius="md"
-                  shadow="xl"
-                >
-                  <Group justify="space-between" mb="xs">
-                    <Text c={isLight ? '#1f2937' : 'gray.2'} size="sm" fw={600}>
+                <Card key={card.label} padding="md" radius="md" withBorder shadow="none">
+                  <Group justify="space-between" mb={6} wrap="nowrap">
+                    <Text size="xs" c="dimmed" fw={600} tt="uppercase" style={{ letterSpacing: 0.4 }}>
                       {card.label}
                     </Text>
-                    <ThemeIcon
-                      variant="gradient"
-                      gradient={isLight ? card.iconGradientLight : card.iconGradientDark}
-                      radius="xl"
-                      size="lg"
-                    >
-                      <card.icon size={18} />
+                    <ThemeIcon variant="light" color={card.tone} radius="md" size="md" aria-hidden>
+                      <card.icon size={15} />
                     </ThemeIcon>
                   </Group>
-                  <Title order={2} c={isLight ? '#0b1220' : undefined}>{card.value}</Title>
-                  <Text size="sm" c={isLight ? '#334155' : 'gray.4'}>
+                  <Text fw={650} fz={26} lh={1.1} style={{ fontVariantNumeric: 'tabular-nums' }}>
+                    {card.value}
+                  </Text>
+                  <Text size="xs" c="dimmed" mt={4}>
                     {card.subtitle}
                   </Text>
                 </Card>
@@ -1890,17 +1792,11 @@ const handleLogout = async (): Promise<void> => {
               </Card>
             </Grid.Col>
           </Grid>
+          </>
+          )}
 
-          <Tabs value={activeTab} onChange={(v) => setActiveTab((v as any) || 'assets')} radius="md" variant="pills">
-            <Tabs.List style={{ background: colorScheme === 'light' ? 'rgba(2,6,23,0.06)' : 'rgba(15,23,42,0.6)', borderRadius: 999, padding: 4 }}>
-              <Tabs.Tab value="assets">Assets</Tabs.Tab>
-              <Tabs.Tab value="scans">Scans</Tabs.Tab>
-              <Tabs.Tab value="findings">Findings</Tabs.Tab>
-              {canWrite && <Tabs.Tab value="coverage">Coverage</Tabs.Tab>}
-              {currentUser?.role === 'admin' && <Tabs.Tab value="schedules">Schedules</Tabs.Tab>}
-              <Tabs.Tab value="integrations">Integrations</Tabs.Tab>
-              <Tabs.Tab value="reports">Reports</Tabs.Tab>
-            </Tabs.List>
+          {route !== 'overview' && (
+          <Tabs value={activeTab} onChange={(value) => value && navigate(`/${value}`)} radius="md" variant="pills">
 
             <Tabs.Panel value="coverage" pt="sm">
               <Card padding="lg" radius="md" shadow="xl" style={colorScheme === 'light' ? (surfaces.tile as React.CSSProperties) : glassStyles}>
@@ -2041,7 +1937,14 @@ const handleLogout = async (): Promise<void> => {
                   <Group justify="space-between" align="flex-start">
                     <div>
                       <Title order={4}>Integrations</Title>
-                      <Text c="dimmed" size="sm">Connect enrichers, ticketing, and notifications. Configure credentials and webhooks here.</Text>
+                      <Text c="dimmed" size="sm">Connect enrichers, ticketing, and notifications.</Text>
+                      {/* Honesty rule: the backend has no integrations endpoint yet, so
+                          these rows are marked as an unconfigured placeholder rather
+                          than shown as live connection state. */}
+                      <Alert color="yellow" variant="light" mt="sm" title="Not connected to an API yet" icon={<IconAlertTriangle size={16} />}>
+                        This list is a placeholder. Delivering connectors need a backend integration API; until then no
+                        status shown here is live, and nothing is being delivered.
+                      </Alert>
                     </div>
                     <Badge color="indigo" variant="light">Preview</Badge>
                   </Group>
@@ -2421,13 +2324,13 @@ const handleLogout = async (): Promise<void> => {
                 </Stack>
                 <Stack gap="md">
                   {findingsByHost.length === 0 && <Text c="dimmed">No findings to summarize.</Text>}
-                  {findingsByHost.slice(0, findingGroupLimit).map((group) => (
+                  {findingsByHost.map((group) => (
                     <Paper key={group.hostLabel} withBorder p="md" radius="md" style={surfaces.host}>
                       <Group justify="space-between" mb="xs">
                         <div>
                           <Text fw={600}>Nmap scan report for {group.hostLabel}</Text>
                           <Text size="sm" c="gray.5">
-                            Asset: {group.assetName || 'unknown'} · Open ports: {group.findings.length}
+                            Asset: {group.assetName || 'unknown'} · Findings: {group.findings.length}
                           </Text>
                         </div>
                         <Badge color="green" variant="filled" radius="sm">
@@ -2631,8 +2534,8 @@ const handleLogout = async (): Promise<void> => {
               </Tabs.Panel>
             )}
           </Tabs>
+          )}
         </Stack>
-      </AppShell.Main>
       <Drawer
         opened={selectedFinding != null}
         onClose={() => setSelectedFinding(null)}
@@ -2818,14 +2721,27 @@ const handleLogout = async (): Promise<void> => {
                       <Text size="sm">Asset #{row.asset_id}</Text>
                       <StatusBadge status={row.status} />
                     </Group>
-                    <Progress
-                      className="animate-progress"
-                      value={row.status === 'completed' ? 100 : row.status === 'failed' ? 100 : row.status === 'running' ? 66 : 10}
-                      w={200}
-                      color={row.status === 'failed' ? 'red' : row.status === 'completed' ? 'teal' : 'indigo'}
-                      striped={row.status === 'running' || row.status === 'pending'}
-                      animated={row.status === 'running' || row.status === 'pending'}
-                    />
+                    {/* The API reports per-asset status, not a percentage. Show an
+                        indeterminate bar for in-flight assets rather than inventing
+                        a number: a made-up 66% is worse than no number. */}
+                    <Group gap="xs" wrap="nowrap">
+                      <Badge size="xs" variant="light" color={row.status === 'running' ? 'brand' : 'gray'}>
+                        {row.status === 'running' ? 'in progress' : row.status.replace(/_/g, ' ')}
+                      </Badge>
+                      <Progress
+                        value={row.status === 'completed' || row.status === 'failed' ? 100 : 0}
+                        w={140}
+                        size="sm"
+                        color={row.status === 'failed' ? 'red' : row.status === 'completed' ? 'teal' : 'brand'}
+                        striped={row.status === 'running'}
+                        animated={row.status === 'running'}
+                        aria-label={
+                          row.status === 'completed' || row.status === 'failed'
+                            ? `Asset ${row.asset_id} ${row.status}`
+                            : `Asset ${row.asset_id} in progress`
+                        }
+                      />
+                    </Group>
                   </Group>
                 ))}
               </Stack>
@@ -2846,7 +2762,7 @@ const handleLogout = async (): Promise<void> => {
           </Stack>
         </ScrollArea>
       </Drawer>
-    </AppShell>
+    </AppLayout>
   );
 }
 
